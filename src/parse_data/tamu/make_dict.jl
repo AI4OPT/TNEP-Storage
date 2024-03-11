@@ -8,7 +8,8 @@ const DATA_DIR = "tamu/base_grid/"
 const BUS_FILE = "bus.csv"
 const BRANCH_FILE = "branch.csv"
 const BUS2SUB_FILE = "bus2sub.csv"
-const SUB_FILE = "sub.csv"
+# const SUB_FILE = "tamu/base_grid/sub.csv"
+const SUB_FILE = "data/geojson/upgraded_sub.csv"
 const GEN_FILE = "plant.csv"
 const DEMAND_FILE = "demand.csv"
 const GENCOST_FILE = "gencost.csv"
@@ -26,7 +27,7 @@ end
 function get_lat_lon_sub(bus2sub, sub_info, bus_id)
     sub = bus2sub[bus_id]
     ans = sub_info[sub]
-    return ans["lat"], ans["lon"], ans["name"]
+    return ans["lat"], ans["lon"], ans["name"], ans["iso"]
 end
 
 function create_p_data(region=nothing)
@@ -34,14 +35,14 @@ function create_p_data(region=nothing)
         "per_unit" => false,
         "baseMVA" => 100.0, 
         "multinetwork" => false,
-        "name" => "ERCOT_DC_model",
-        "description" => "TAMU 2000 node representation of ERCOT",
+        "name" => "TAMU_DC_model",
+        "description" => "TAMU",
         "source_type" => "NREL Breakthrough Zenodo",
         "source_version" => "2021_Feb Version 0.4.2"
     )
 
     df_bus = load_df_and_filter_region(joinpath(DATA_DIR, BUS_FILE), region)
-    df_sub = load_df_and_filter_region(joinpath(DATA_DIR, SUB_FILE), region)
+    df_sub = load_df_and_filter_region(SUB_FILE, region)
     df_bus2sub = load_df_and_filter_region(joinpath(DATA_DIR, BUS2SUB_FILE), region)
     df_branch = load_df_and_filter_region(joinpath(DATA_DIR, BRANCH_FILE), region)
     df_gen = load_df_and_filter_region(joinpath(DATA_DIR, GEN_FILE), region)
@@ -49,7 +50,7 @@ function create_p_data(region=nothing)
 
     # create bus2sub and sub_info dictionary
     bus2sub = Dict(row[:bus_id] => row[:sub_id] for row in eachrow(df_bus2sub))
-    sub_info = Dict(row[:sub_id] => Dict("name" => row[:name], "lat" => row[:lat], "lon" => row[:lon]) for row in eachrow(df_sub))
+    sub_info = Dict(row[:sub_id] => Dict("name" => row[:name], "lat" => row[:lat], "lon" => row[:lon], "iso" => row[:zoneName]) for row in eachrow(df_sub))
 
     # create busses dictionary
     # create zonal demand disaggregation dict
@@ -58,7 +59,7 @@ function create_p_data(region=nothing)
     bus2idx = Dict()
     bus_idx = 1
     for row in eachrow(df_bus)
-        lat, lon, sub_name = get_lat_lon_sub(bus2sub, sub_info, row["bus_id"])
+        lat, lon, sub_name, iso_name = get_lat_lon_sub(bus2sub, sub_info, row["bus_id"])
 
         bus2idx[row["bus_id"]] = bus_idx
         busses[bus_idx] = Dict(
@@ -71,7 +72,8 @@ function create_p_data(region=nothing)
             "lat" => lat,
             "lon" => lon,
             "bus_name" => sub_name,
-            "sub" => bus2sub[row["bus_id"]]
+            "sub" => bus2sub[row["bus_id"]],
+            "iso" => iso_name
         )
         zone_pd[row["zone_id"]] = get(zone_pd, row["zone_id"], 0) + row["Pd"]
         bus_idx += 1
@@ -167,7 +169,7 @@ function create_p_data(region=nothing)
     p_data["idx2gen"] = idx2gen
 
     json_data = JSON.json(p_data)
-    open("data/topology/tamu/texas/power_system_data.json", "w") do file
+    open("data/topology/tamu/power_system_data.json", "w") do file
         write(file, json_data)
     end
 
