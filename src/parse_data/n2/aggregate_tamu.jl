@@ -127,7 +127,7 @@ function aggregate_tamu()
                 )
                 branch_idx += 1
             else # aggregate branch flow rates
-                branches[branch2idx[key]]["rate_a"] += the_branch["rate_a"]
+                branches[branch2idx[key]]["rate_a"] = max(branches[branch2idx[key]]["rate_a"], the_branch["rate_a"])
                 branches[branch2idx[key]]["num_branches"] += 1
             end
             # push to the inter_iso_df
@@ -168,7 +168,7 @@ function aggregate_tamu()
     aggregate["gen"] = data["gen"]
 
     json_data = JSON.json(aggregate)
-    open("data/topology/tamu/n2/tamu_aggregate_ps_data.json", "w") do file
+    open("data/topology/tamu/n2/tamu_aggregate_ps_maxes_data.json", "w") do file
         write(file, json_data)
     end
 

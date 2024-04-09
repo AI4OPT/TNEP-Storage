@@ -55,7 +55,7 @@ function export_energy_csv(simdir, model, data)
     # Now create the generator information by fuel type
     pg = mean(value.(model[:pg]), dims=1) # 1 x 210 x 24
     
-    gen_types = data["param"]["gen_types"]
+    gen_types = vcat(data["param"]["renewable_types"], data["param"]["nonrenewable_types"])
     gen_array = Float64[]
 
     for gen_type in gen_types
@@ -103,6 +103,38 @@ function export_investments_csv(simdir, model, data)
 
     df_storage = round_df(df_storage)
     CSV.write(joinpath(simdir, "output", "storage_investments.csv"), df_storage)
+end
+
+function export_flow(simdir, model, data)
+    pfs = mean(value.(model[:pf]), dims=1)
+    num_branches = size(pfs, 2)
+    num_hours = size(pfs, 3)
+
+    # Mappings (you need to define these based on your data)
+    branch_indices_mapping = ["$i" for i in 1:length(data["branch"])]
+    lat1_mapping = [data["bus"][string(data["branch"]["$i"]["f_bus"])]["lat"] for i in 1:length(data["branch"])]
+    lon1_mapping = [data["bus"][string(data["branch"]["$i"]["f_bus"])]["lon"] for i in 1:length(data["branch"])]
+    lat2_mapping = [data["bus"][string(data["branch"]["$i"]["t_bus"])]["lat"] for i in 1:length(data["branch"])]
+    lon2_mapping = [data["bus"][string(data["branch"]["$i"]["t_bus"])]["lon"] for i in 1:length(data["branch"])]
+    hours_mapping = 1:data["param"]["num_hours"]
+
+    column_names = [:Branch_Index, :Lat1, :Lon1, :Lat2, :Lon2, :Hour, :Power_Flow]
+
+    # Flatten the array and create DataFrame
+    flow = [(branch_indices_mapping[branch], 
+        lat1_mapping[branch],
+        lon1_mapping[branch],
+        lat2_mapping[branch],
+        lon2_mapping[branch],
+        hours_mapping[hour], 
+        pfs[1,branch,hour]) 
+            for branch in 1:num_branches, hour in 1:num_hours]
+
+    flow_flattened = [vec for row in eachrow(flow) for vec in row]
+    df_flow = DataFrame(flow_flattened, Symbol.(column_names))
+
+    df_flow = round_df(df_flow)
+    CSV.write(joinpath(simdir, "output", "flow.csv"), df_flow)
 end
 
 # ue, oe, pf, dis, ch = value.(model[:ue]), value.(model[:oe]), value.(model[:pf]), value.(model[:dis]), value.(model[:ch])

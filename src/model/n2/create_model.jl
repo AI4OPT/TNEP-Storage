@@ -86,16 +86,21 @@ function create_model_n2(data::Dict{String, Any}, optimizer)
     #
 
     # generator active dispatch
-    nonrenewable_generators = filter(g -> lowercase(data["gen"][g]["gen_type"]) ∉ ["solar", "wind", "hydro"], keys(data["gen"]))
+    nonrenewable_generators = filter(g -> lowercase(data["gen"][g]["gen_type"]) ∉ data["param"]["renewable_types"], keys(data["gen"]))
     @variable(model, pg[r in 1:R, g in 1:G, t in 1:T])
 
     for g in 1:G
         gen = data["gen"]["$g"]
-        is_renewable = gen["gen_type"] ∈ ["solar", "wind", "hydro"]
+        is_renewable = gen["gen_type"] ∈ data["param"]["renewable_types"]
+        is_foreign = gen["gen_type"]  ∈ ["foreign"]
         if is_renewable
             set_lower_bound.(pg[:, g, :], 0.0)
             for r in 1:R, t in 1:T
                 set_upper_bound(pg[r, g, t], max(0, gen["profile"]["$r"][t]))
+            end
+        elseif is_foreign
+            for r in 1:R, t in 1:T
+                fix(pg[r, g, t], gen["profile"]["$r"][t])
             end
         else
             set_lower_bound.(pg[:, g, :], gen["pmin"])
@@ -169,7 +174,7 @@ function create_model_n2(data::Dict{String, Any}, optimizer)
     # soc over time constraint
     JuMP.@constraint(model, 
         soc_over_time[r in 1:R, i in 1:N, t in 2:T],
-        soc[r,i,t] == soc[r,i,t-1] + (ch[r,i,t] - dis[r,i,t]) * data["param"]["bess_efficiency"]
+        soc[r,i,t] == soc[r,i,t-1] + ch[r,i,t] * data["param"]["bess_efficiency"] - dis[r,i,t] / data["param"]["bess_efficiency"]
     )
 
     # OPTIONAL: soc 0.5 constraint

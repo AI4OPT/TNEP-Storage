@@ -2,6 +2,9 @@ using TOML
 using JSON
 using CSV
 using DataFrames
+using Dates
+
+include("../../parse_data/n2/get_foreign_flows.jl")
 
 function add_params(simdir::String)
     # Load config file
@@ -26,6 +29,9 @@ function update_generation_profile(data, rep_index, bus_id, resource_type, df, r
         # Update the profile for each generator ID
         for idx in gens
             gen_id = string(data["idx2gen"]["$idx"])
+            if !haskey(data["gen"]["$idx"], "profile")
+                data["gen"]["$idx"]["profile"] = Dict()
+            end
             data["gen"]["$idx"]["profile"]["$rep_index"] = df[:, gen_id] * renewable_scale
         end
     end
@@ -76,6 +82,7 @@ function add_profiles(data)
             update_load(data, rep_index, i, fdemand_df, load_scale)
 
             # -- Populate the wind of all busses --
+            update_generation_profile(data, rep_index, i, "wind_offshore", fwind_df, renewable_scale)
             update_generation_profile(data, rep_index, i, "wind", fwind_df, renewable_scale)
             update_generation_profile(data, rep_index, i, "solar", fsolar_df, renewable_scale)
             update_generation_profile(data, rep_index, i, "hydro", fhydro_df, renewable_scale)
@@ -87,6 +94,7 @@ end
 function add_params_profiles(simdir)
     data = add_params(simdir)
     add_profiles(data)
+    add_foreign_imports(data)
 
     # Calculate and check the sum of representatives' probabilities
     sum_probabilities = sum(values(data["representative_prob"]))
@@ -95,4 +103,51 @@ function add_params_profiles(simdir)
         throw(InvalidProbabilitySumError(error_message))
     end
     return data
+end
+
+function add_foreign_imports(data)
+    if data["param"]["foreign_imports"] == false
+        return
+    end
+
+    tamu2idx = Dict()
+    for i in keys(data["bus"])
+        tamu2idx[data["bus"][i]["bus_name"]] = i
+    end
+
+    eia_pair2idx = Dict()
+    gen_idx = length(data["gen"]) + 1
+    rep_idx = 1
+
+    eia_tamu = JSON.parsefile(EIA_TAMU_FILE)
+    for date in data["param"]["dates"]
+        formatted_date = Dates.format(Date(date, "yyyy-mm-dd"), "mm/dd/yyyy")
+        foreign_flows = get_foreign_flows(data["param"]["eia_interchange"], formatted_date)
+
+        for i in keys(foreign_flows)
+            if !haskey(eia_pair2idx, i)
+                eia_pair2idx[i] = gen_idx
+
+                # create new generator at that node
+                # first update the bus dictionary
+                bus_idx = tamu2idx[eia_tamu[i[2]]]
+                haskey(data["bus"][bus_idx]["gen"], "foreign") ? push!(data["bus"][bus_idx]["gen"]["foreign"], gen_idx) : data["bus"][bus_idx]["gen"]["foreign"] = [gen_idx]
+                # then update the gen dictionary
+                data["gen"]["$gen_idx"] = Dict(
+                    "profile" => Dict(),
+                    "cost" => [0, 0, 0],
+                    "gen_type" => "foreign",
+                    "status" => 1,
+                    "model" => 2,
+                    "gen_bus" => parse(Int, bus_idx),
+                    "ncost" => 3
+                )
+                gen_idx += 1
+            end
+            a_gen_idx = eia_pair2idx[i]
+            data["gen"]["$a_gen_idx"]["profile"]["$rep_idx"] = foreign_flows[i]
+        end
+        rep_idx += 1
+
+    end
 end

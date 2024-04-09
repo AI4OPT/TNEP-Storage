@@ -10,6 +10,10 @@ function run_model(simdir) # set add_ts to be true if anything other than the pa
     setup_simdir(simdir)
 
     data = add_params_profiles(simdir)
+    json_data = JSON.json(data)
+    open(joinpath(simdir, "data.json"), "w") do file
+        JSON.print(file, data)
+    end
 
     # create the model
     optimizer = Gurobi.Optimizer
@@ -31,6 +35,7 @@ function run_model(simdir) # set add_ts to be true if anything other than the pa
 
     export_model(simdir, model, data)
 
+    
     return model, data
 end
 

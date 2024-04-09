@@ -3,7 +3,7 @@ using JSON
 
 include("../../helpers/setup_simdir.jl")
 include("add_params_profiles.jl")
-include("export_model.jl")
+include("../n1/export_model.jl")
 include("create_model.jl")
 
 function run_model(simdir)
