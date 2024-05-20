@@ -18,7 +18,7 @@ function compute_gen_cost(pg, gen_data)
         # Polynomial Cost Model
         # The cost array contains coefficients for the polynomial
         # where the highest degree coefficient comes first.
-        return sum([cost[k] * pg^(ncost-k) for k in 1:ncost])
+        return sum([cost[k] * pg^(k-1) for k in 1:ncost])
     else
         error("Unsupported cost model type: $model")
     end

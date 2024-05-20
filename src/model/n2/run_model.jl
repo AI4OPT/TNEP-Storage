@@ -7,7 +7,7 @@ include("add_params_profiles.jl")
 include("../n1/export_model.jl")
 include("decarbonization.jl")
 
-function run_model(simdir; prev_model=nothing) # set add_ts to be true if anything other than the params in the powermodels file needs to be changed
+function run_model(simdir; prev_simdir=nothing) # set add_ts to be true if anything other than the params in the powermodels file needs to be changed
     setup_simdir(simdir)
 
     data = add_params_profiles(simdir)
@@ -19,7 +19,7 @@ function run_model(simdir; prev_model=nothing) # set add_ts to be true if anythi
 
     # create the model
     optimizer = Gurobi.Optimizer
-    model = create_model_n2(data, optimizer, prev_model=prev_model)
+    model = create_model_n2(data, optimizer, prev_simdir=prev_simdir)
 
     # set Gurobi log location
     set_optimizer_attribute(model, "LogFile", joinpath(simdir, "gurobi_logfile.log"))
@@ -48,41 +48,33 @@ function export_model(simdir, model, data)
 end
 
 function run_sequential(seqsimdir, ending_year)
+    ending_year = parse(Int, ending_year)
     config_file = joinpath(seqsimdir, "config.toml")
     toml_data = TOML.parsefile(config_file)
     current_year = toml_data["decarbonization_year"]
 
-    # make the starting directory
-    simdir = joinpath(seqsimdir, "$current_year")
-    if !isdir(simdir)
-        mkdir(simdir)
-    end
-
-    # copy the toml to the new directory
-    open(joinpath(simdir, "config.toml"), "w") do file
-        TOML.print(file, toml_data)
-    end
-
-    current_model, current_data = run_model(simdir)
-
-    while current_year != ending_year
-        config_file = joinpath(simdir, "config.toml")
-        toml_data = TOML.parsefile(config_file)
-        toml_data["decarbonization_year"] += 1 # TODO CHECK IF THIS IS INT
-
-        # update current_year and simdir
-        current_year = toml_data["decarbonization_year"]
+    while current_year <= ending_year
+        # make the starting directory
         simdir = joinpath(seqsimdir, "$current_year")
         if !isdir(simdir)
             mkdir(simdir)
         end
 
-        # copy the toml to the new directory
+        # create the new toml in the directory
         open(joinpath(simdir, "config.toml"), "w") do file
             TOML.print(file, toml_data)
         end
 
-        current_model, current_model = run_model(simdir, prev_model=current_model)
+        # check if previous year directory exists, and run
+        prev_year = current_year - 1
+        if !isdir(joinpath(seqsimdir, "$prev_year"))
+            run_model(simdir)
+        else
+            run_model(simdir, prev_simdir=joinpath(seqsimdir, "$prev_year"))
+        end
+
+        # increment current_year
+        current_year += 1
+        toml_data["decarbonization_year"] = current_year
     end
 end
-

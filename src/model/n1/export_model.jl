@@ -25,6 +25,8 @@ function export_energy_csv(simdir, model, data)
 
     ue = mean(value.(model[:ue]), dims=1)
     oe = mean(value.(model[:oe]), dims=1)
+    ch = mean(value.(model[:ch]), dims=1)
+    dis = mean(value.(model[:dis]), dims=1)
     imbalance = oe - ue # 1 x num_nodes x num_hours
 
     num_nodes = size(imbalance, 2)
@@ -37,7 +39,7 @@ function export_energy_csv(simdir, model, data)
     lon_mapping = [data["bus"]["$i"]["lon"] for i in 1:length(data["bus"])]
     hours_mapping = 1:data["param"]["num_hours"]
 
-    column_names = [:Node_Index, :Node_Name, :Lat, :Lon, :Hour, :Energy_Imbalance]
+    column_names = [:Node_Index, :Node_Name, :Lat, :Lon, :Hour, :Energy_Imbalance, :Charge, :Discharge]
 
     # Flatten the array and create DataFrame
     energy = [(node_indices_mapping[bus], 
@@ -45,7 +47,9 @@ function export_energy_csv(simdir, model, data)
         lat_mapping[bus],
         lon_mapping[bus],
         hours_mapping[hour], 
-        imbalance[1,bus,hour]) 
+        imbalance[1,bus,hour],
+        ch[1,bus,hour],
+        dis[1,bus,hour]) 
             for bus in 1:num_nodes, hour in 1:num_hours]
 
     energy_flattened = [vec for row in eachrow(energy) for vec in row]

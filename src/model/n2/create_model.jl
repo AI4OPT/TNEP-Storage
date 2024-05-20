@@ -68,7 +68,7 @@ data {
 using JuMP
 include("../../helpers/compute_gen_cost.jl")
 
-function create_model_n2(data::Dict{String, Any}, optimizer; prev_model=nothing)
+function create_model_n2(data::Dict{String, Any}, optimizer; prev_simdir=nothing)
 
     # Initialize model
     model = JuMP.Model(optimizer)
@@ -149,18 +149,20 @@ function create_model_n2(data::Dict{String, Any}, optimizer; prev_model=nothing)
     #
 
     # if prev model as input, enforce old investment upgrades (gamma, s_power, s_energy)
-    if prev_model !== nothing
+    if prev_simdir !== nothing
+        line_inv = CSV.read(joinpath(prev_simdir, "output", "line_investments.csv"), DataFrame)
+        storage_inv = CSV.read(joinpath(prev_simdir, "output", "storage_investments.csv"), DataFrame)
         JuMP.@constraint(model,
             old_gamma[a in 1:E],
-            gamma[a] >= value.(prev_model[:gamma][a])
+            gamma[a] >= line_inv[a, :Upgrade_Lvl]
         )
         JuMP.@constraint(model,
             old_s_power[i in 1:N],
-            s_power[i] >= value.(prev_model[:s_power][i])
+            s_power[i] >= storage_inv[i, :Storage_Power]
         )
         JuMP.@constraint(model,
             old_s_energy[i in 1:N],
-            s_energy[i] >= value.(prev_model[:s_energy][i])
+            s_energy[i] >= storage_inv[i, :Storage_Energy]
         )
     end
 

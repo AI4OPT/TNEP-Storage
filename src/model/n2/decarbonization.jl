@@ -32,8 +32,9 @@ function update_decarbonization(simdir, data)
         gen_type = gen["gen_type"]
 
         if gen_type in keys(ratios)
-            # scale up pmax
+            # scale up pmax and pmin
             gen["pmax"] *= ratios[gen_type]
+            gen["pmin"] *= ratios[gen_type]
             if gen_type in renewable_types
                 # scale up the time series profile too
                 for (key, values) in gen["profile"]
