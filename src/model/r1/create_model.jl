@@ -66,9 +66,9 @@ data {
 """
 
 using JuMP
+include("../../helpers/compute_gen_cost.jl")
 
-
-function create_model(data::Dict{String, Any}, optimizer)
+function create_model_r1(data::Dict{String, Any}, optimizer; prev_simdir=nothing)
 
     # Initialize model
     model = JuMP.Model(optimizer)
@@ -90,16 +90,21 @@ function create_model(data::Dict{String, Any}, optimizer)
     #
 
     # generator active dispatch
-    nonrenewable_generators = filter(g -> lowercase(data["gen"][g]["gen_type"]) ∉ ["solar", "wind", "hydro"], keys(data["gen"]))
+    nonrenewable_generators = filter(g -> lowercase(data["gen"][g]["gen_type"]) ∉ data["param"]["renewable_types"], keys(data["gen"]))
     @variable(model, pg[r in 1:R, g in 1:G, t in 1:T])
 
     for g in 1:G
         gen = data["gen"]["$g"]
-        is_renewable = gen["gen_type"] ∈ ["solar", "wind", "hydro"]
+        is_renewable = gen["gen_type"] ∈ data["param"]["renewable_types"]
+        is_foreign = gen["gen_type"]  ∈ ["foreign"]
         if is_renewable
-            set_lower_bound.(pg[:, g, :], gen["pmin"])
+            set_lower_bound.(pg[:, g, :], 0.0)
             for r in 1:R, t in 1:T
                 set_upper_bound(pg[r, g, t], max(0, gen["profile"]["$r"][t]))
+            end
+        elseif is_foreign
+            for r in 1:R, t in 1:T
+                fix(pg[r, g, t], gen["profile"]["$r"][t])
             end
         else
             set_lower_bound.(pg[:, g, :], gen["pmin"])
@@ -150,6 +155,24 @@ function create_model(data::Dict{String, Any}, optimizer)
     #   II. Constraints
     #
 
+    # if prev model as input, enforce old investment upgrades (gamma, s_power, s_energy)
+    if prev_simdir !== nothing
+        line_inv = CSV.read(joinpath(prev_simdir, "output", "line_investments.csv"), DataFrame)
+        storage_inv = CSV.read(joinpath(prev_simdir, "output", "storage_investments.csv"), DataFrame)
+        JuMP.@constraint(model,
+            old_gamma[a in 1:E],
+            gamma[a] >= line_inv[a, :Upgrade_Lvl]
+        )
+        JuMP.@constraint(model,
+            old_s_power[i in 1:N],
+            s_power[i] >= storage_inv[i, :Storage_Power]
+        )
+        JuMP.@constraint(model,
+            old_s_energy[i in 1:N],
+            s_energy[i] >= storage_inv[i, :Storage_Energy]
+        )
+    end
+
     # flow constraints
     JuMP.@constraint(model, 
         flow_lb[r in 1:R, a in 1:E, t in 1:T],
@@ -192,7 +215,7 @@ function create_model(data::Dict{String, Any}, optimizer)
     # soc over time constraint
     JuMP.@constraint(model, 
         soc_over_time[r in 1:R, i in 1:N, t in 2:T],
-        soc[r,i,t] == soc[r,i,t-1] + (ch[r,i,t] - dis[r,i,t]) * data["param"]["bess_efficiency"]
+        soc[r,i,t] == soc[r,i,t-1] + ch[r,i,t] * data["param"]["bess_efficiency"] - dis[r,i,t] / data["param"]["bess_efficiency"]
     )
 
     # OPTIONAL: soc 0.5 constraint
@@ -258,7 +281,7 @@ function create_model(data::Dict{String, Any}, optimizer)
         data["representative_prob"][r] *
         (
             sum(
-                sum(data["gen"]["$g"]["cost"][1] * pg[r,g,t] for g in 1:G) +
+                sum(compute_gen_cost(pg[r,g,t], data["gen"]["$g"]) for g in 1:G) +
                 sum(data["param"]["over_generated_penalty"] * oe[r,i,t] for i in 1:N) + 
                 sum(data["param"]["under_served_penalty"] * ue[r,i,t] for i in 1:N)
             for t in 1:T)

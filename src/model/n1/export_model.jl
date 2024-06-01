@@ -120,9 +120,11 @@ function export_flow(simdir, model, data)
     lon1_mapping = [data["bus"][string(data["branch"]["$i"]["f_bus"])]["lon"] for i in 1:length(data["branch"])]
     lat2_mapping = [data["bus"][string(data["branch"]["$i"]["t_bus"])]["lat"] for i in 1:length(data["branch"])]
     lon2_mapping = [data["bus"][string(data["branch"]["$i"]["t_bus"])]["lon"] for i in 1:length(data["branch"])]
+    thermal_limits_mapping = [data["branch"]["$i"]["rate_a"] for i in 1:length(data["branch"])]
+
     hours_mapping = 1:data["param"]["num_hours"]
 
-    column_names = [:Branch_Index, :Lat1, :Lon1, :Lat2, :Lon2, :Hour, :Power_Flow]
+    column_names = [:Branch_Index, :Lat1, :Lon1, :Lat2, :Lon2, :Hour, :Rate_A, :Power_Flow]
 
     # Flatten the array and create DataFrame
     flow = [(branch_indices_mapping[branch], 
@@ -131,6 +133,7 @@ function export_flow(simdir, model, data)
         lat2_mapping[branch],
         lon2_mapping[branch],
         hours_mapping[hour], 
+        thermal_limits_mapping[branch],
         pfs[1,branch,hour]) 
             for branch in 1:num_branches, hour in 1:num_hours]
 

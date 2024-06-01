@@ -83,9 +83,9 @@ plt.savefig(f'../../{simdir}/visual/hourly_generation.png')
 stacked_production = renewable_production + nonrenewable_outputs + discharge_amount
 stacked_no_discharge = renewable_production + nonrenewable_outputs
 plt.figure(figsize=(10, 5))  # Set the figure size
-plt.plot(hours, total_load, label='Total Load', marker='o', linestyle='-')  # Plot total load
-plt.plot(hours, stacked_production, label='Stacked Production', marker='o', linestyle='-')  # Plot stacked production
-plt.plot(hours, stacked_no_discharge, label='Stacked No Discharge', marker='o', linestyle='-')  # Plot stacked production
+plt.plot(hours, total_load, label='Total Load', marker='o', linestyle='-', alpha=0.8)  # Plot total load
+plt.plot(hours, stacked_production, label='Stacked Production', marker='^', linestyle='--', alpha=0.6)  # Plot stacked production
+plt.plot(hours, stacked_no_discharge, label='Stacked No Discharge', marker='x', linestyle=':', alpha=0.6)  # Plot stacked production
 plt.title('Stacked Energy Production vs Total Load')
 plt.xlabel('Hour of the Day')
 plt.ylabel('Energy (MW)')

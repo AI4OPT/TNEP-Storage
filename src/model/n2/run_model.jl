@@ -7,7 +7,7 @@ include("add_params_profiles.jl")
 include("../n1/export_model.jl")
 include("decarbonization.jl")
 
-function run_model(simdir; prev_simdir=nothing) # set add_ts to be true if anything other than the params in the powermodels file needs to be changed
+function run_model(simdir; prev_simdir=nothing)
     setup_simdir(simdir)
 
     data = add_params_profiles(simdir)

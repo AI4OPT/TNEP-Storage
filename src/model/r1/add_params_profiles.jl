@@ -3,6 +3,8 @@ using JSON
 using CSV
 using DataFrames
 
+# COULD BE DEPRECATED
+
 function add_params(simdir::String)
     # Load config file
     config_file = joinpath(simdir, "config.toml")
@@ -18,7 +20,7 @@ function add_params(simdir::String)
     return data
 end
 
-function update_generation_profile(data, rep_index, bus_id, resource_type, df, renewable_scale)
+function update_generation_profile(data, rep_index, bus_id, resource_type, df)
     # Check if the resource type exists in the current bus's generators
     if resource_type in keys(data["bus"][bus_id]["gen"])
         # Get generator IDs for the specific resource type
@@ -26,16 +28,23 @@ function update_generation_profile(data, rep_index, bus_id, resource_type, df, r
         # Update the profile for each generator ID
         for idx in gens
             gen_id = string(data["idx2gen"]["$idx"])
-            data["gen"]["$idx"]["profile"]["$rep_index"] = df[:, gen_id] * renewable_scale
+            if !haskey(data["gen"]["$idx"], "profile")
+                data["gen"]["$idx"]["profile"] = Dict()
+            end
+            data["gen"]["$idx"]["profile"]["$rep_index"] = df[:, gen_id]
         end
     end
+end
+
+function update_load(data, rep_index, bus_id, df)
+    zone_id = string(data["bus"][bus_id]["zone_id"])
+    demand = df[:, zone_id] * data["bus"][bus_id]["Pd"] / data["zone_pd"][zone_id]
+    data["bus"][bus_id]["load"]["$rep_index"] = demand
 end
 
 function add_profiles(data)
     num_r = data["param"]["num_representatives"]
     num_h = data["param"]["num_hours"]
-    load_scale = data["param"]["load_scale"]
-    renewable_scale = data["param"]["load_scale"]
 
     # Check if number of representatives is equal to the dates
     if num_r != length(data["param"]["dates"])
@@ -65,15 +74,13 @@ function add_profiles(data)
         
         for i in keys(data["bus"])
             # -- Populate the load of all busses --
-            zone_id = string(data["bus"]["$i"]["zone_id"])
-            # zone power demand (MW) is disaggregated to buses proportional to Pd
-            demand = fdemand_df[:, zone_id] * (data["bus"]["$i"]["Pd"] / data["zone_pd"][zone_id])
-            data["bus"]["$i"]["load"]["$rep_index"] = demand
+            update_load(data, rep_index, i, fdemand_df)
 
             # -- Populate the wind of all busses --
-            update_generation_profile(data, rep_index, i, "wind", fwind_df, renewable_scale)
-            update_generation_profile(data, rep_index, i, "solar", fsolar_df, renewable_scale)
-            update_generation_profile(data, rep_index, i, "hydro", fhydro_df, renewable_scale)
+            update_generation_profile(data, rep_index, i, "wind_offshore", fwind_df)
+            update_generation_profile(data, rep_index, i, "wind", fwind_df)
+            update_generation_profile(data, rep_index, i, "solar", fsolar_df)
+            update_generation_profile(data, rep_index, i, "hydro", fhydro_df)
         end
         rep_index += 1
     end

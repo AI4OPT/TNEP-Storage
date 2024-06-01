@@ -32,7 +32,7 @@ end
 
 function create_p_data(region=nothing)
     p_data = Dict(
-        "per_unit" => false,
+        "per_unit" => true,
         "baseMVA" => 100.0, 
         "multinetwork" => false,
         "name" => "TAMU_DC_model",
