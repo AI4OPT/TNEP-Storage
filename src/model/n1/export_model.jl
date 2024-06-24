@@ -21,6 +21,36 @@ function gen_energy(bus, gen_type, hour, pg, data)
     end
 end
 
+function get_renewable_production_by_bus(bus, data)
+    renewable_production = Dict()
+    renewable_types = data["param"]["renewable_types"]
+    bus_gens = data["bus"][bus]["gen"]
+
+    for renewable_type in renewable_types
+        renewable_production[renewable_type] = zeros(data["param"]["num_hours"])
+        if haskey(bus_gens, renewable_type)
+            for gen_id in bus_gens[renewable_type]
+                profile = data["gen"]["$gen_id"]["profile"]
+                avg_time_series = mean(reduce(hcat, values(profile)), dims=2)
+                renewable_production[renewable_type] += avg_time_series
+            end
+        end
+    end
+
+    df = DataFrame(renewable_production)
+    df = df[:, renewable_types]
+    return df
+end
+
+function rename_columns_with_suffix!(df::DataFrame, suffix::String)
+    old_names = names(df)
+    new_names = Symbol[]
+    for name in old_names
+        push!(new_names, Symbol(string(name) * suffix))
+    end
+    rename!(df, new_names)
+end
+
 function export_energy_csv(simdir, model, data)
 
     ue = mean(value.(model[:ue]), dims=1)
@@ -56,7 +86,7 @@ function export_energy_csv(simdir, model, data)
     df_imbalance = DataFrame(energy_flattened, Symbol.(column_names))
 
 
-    # Now create the generator information by fuel type
+    # Now create the generator output information by fuel type
     pg = mean(value.(model[:pg]), dims=1) # 1 x 210 x 24
     
     gen_types = vcat(data["param"]["renewable_types"], data["param"]["nonrenewable_types"])
@@ -72,8 +102,17 @@ function export_energy_csv(simdir, model, data)
     end
     df_generation = DataFrame(gen_array, Symbol.(gen_types))
 
+    # Now create the renewable production information by fuel type (before curtailment)
+    dfs = DataFrame[]
+    for i in 1:length(data["bus"])
+        df_bus = get_renewable_production_by_bus("$i", data)
+        push!(dfs, df_bus)
+    end
+    df_renewable_prod = vcat(dfs...)
+    rename_columns_with_suffix!(df_renewable_prod, "_production")
+
     # Horizontally concatenate the imbalance and generation information
-    df_energy = hcat(df_imbalance, df_generation) 
+    df_energy = hcat(df_imbalance, df_generation, df_renewable_prod) 
     df_energy = round_df(df_energy)
     CSV.write(joinpath(simdir, "output", "energy.csv"), df_energy)
 end

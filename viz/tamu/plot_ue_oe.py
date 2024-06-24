@@ -5,11 +5,9 @@ import sys
 simdir = sys.argv[1]
 # Read CSV file
 df_energy = pd.read_csv(f"../../{simdir}/output/energy.csv")
-# Filter to include only negative imbalances
-df_energy = df_energy[df_energy['Energy_Imbalance'] < 0]
 
 # Create a new column for plotting (size)
-df_energy['Imbalance_Size'] = df_energy['Energy_Imbalance'].abs()
+df_energy['Imbalance_Size'] = df_energy['Energy_Imbalance'].apply(lambda x: abs(x) if x < 0 else 0)
 
 # Generate the plot focusing only on negatives, shown in red
 fig = px.scatter_geo(df_energy, 
@@ -22,4 +20,4 @@ fig = px.scatter_geo(df_energy,
                      scope='usa')
 
 # Save the plot as an HTML file
-fig.write_html(f"../../{simdir}/visual/energy.html")
+fig.write_html(f"../../{simdir}/visual/ue_energy.html")

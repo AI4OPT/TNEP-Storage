@@ -12,7 +12,7 @@ if __name__ == "__main__":
     simdir = sys.argv[1]
 
     # List of your scripts
-    scripts = ["plot_nodes.py", "plot_ue_oe.py", "plot_investments.py"]
+    scripts = ["plot_nodes.py", "plot_ue_oe.py", "plot_hourly_generation.py", "plot_investments.py", "plot_curtailment.py", "plot_congested_lines.py"]
 
     for script in scripts:
         run_script(script, simdir)
