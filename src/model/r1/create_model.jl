@@ -199,6 +199,16 @@ function create_model_r1(data::Dict{String, Any}, optimizer; prev_simdir=nothing
         va[r,tbus[a],t] - va[r,fbus[a],t] >= -1 * data["param"]["voltage_angle_difference_max"]
     )
 
+    # Voltage angle at each bus limits
+    JuMP.@constraint(model,
+        va_bus_ub[r in 1:R, i in 1:N, t in 1:T],
+        va[r,i,t] <= data["param"]["voltage_angle_bus_max"]
+    )
+    JuMP.@constraint(model,
+        va_bus_lb[r in 1:R, i in 1:N, t in 1:T],
+        va[r,i,t] >= -1 * data["param"]["voltage_angle_bus_max"]
+    )
+
     # nodal power balance
     JuMP.@constraint(model, 
         power_balance[r in 1:R, i in 1:N, t in 1:T],
@@ -221,7 +231,7 @@ function create_model_r1(data::Dict{String, Any}, optimizer; prev_simdir=nothing
     # OPTIONAL: soc 0.5 constraint
     JuMP.@constraint(model,
         soc_start[r in 1:R, i in 1:N],
-        soc[r,i,1] == 0.5 * s_energy[i]
+        soc[r,i,1] == 0.5 * s_energy[i] + ch[r,i,1] * data["param"]["bess_efficiency"] - dis[r,i,1] / data["param"]["bess_efficiency"]
     )
     JuMP.@constraint(model,
         soc_end[r in 1:R, i in 1:N],

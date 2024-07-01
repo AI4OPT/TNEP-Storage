@@ -198,7 +198,7 @@ function create_model_n2(data::Dict{String, Any}, optimizer; prev_simdir=nothing
     # OPTIONAL: soc 0.5 constraint
     JuMP.@constraint(model,
         soc_start[r in 1:R, i in 1:N],
-        soc[r,i,1] == 0.5 * s_energy[i]
+        soc[r,i,1] == 0.5 * s_energy[i] + ch[r,i,1] * data["param"]["bess_efficiency"] - dis[r,i,1] / data["param"]["bess_efficiency"]
     )
     JuMP.@constraint(model,
         soc_end[r in 1:R, i in 1:N],

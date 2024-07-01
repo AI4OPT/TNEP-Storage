@@ -36,7 +36,7 @@ function get_renewable_production_by_bus(bus, data)
             end
         end
     end
-
+    renewable_production = Dict(k => vec(v) for (k, v) in renewable_production)
     df = DataFrame(renewable_production)
     df = df[:, renewable_types]
     return df
@@ -57,6 +57,8 @@ function export_energy_csv(simdir, model, data)
     oe = mean(value.(model[:oe]), dims=1)
     ch = mean(value.(model[:ch]), dims=1)
     dis = mean(value.(model[:dis]), dims=1)
+    # ch = mean(value.(model[:ch]), dims=1) * data["param"]["bess_efficiency"]
+    # dis = mean(value.(model[:dis]), dims=1) / data["param"]["bess_efficiency"]
     imbalance = oe - ue # 1 x num_nodes x num_hours
 
     num_nodes = size(imbalance, 2)
