@@ -1,6 +1,7 @@
 using Gurobi
 using JSON
 
+include("../../helpers/convert_units.jl")
 include("../../helpers/setup_simdir.jl")
 include("add_params_profiles.jl")
 include("../n1/export_model.jl")
@@ -12,6 +13,7 @@ function run_model(simdir; prev_simdir=nothing)
 
     data = add_params_profiles(simdir)
     data = update_decarbonization(simdir, data)
+    data = convert_units(data)
     json_data = JSON.json(data)
     open(joinpath(simdir, "data.json"), "w") do file
         JSON.print(file, data)
@@ -28,7 +30,7 @@ function run_model(simdir; prev_simdir=nothing)
 
     if termination_status(model) != OPTIMAL 
         println("Termination status not optimal")
-        return
+        return model, data
     end
             
     if primal_status(model) != FEASIBLE_POINT

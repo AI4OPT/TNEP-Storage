@@ -189,6 +189,12 @@ function create_model_r1(data::Dict{String, Any}, optimizer; prev_simdir=nothing
         pf[r,a,t] == (va[r,tbus[a],t] - va[r,fbus[a],t]) / br_x[a]
     )
 
+    # Optional: slack bus voltage angle
+    JuMP.@constraint(model,
+    slack_bus_voltage[r in 1:R, t in 1:T],
+    va[r, 1, t] == 0
+    )
+
     # Voltage difference limits
     JuMP.@constraint(model,
         voltage_diff_ub[r in 1:R, a in 1:E, t in 1:T],
@@ -197,16 +203,6 @@ function create_model_r1(data::Dict{String, Any}, optimizer; prev_simdir=nothing
     JuMP.@constraint(model,
         voltage_diff_lb[r in 1:R, a in 1:E, t in 1:T],
         va[r,tbus[a],t] - va[r,fbus[a],t] >= -1 * data["param"]["voltage_angle_difference_max"]
-    )
-
-    # Voltage angle at each bus limits
-    JuMP.@constraint(model,
-        va_bus_ub[r in 1:R, i in 1:N, t in 1:T],
-        va[r,i,t] <= data["param"]["voltage_angle_bus_max"]
-    )
-    JuMP.@constraint(model,
-        va_bus_lb[r in 1:R, i in 1:N, t in 1:T],
-        va[r,i,t] >= -1 * data["param"]["voltage_angle_bus_max"]
     )
 
     # nodal power balance

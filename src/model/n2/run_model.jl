@@ -1,6 +1,7 @@
 using Gurobi
 using JSON
 
+include("../../helpers/convert_units.jl")
 include("../../helpers/setup_simdir.jl")
 include("create_model.jl")
 include("add_params_profiles.jl")
@@ -12,6 +13,7 @@ function run_model(simdir; prev_simdir=nothing)
 
     data = add_params_profiles(simdir)
     data = update_decarbonization(simdir, data)
+    data = convert_units(data)
     json_data = JSON.json(data)
     open(joinpath(simdir, "data.json"), "w") do file
         JSON.print(file, data)

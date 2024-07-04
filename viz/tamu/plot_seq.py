@@ -5,6 +5,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 def create_and_save_plots(df, seqsimdir):
+    df = df.sort_values(by='Year')
     # Set the figure size and adjust subplots
     plt.figure(figsize=(10, 8))
 
