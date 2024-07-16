@@ -74,7 +74,7 @@ plt.plot(hours, discharge_amount, label='Discharge Amount', marker='o')
 
 plt.title('Energy Production and Load Over Time')
 plt.xlabel('Hour of the Day')
-plt.ylabel('Energy (MWh)')
+plt.ylabel('Energy (puh)')
 plt.legend()
 plt.grid(True)
 plt.savefig(f'../../{simdir}/visual/hourly_generation.png')
@@ -91,7 +91,7 @@ plt.plot(hours, stacked_outputs_only, label='After Curtailment Production', mark
 plt.plot(hours, stacked_outputs_with_discharge, label='After Curtailment with Discharge', marker='o', linestyle='-.', alpha=0.6)  # Plot stacked production
 plt.title('Stacked Energy Production vs Total Load')
 plt.xlabel('Hour of the Day')
-plt.ylabel('Energy (MWh)')
+plt.ylabel('Energy (puh)')
 plt.legend()
 plt.grid(True)
 plt.savefig(f'../../{simdir}/visual/stacked_hourly_generation.png')
@@ -102,13 +102,13 @@ df_filtered = df_energy[df_energy['Energy_Imbalance'] <= 0]
 df_grouped = df_filtered.groupby('Hour')['Energy_Imbalance'].sum().reset_index()
 for _, row in df_grouped.iterrows():
     hour = int(row['Hour'])
-    ue[hour - 1] = row['Energy_Imbalance']
+    ue[hour - 1] = -1 * row['Energy_Imbalance']
 
 plt.figure(figsize=(10,5))
 plt.plot(hours, ue, label='Unserved Energy', marker='o')
 plt.title('Unserved Energy over Time')
 plt.xlabel('Hour of the Day')
-plt.ylabel('Energy (MWh)')
+plt.ylabel('Energy (puh)')
 plt.legend()
 plt.grid(True)
 plt.savefig(f'../../{simdir}/visual/ue.png')

@@ -7,6 +7,7 @@ include("add_params_profiles.jl")
 include("../n1/export_model.jl")
 include("create_model.jl")
 include("../n2/decarbonization.jl")
+include("create_summary.jl")
 
 function run_model(simdir; prev_simdir=nothing)
     setup_simdir(simdir)

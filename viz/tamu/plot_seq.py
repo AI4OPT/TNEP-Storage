@@ -11,16 +11,18 @@ def create_and_save_plots(df, seqsimdir):
 
     # Titles and labels for plots
     metrics = {
-        "Load_Shed": "Energy Imbalance (MWh)",
+        "Load_Shed": "Energy Imbalance (puh)",
         "Line_Investments": "Total Line Investments (Increments)",
-        "Storage_Investments": "Total Storage Investments (MW)",
-        "Used_Renewables": "Total Used Renewables (MWh)"
+        "Storage_Investments": "Total Storage Investments (pu)",
+        "Used_Renewables": "Total Used Renewables (puh)",
     }
 
     # Create a plot for each metric
     for i, (metric, title) in enumerate(metrics.items(), start=1):
         plt.subplot(2, 2, i)  # Position each plot in a 2x2 grid
-        plt.plot(df['Year'], df[metric], marker='o', linestyle='-')
+        plt.plot(df['Year'], df[metric], marker='o', linestyle='-', label=title)
+        if metric == "Used_Renewables":
+            plt.plot(df['Year'], df["Prod_Renewables"], marker='x', linestyle='--', label="Total Produced Renewables (puh)")
         plt.title(title)
         plt.xlabel('Year')
         plt.ylabel(metric)
@@ -48,7 +50,8 @@ if __name__ == "__main__":
                                "Load_Shed",
                                "Line_Investments",
                                "Storage_Investments",
-                               "Used_Renewables"])
+                               "Used_Renewables",
+                               "Prod_Renewables"])
 
     for item in os.listdir(seqsimdir):
         # Construct the full path to the item
@@ -69,6 +72,7 @@ if __name__ == "__main__":
             line_investments = line_inv['Upgrade_Lvl'].sum()
             storage_investments = storage_inv['Storage_Power'].sum()
             used_renewables = energy[[col for col in renewable_types if col in energy.columns]].sum(axis=1).sum()
+            prod_renewables = energy[[f"{col}_production" for col in renewable_types if f"{col}_production" in energy.columns]].sum(axis=1).sum()
 
             # add to the df
             new_row = pd.DataFrame({
@@ -76,7 +80,8 @@ if __name__ == "__main__":
                 "Load_Shed": [load_shed],
                 "Line_Investments": [line_investments],
                 "Storage_Investments": [storage_investments],
-                "Used_Renewables": [used_renewables]
+                "Used_Renewables": [used_renewables],
+                "Prod_Renewables": [prod_renewables]
             })
             df = pd.concat([df, new_row], ignore_index=True)
 

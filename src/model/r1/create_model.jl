@@ -234,6 +234,14 @@ function create_model_r1(data::Dict{String, Any}, optimizer; prev_simdir=nothing
         soc[r,i,T] == 0.5 * s_energy[i]
     )
 
+    # OPTIONAL: limit the number of storage locations
+    if haskey(data["param"], "max_num_storage") && data["param"]["max_num_storage"] > 0
+        JuMP.@constraint(model, 
+            storage_location_limit,
+            sum(sigma[i] for i in 1:N) <= data["param"]["max_num_storage"]
+        )
+    end
+
     # soc energy rating constraint
     JuMP.@constraint(model, 
         soc_energy_ub[r in 1:R, i in 1:N, t in 1:T],
@@ -282,6 +290,7 @@ function create_model_r1(data::Dict{String, Any}, optimizer; prev_simdir=nothing
 
     JuMP.@objective(model, Min,
     sum(s_power[i] * data["param"]["bess_power_cost"] + s_energy[i] * data["param"]["bess_energy_cost"] for i in 1:N) +
+    sum(sigma[i] for i in 1:N) * data["param"]["storage_fixed_cost"] + 
     sum(data["param"]["cap_upgrade_cost"] * data["param"]["cap_upgrade_increment"] * data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
     sum(
         data["representative_prob"][r] *
