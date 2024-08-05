@@ -30,7 +30,7 @@ function get_lat_lon_sub(bus2sub, sub_info, bus_id)
     return ans["lat"], ans["lon"], ans["name"], ans["iso"]
 end
 
-function create_p_data(region=nothing)
+function create_p_data(; region=nothing, iso=nothing)
     p_data = Dict(
         "per_unit" => true,
         "baseMVA" => 100.0, 
@@ -53,7 +53,7 @@ function create_p_data(region=nothing)
     sub_info = Dict(row[:sub_id] => Dict("name" => row[:name], "lat" => row[:lat], "lon" => row[:lon], "iso" => row[:zoneName]) for row in eachrow(df_sub))
 
     # create busses dictionary
-    # create zonal demand disaggregation dict
+    # create zonal demand disaggregation dict (used later in add_params_profiles for calculating load ratios)
     busses = Dict()
     zone_pd = Dict()
     bus2idx = Dict()
@@ -63,6 +63,7 @@ function create_p_data(region=nothing)
 
         bus2idx[row["bus_id"]] = bus_idx
         busses[bus_idx] = Dict(
+            "bus_id" => row["bus_id"],
             "bus_type" => row["type"],
             "load" => Dict(),
             "gen" => Dict(),
@@ -79,48 +80,102 @@ function create_p_data(region=nothing)
         bus_idx += 1
     end
 
+    # now filter for the desired iso
+    # remap bus indices
+    if iso != nothing
+        filtered_busses = Dict()
+        filtered_bus2idx = Dict()
+        filtered_idx = 1
+        for (bus_id, bus) in busses
+            if bus["iso"] == iso
+                filtered_busses[filtered_idx] = bus
+                filtered_bus2idx[bus["bus_id"]] = filtered_idx
+                filtered_idx += 1
+            end
+        end
+        bus2idx = filtered_bus2idx
+        busses = filtered_busses
+    end
+
     # create branches dictionary
     branches = Dict()
     idx2branch = Dict()
     arcs_from = Dict{Any,Any}()
     branch_idx = 1
     for row in eachrow(df_branch)
-        f_bus = bus2idx[row["from_bus_id"]]
-        t_bus = bus2idx[row["to_bus_id"]]
+        if haskey(bus2idx, row["from_bus_id"]) && haskey(bus2idx, row["to_bus_id"])
+            f_bus = bus2idx[row["from_bus_id"]]
+            t_bus = bus2idx[row["to_bus_id"]]
 
-        dist = haversine_distance(busses[f_bus]["lat"], busses[f_bus]["lon"], busses[t_bus]["lat"], busses[t_bus]["lon"])
-        dist = maximum((0.25, dist)) # chose 0.25 km if the branch connects two busses at the same sub
+            dist = haversine_distance(busses[f_bus]["lat"], busses[f_bus]["lon"], busses[t_bus]["lat"], busses[t_bus]["lon"])
+            dist = maximum((0.25, dist)) # chose 0.25 km if the branch connects two busses at the same sub
 
-        branch = Dict(
-            "f_bus" => f_bus,
-            "t_bus" => t_bus,
-            "br_r" => row["r"],
-            "br_x" => row["x"],
-            "rate_a" => row["rateA"],
-            "br_status" => row["status"],
-            "br_type" => row["branch_device_type"],
-            "angmin" => row["angmin"],
-            "angmax" => row["angmax"],
-            "distance" => dist
-        )
+            branch = Dict(
+                "f_bus" => f_bus,
+                "t_bus" => t_bus,
+                "br_r" => row["r"],
+                "br_x" => row["x"],
+                "rate_a" => row["rateA"],
+                "br_status" => row["status"],
+                "br_type" => row["branch_device_type"],
+                "angmin" => row["angmin"],
+                "angmax" => row["angmax"],
+                "distance" => dist
+            )
 
-        # update arcs_from dictionary
-        if !haskey(arcs_from, f_bus)
-            arcs_from[f_bus] = [branch_idx]
-        else
-            push!(arcs_from[f_bus], branch_idx)
+            # update arcs_from dictionary
+            if !haskey(arcs_from, f_bus)
+                arcs_from[f_bus] = [branch_idx]
+            else
+                push!(arcs_from[f_bus], branch_idx)
+            end
+            if !haskey(arcs_from, t_bus)
+                arcs_from[t_bus] = [branch_idx]
+            else
+                push!(arcs_from[t_bus], branch_idx)
+            end
+
+            # update branch dictionary
+            branches[branch_idx] = branch
+
+            branch_idx += 1
         end
-        if !haskey(arcs_from, t_bus)
-            arcs_from[t_bus] = [branch_idx]
-        else
-            push!(arcs_from[t_bus], branch_idx)
-        end
-
-        # update branch dictionary
-        branches[branch_idx] = branch
-
-        branch_idx += 1
     end
+
+    """
+    # remove island buses
+    non_island_busses = filter(k -> haskey(arcs_from, k), keys(busses))
+    non_island_busses = collect(non_island_busses)
+    # remap bus indices (in busses)
+    new_bus2idx = Dict()
+    new_busses = Dict()
+    new_idx = 1
+    for old_idx in non_island_busses
+        new_bus2idx[busses[old_idx]["bus_id"]] = new_idx
+        new_busses[new_idx] = busses[old_idx]
+        new_idx += 1
+    end
+    # update branches to reflect new bus indices
+    new_branches = Dict()
+    for (branch_idx, branch) in branches
+        f_bus = new_bus2idx[busses[branch["f_bus"]]["bus_id"]]
+        t_bus = new_bus2idx[busses[branch["t_bus"]]["bus_id"]]
+        branch["f_bus"] = f_bus
+        branch["t_bus"] = t_bus
+        new_branches[branch_idx] = branch
+    end
+    # update arcs_from to reflect new bus indices
+    new_arcs_from = Dict{Any, Any}()
+    for (old_f_bus, branch_indices) in arcs_from
+        new_f_bus = new_bus2idx[busses[old_f_bus]["bus_id"]]
+        new_arcs_from[new_f_bus] = branch_indices
+    end
+    # reassign the new dicts to the old ones
+    bus2idx = new_bus2idx
+    busses = new_busses
+    branches = new_branches
+    arcs_from = new_arcs_from
+    """
 
     # create gencosts dictionary
     gencosts = Dict(row[:plant_id] => Dict("type" => row[:type], 
@@ -134,29 +189,31 @@ function create_p_data(region=nothing)
     for row in eachrow(df_gen)
 
         plant = row["plant_id"]
-        gen_bus = bus2idx[row["bus_id"]]
-        idx2gen[gen_idx] = plant
+        if haskey(bus2idx, row["bus_id"])
+            gen_bus = bus2idx[row["bus_id"]]
+            idx2gen[gen_idx] = plant
 
-        gens[gen_idx] = Dict(
-            "profile" => Dict(),
-            "cost" => gencosts[plant]["coeffs"],
-            "model" => gencosts[plant]["type"],
-            "ncost" => gencosts[plant]["n"],
-            "gen_bus" => gen_bus,
-            "gen_type" => row["type"],
-            "pmax" => row["Pmax"],
-            "pmin" => row["Pmin"],
-            "status" => row["status"]
-        )
+            gens[gen_idx] = Dict(
+                "profile" => Dict(),
+                "cost" => gencosts[plant]["coeffs"],
+                "model" => gencosts[plant]["type"],
+                "ncost" => gencosts[plant]["n"],
+                "gen_bus" => gen_bus,
+                "gen_type" => row["type"],
+                "pmax" => row["Pmax"],
+                "pmin" => row["Pmin"],
+                "status" => row["status"]
+            )
 
-        # update busses to track gens
-        if !haskey(busses[gen_bus]["gen"], row["type"])
-            busses[gen_bus]["gen"][row["type"]] = [gen_idx]
-        else
-            push!(busses[gen_bus]["gen"][row["type"]], gen_idx)
+            # update busses to track gens
+            if !haskey(busses[gen_bus]["gen"], row["type"])
+                busses[gen_bus]["gen"][row["type"]] = [gen_idx]
+            else
+                push!(busses[gen_bus]["gen"][row["type"]], gen_idx)
+            end
+
+            gen_idx += 1
         end
-
-        gen_idx += 1
     end
 
     p_data["bus"] = busses
@@ -168,17 +225,24 @@ function create_p_data(region=nothing)
     p_data["zone_pd"] = zone_pd
     p_data["idx2gen"] = idx2gen
 
+    # Set default values if region or iso are nothing
+    region_str = isnothing(region) ? "" : region
+    iso_str = isnothing(iso) ? "" : iso
+
+    # Clean up the file name if necessary
+    file_name = "power_system_data"
+    if !isempty(region_str)
+        file_name *= "_$region_str"
+    end
+    if !isempty(iso_str)
+        file_name *= "_$iso_str"
+    end
+
+    file_path = "data/topology/tamu/$file_name.json"
     json_data = JSON.json(p_data)
-    open("data/topology/tamu/power_system_data.json", "w") do file
+    open(file_path, "w") do file
         write(file, json_data)
     end
 
     return p_data
 end
-
-        
-
-    
-    
-
-

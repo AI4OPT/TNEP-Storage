@@ -67,6 +67,7 @@ data {
 
 using JuMP
 include("../../helpers/compute_gen_cost.jl")
+include("naive_candidates.jl")
 
 function create_model_r1(data::Dict{String, Any}, optimizer; prev_simdir=nothing)
 
@@ -235,7 +236,7 @@ function create_model_r1(data::Dict{String, Any}, optimizer; prev_simdir=nothing
     )
 
     # OPTIONAL: limit the number of storage locations
-    if haskey(data["param"], "max_num_storage") && data["param"]["max_num_storage"] > 0
+    if (haskey(data["param"], "max_num_storage") && data["param"]["max_num_storage"] >= 0)
         JuMP.@constraint(model, 
             storage_location_limit,
             sum(sigma[i] for i in 1:N) <= data["param"]["max_num_storage"]
@@ -283,6 +284,19 @@ function create_model_r1(data::Dict{String, Any}, optimizer; prev_simdir=nothing
         storage_linearization_4[r in 1:R, i in 1:N, t in 1:T],
         s_power[i] - beta[r,i,t] <= data["param"]["max_power_rating"] * (1 - alpha[r,i,t])
     )
+
+    # OPTIONAL: CANDIDATE STORAGE LOCATIONS ONLY
+    if haskey(data["param"], "candidate_analysis_seqsimdir")
+        seqsimdir = data["param"]["candidate_analysis_seqsimdir"]
+        decarbonization_year = data["param"]["decarbonization_year"]
+        filepath = "$(seqsimdir)/$(decarbonization_year)/output/energy.csv"
+        candidates, non_candidates = get_storage_candidates(data, filepath)
+        non_candidates = Set(parse(Int, x) for x in non_candidates)
+
+        JuMP.@constraint(model, storage_non_candidate[i in non_candidates],
+            sigma[i] == 0
+        )
+    end
 
     #
     #   III. Objective

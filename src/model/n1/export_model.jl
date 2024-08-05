@@ -4,8 +4,8 @@ using DataFrames
 
 function round_df(df)
     for col_name in names(df)
-        # Check if the column type is a subtype of AbstractFloat
-        if eltype(df[!, col_name]) <: AbstractFloat
+        # Check if the column type is a subtype of AbstractFloat and the column name is not Lat or Lon
+        if eltype(df[!, col_name]) <: AbstractFloat && col_name != "Lat" && col_name != "Lon"
             df[!, col_name] = round.(df[!, col_name], digits=3)
         end
     end

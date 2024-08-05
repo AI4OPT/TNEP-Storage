@@ -3,8 +3,6 @@ using JSON
 using CSV
 using DataFrames
 
-# COULD BE DEPRECATED
-
 function add_params(simdir::String)
     # Load config file
     config_file = joinpath(simdir, "config.toml")

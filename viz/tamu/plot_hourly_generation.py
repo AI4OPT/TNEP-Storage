@@ -113,4 +113,13 @@ plt.legend()
 plt.grid(True)
 plt.savefig(f'../../{simdir}/visual/ue.png')
 
+# Fourth plot: curtailed renewable energy
+plt.figure(figsize=(10,5))
+plt.plot(hours, renewable_production - renewable_outputs, label='Renewable Curtailment', marker='o')  # Plot renewable curtailment
+plt.title('Renewable Curtailment over Time')
+plt.xlabel('Hour of the Day')
+plt.ylabel('Energy (puh)')
+plt.legend()
+plt.grid(True)
+plt.savefig(f'../../{simdir}/visual/curtailed_hourly.png')
 

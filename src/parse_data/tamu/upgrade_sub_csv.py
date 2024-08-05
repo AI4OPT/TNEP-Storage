@@ -2,8 +2,8 @@ import geopandas as gpd
 import pandas as pd
 from shapely.geometry import Point
 
-GEOJSON_PATH = "../data/geojson/world.geojson"
-SUB_CSV_PATH = "../tamu/base_grid/sub.csv"
+GEOJSON_PATH = "../../../data/geojson/world.geojson"
+SUB_CSV_PATH = "../../tamu/base_grid/sub.csv"
 
 df = pd.read_csv(SUB_CSV_PATH)
 

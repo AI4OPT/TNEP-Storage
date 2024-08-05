@@ -9,7 +9,7 @@ include("create_model.jl")
 include("../n2/decarbonization.jl")
 include("create_summary.jl")
 
-function run_model(simdir; prev_simdir=nothing)
+function run_model(simdir; prev_simdir=nothing, timeout=84600)
     setup_simdir(simdir)
 
     data = add_params_profiles(simdir)
@@ -27,18 +27,23 @@ function run_model(simdir; prev_simdir=nothing)
     # set Gurobi log location
     set_optimizer_attribute(model, "LogFile", joinpath(simdir, "gurobi_logfile.log"))
     set_optimizer_attribute(model, "MIPGap", data["param"]["mip_gap"])
+    set_optimizer_attribute(model, "TimeLimit", timeout)
     optimize!(model)
 
-    if termination_status(model) != OPTIMAL 
+    if termination_status(model) != MOI.OPTIMAL
         println("Termination status not optimal")
+        # Export the solution even if it's suboptimal
+        export_model(simdir, model, data)
+        write_summary_to_csv(simdir, model, data)
         return model, data
     end
-            
-    if primal_status(model) != FEASIBLE_POINT
+
+    if primal_status(model) != MOI.FEASIBLE_POINT
         error("Primal status not feasible point")
     end
 
     export_model(simdir, model, data)
+    write_summary_to_csv(simdir, model, data)
 
     return model, data
 

@@ -4,6 +4,56 @@ import os
 import pandas as pd
 import matplotlib.pyplot as plt
 
+def read_summary_to_row(df, year):
+    # Convert the DataFrame to a dictionary and then to a single-row DataFrame
+    row_dict = df.set_index('Variable').to_dict()['Value']
+    row_dict['Year'] = year  # Add the year to the dictionary
+    row_df = pd.DataFrame([row_dict])
+    return row_df
+
+def plot_stacked_cost(df, seqsimdir):
+    df = df.sort_values(by='Year')
+    years = df['Year']
+    df.set_index('Year', inplace=True)
+    # Select only the relevant cost columns
+    cost_columns = ["over_generation_penalty", "under_served_penalty", "generation_costs", "storage_investment_costs", "line_investment_costs"]
+    cost_columns_without_under_served = ["over_generation_penalty", "generation_costs", "storage_investment_costs", "line_investment_costs"]
+
+    df_costs = df[cost_columns]
+    df_costs_without_under_served = df[cost_columns_without_under_served]
+
+    # Prepare the data for stackplot
+    values = [df_costs[category] for category in cost_columns]
+    values_without_under_served = [df_costs_without_under_served[category] for category in cost_columns_without_under_served]
+
+    # Plotting
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Stacked area plot with baseline set to zero
+    ax.stackplot(years, values, labels=cost_columns, baseline='zero')
+
+    # Add labels and title
+    ax.set_xlabel('Year')
+    ax.set_ylabel('Costs')
+    ax.set_title('Stacked Area Plot of Costs Over Years')
+    ax.legend(loc='upper left')
+    plt.xticks(fontsize='small') 
+    plt.xticks(rotation=90)
+    plt.savefig(os.path.join(seqsimdir, 'summary_costs.png'))
+
+    # Plotting without under_served_penalty
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.stackplot(years, values_without_under_served, labels=cost_columns_without_under_served)
+    ax.set_xlabel('Year')
+    ax.set_ylabel('Costs')
+    ax.set_title('Stacked Area Plot of Costs Over Years (Without Under Served Penalty)')
+    ax.legend(loc='upper left')
+    plt.xticks(fontsize='small')
+    plt.xticks(rotation=90)
+    plt.savefig(os.path.join(seqsimdir, 'summary_costs_without_under_served.png'))
+
+    return 0
+
 def create_and_save_plots(df, seqsimdir):
     df = df.sort_values(by='Year')
     # Set the figure size and adjust subplots
@@ -52,6 +102,8 @@ if __name__ == "__main__":
                                "Storage_Investments",
                                "Used_Renewables",
                                "Prod_Renewables"])
+    
+    summary_df = pd.DataFrame()
 
     for item in os.listdir(seqsimdir):
         # Construct the full path to the item
@@ -59,13 +111,14 @@ if __name__ == "__main__":
         # Check if this item is a directory
         if os.path.isdir(simdir):
             # Plot investments
-            subprocess.run(["python3", "plot_investments.py", os.path.join(inner_seqsimdir, item)], check=True)
+            # subprocess.run(["python3", "plot_investments.py", os.path.join(inner_seqsimdir, item)], check=True)
             # Plot hourly generation
-            subprocess.run(["python3", "plot_hourly_generation.py", os.path.join(inner_seqsimdir, item)], check=True)
+            # subprocess.run(["python3", "plot_hourly_generation.py", os.path.join(inner_seqsimdir, item)], check=True)
             # Read CSVs
             energy = pd.read_csv(f"{simdir}/output/energy.csv")
             line_inv = pd.read_csv(f"{simdir}/output/line_investments.csv")
             storage_inv = pd.read_csv(f"{simdir}/output/storage_investments.csv")
+            summary = pd.read_csv(f"{simdir}/output/summary_data.csv")
 
             year = item
             load_shed = energy[energy['Energy_Imbalance'] < 0]['Energy_Imbalance'].sum()
@@ -85,9 +138,14 @@ if __name__ == "__main__":
             })
             df = pd.concat([df, new_row], ignore_index=True)
 
+            # add to the summary_df
+            row_df = read_summary_to_row(summary, year)
+            summary_df = pd.concat([summary_df, row_df], ignore_index=True)
+
     df.to_csv(f"{seqsimdir}/seq_summary_results.csv", index=False)
     # Call the function with your DataFrame and directory
     create_and_save_plots(df, seqsimdir)
+    plot_stacked_cost(summary_df, seqsimdir)
 
 
 
