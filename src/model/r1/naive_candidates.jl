@@ -33,7 +33,3 @@ function get_storage_candidates(data, filepath)
 
     return keys_in_final_df, keys_not_in_final_df
 end
-
-
-
-

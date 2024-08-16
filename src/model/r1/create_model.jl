@@ -68,6 +68,7 @@ data {
 using JuMP
 include("../../helpers/compute_gen_cost.jl")
 include("naive_candidates.jl")
+include("rate_a_zero.jl")
 
 function create_model_r1(data::Dict{String, Any}, optimizer; prev_simdir=nothing)
 
@@ -175,13 +176,23 @@ function create_model_r1(data::Dict{String, Any}, optimizer; prev_simdir=nothing
     end
 
     # flow constraints
+    rate_a_zero, rate_a_nonzero = get_rate_a_zero(data)
+    rate_a_zero = Set(parse(Int, x) for x in rate_a_zero)
+    rate_a_nonzero = Set(parse(Int, x) for x in rate_a_nonzero)
+
     JuMP.@constraint(model, 
-        flow_lb[r in 1:R, a in 1:E, t in 1:T],
+        flow_lb[r in 1:R, a in rate_a_nonzero, t in 1:T],
         pf[r,a,t] >= -1 * data["branch"]["$a"]["rate_a"] - gamma[a] * data["param"]["cap_upgrade_increment"]
     )
     JuMP.@constraint(model, 
-        flow_ub[r in 1:R, a in 1:E, t in 1:T],
+        flow_ub[r in 1:R, a in rate_a_nonzero, t in 1:T],
         pf[r,a,t] <= data["branch"]["$a"]["rate_a"] + gamma[a] * data["param"]["cap_upgrade_increment"]
+    )
+
+    # if rate a is zero (unlimited), then don't allow upgrades
+    JuMP.@constraint(model, 
+        rate_a_zero_line_upgrade[a in rate_a_zero],
+        gamma[a] == 0
     )
 
     # Ohm's law constraint
@@ -293,9 +304,12 @@ function create_model_r1(data::Dict{String, Any}, optimizer; prev_simdir=nothing
         candidates, non_candidates = get_storage_candidates(data, filepath)
         non_candidates = Set(parse(Int, x) for x in non_candidates)
 
-        JuMP.@constraint(model, storage_non_candidate[i in non_candidates],
-            sigma[i] == 0
-        )
+        # JuMP.@constraint(model, storage_non_candidate[i in non_candidates],
+        #     sigma[i] == 0
+        # )
+        for i in non_candidates
+            fix(sigma[i], 0; force = true)
+        end
     end
 
     #
