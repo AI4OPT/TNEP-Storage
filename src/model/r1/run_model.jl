@@ -49,12 +49,6 @@ function run_model(simdir; prev_simdir=nothing, timeout=84600)
 
 end
 
-function export_model(simdir, model, data)
-    export_investments_csv(simdir, model, data)
-    export_energy_csv(simdir, model, data)
-    export_flow(simdir, model, data)
-end
-
 function run_sequential(seqsimdir, ending_year)
     ending_year = parse(Int, ending_year)
     config_file = joinpath(seqsimdir, "config.toml")

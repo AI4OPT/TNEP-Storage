@@ -17,11 +17,11 @@ function gen_energy(bus, gen_type, hour, pg, data)
     if !haskey(data["bus"]["$bus"]["gen"], gen_type)
         return 0.0
     else
-        return sum(pg[1,gen_id,hour] for gen_id in data["bus"]["$bus"]["gen"][gen_type])
+        return sum(pg[gen_id,hour] for gen_id in data["bus"]["$bus"]["gen"][gen_type])
     end
 end
 
-function get_renewable_production_by_bus(bus, data)
+function get_renewable_production_by_bus(bus, data, rep_index)
     renewable_production = Dict()
     renewable_types = data["param"]["renewable_types"]
     bus_gens = data["bus"][bus]["gen"]
@@ -30,9 +30,8 @@ function get_renewable_production_by_bus(bus, data)
         renewable_production[renewable_type] = zeros(data["param"]["num_hours"])
         if haskey(bus_gens, renewable_type)
             for gen_id in bus_gens[renewable_type]
-                profile = data["gen"]["$gen_id"]["profile"]
-                avg_time_series = mean(reduce(hcat, values(profile)), dims=2)
-                renewable_production[renewable_type] += avg_time_series
+                profile = data["gen"]["$gen_id"]["profile"]["$rep_index"]
+                renewable_production[renewable_type] += profile
             end
         end
     end
@@ -51,18 +50,18 @@ function rename_columns_with_suffix!(df::DataFrame, suffix::String)
     rename!(df, new_names)
 end
 
-function export_energy_csv(simdir, model, data)
+function export_energy_csv(simdir, model, data, rep_index)
 
-    ue = mean(value.(model[:ue]), dims=1)
-    oe = mean(value.(model[:oe]), dims=1)
-    ch = mean(value.(model[:ch]), dims=1)
-    dis = mean(value.(model[:dis]), dims=1)
+    ue = value.(model[:ue])[rep_index, :, :]
+    oe = value.(model[:oe])[rep_index, :, :]
+    ch = value.(model[:ch])[rep_index, :, :]
+    dis = value.(model[:dis])[rep_index, :, :]
     # ch = mean(value.(model[:ch]), dims=1) * data["param"]["bess_efficiency"]
     # dis = mean(value.(model[:dis]), dims=1) / data["param"]["bess_efficiency"]
-    imbalance = oe - ue # 1 x num_nodes x num_hours
+    imbalance = oe - ue # num_nodes x num_hours
 
-    num_nodes = size(imbalance, 2)
-    num_hours = size(imbalance, 3)
+    num_nodes = size(imbalance, 1)
+    num_hours = size(imbalance, 2)
 
     # Mappings (you need to define these based on your data)
     node_indices_mapping = ["$i" for i in 1:length(data["bus"])]
@@ -79,9 +78,9 @@ function export_energy_csv(simdir, model, data)
         lat_mapping[bus],
         lon_mapping[bus],
         hours_mapping[hour], 
-        imbalance[1,bus,hour],
-        ch[1,bus,hour],
-        dis[1,bus,hour]) 
+        imbalance[bus,hour],
+        ch[bus,hour],
+        dis[bus,hour]) 
             for bus in 1:num_nodes, hour in 1:num_hours]
 
     energy_flattened = [vec for row in eachrow(energy) for vec in row]
@@ -89,7 +88,7 @@ function export_energy_csv(simdir, model, data)
 
 
     # Now create the generator output information by fuel type
-    pg = mean(value.(model[:pg]), dims=1) # 1 x 210 x 24
+    pg = value.(model[:pg])[rep_index, :, :] # 1 x 210 x 24
     
     gen_types = vcat(data["param"]["renewable_types"], data["param"]["nonrenewable_types"])
     gen_array = Float64[]
@@ -107,7 +106,7 @@ function export_energy_csv(simdir, model, data)
     # Now create the renewable production information by fuel type (before curtailment)
     dfs = DataFrame[]
     for i in 1:length(data["bus"])
-        df_bus = get_renewable_production_by_bus("$i", data)
+        df_bus = get_renewable_production_by_bus("$i", data, rep_index)
         push!(dfs, df_bus)
     end
     df_renewable_prod = vcat(dfs...)
@@ -116,7 +115,8 @@ function export_energy_csv(simdir, model, data)
     # Horizontally concatenate the imbalance and generation information
     df_energy = hcat(df_imbalance, df_generation, df_renewable_prod) 
     df_energy = round_df(df_energy)
-    CSV.write(joinpath(simdir, "output", "energy.csv"), df_energy)
+    datestring = data["param"]["dates"][rep_index]
+    CSV.write(joinpath(simdir, "output", datestring, "energy.csv"), df_energy)
 end
 
 function export_investments_csv(simdir, model, data)
@@ -150,10 +150,10 @@ function export_investments_csv(simdir, model, data)
     CSV.write(joinpath(simdir, "output", "storage_investments.csv"), df_storage)
 end
 
-function export_flow(simdir, model, data)
-    pfs = mean(value.(model[:pf]), dims=1)
-    num_branches = size(pfs, 2)
-    num_hours = size(pfs, 3)
+function export_flow(simdir, model, data, rep_index)
+    pfs = value.(model[:pf])[rep_index, :, :]
+    num_branches = size(pfs, 1)
+    num_hours = size(pfs, 2)
 
     # Mappings (you need to define these based on your data)
     branch_indices_mapping = ["$i" for i in 1:length(data["branch"])]
@@ -175,14 +175,22 @@ function export_flow(simdir, model, data)
         lon2_mapping[branch],
         hours_mapping[hour], 
         thermal_limits_mapping[branch],
-        pfs[1,branch,hour]) 
+        pfs[branch,hour]) 
             for branch in 1:num_branches, hour in 1:num_hours]
 
     flow_flattened = [vec for row in eachrow(flow) for vec in row]
     df_flow = DataFrame(flow_flattened, Symbol.(column_names))
 
     df_flow = round_df(df_flow)
-    CSV.write(joinpath(simdir, "output", "flow.csv"), df_flow)
+    datestring = data["param"]["dates"][rep_index]
+    CSV.write(joinpath(simdir, "output", datestring, "flow.csv"), df_flow)
 end
 
-# ue, oe, pf, dis, ch = value.(model[:ue]), value.(model[:oe]), value.(model[:pf]), value.(model[:dis]), value.(model[:ch])
+function export_model(simdir, model, data)
+    export_investments_csv(simdir, model, data)
+
+    for rep_index in 1:length(data["param"]["dates"])
+        export_energy_csv(simdir, model, data, rep_index)
+        export_flow(simdir, model, data, rep_index)
+    end
+end

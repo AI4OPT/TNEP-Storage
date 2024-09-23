@@ -316,12 +316,17 @@ function create_model_r1(data::Dict{String, Any}, optimizer; prev_simdir=nothing
     #   III. Objective
     #
 
+    operational_weight = 1
+    if haskey(data["param"], "operational_weight")
+        operational_weight = data["param"]["operational_weight"]
+    end
+
     JuMP.@objective(model, Min,
     sum(s_power[i] * data["param"]["bess_power_cost"] + s_energy[i] * data["param"]["bess_energy_cost"] for i in 1:N) +
     sum(sigma[i] for i in 1:N) * data["param"]["storage_fixed_cost"] + 
     sum(data["param"]["cap_upgrade_cost"] * data["param"]["cap_upgrade_increment"] * data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
     sum(
-        data["representative_prob"][r] *
+        data["param"]["representative_prob"][r] *
         (
             sum(
                 sum(compute_gen_cost(pg[r,g,t], data["gen"]["$g"]) for g in 1:G) +
@@ -329,7 +334,7 @@ function create_model_r1(data::Dict{String, Any}, optimizer; prev_simdir=nothing
                 sum(data["param"]["under_served_penalty"] * ue[r,i,t] for i in 1:N)
             for t in 1:T)
         )
-    for r in 1:R)
+    for r in 1:R) * operational_weight
     )
     
     return model

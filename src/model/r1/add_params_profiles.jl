@@ -2,6 +2,11 @@ using TOML
 using JSON
 using CSV
 using DataFrames
+using Dates
+
+FROM_UTC_TIMEZONE_SHIFT = Dict(
+    "CDT" => -5
+)
 
 function add_params(simdir::String)
     # Load config file
@@ -50,9 +55,11 @@ function add_profiles(data)
     end
 
     # Create the representative probabilities
-    data["representative_prob"] = Dict{Int, Float64}()
-    for i in 1:num_r
-        data["representative_prob"][i] = 1 / num_r
+    if !haskey(data["param"], "representative_prob") || data["param"]["representative_prob"] == true                  
+        data["param"]["representative_prob"] = Dict{Int, Float64}()
+        for i in 1:num_r
+            data["param"]["representative_prob"][i] = 1 / num_r
+        end
     end
 
     # Load the demand, solar, and wind time-series
@@ -61,6 +68,26 @@ function add_profiles(data)
     solar_df = CSV.read(joinpath(ts_dir, "solar.csv"), DataFrame)
     wind_df = CSV.read(joinpath(ts_dir, "wind.csv"), DataFrame)
     hydro_df = CSV.read(joinpath(ts_dir, "hydro.csv"), DataFrame)
+
+    # Shift timezone if specified
+    timezone = "UTC"
+    if haskey(data["param"], "timezone")
+        timezone = data["param"]["timezone"] 
+    end
+
+    if timezone != "UTC" && haskey(FROM_UTC_TIMEZONE_SHIFT, timezone)
+        shift_hours = FROM_UTC_TIMEZONE_SHIFT[timezone]
+
+        # Function to apply the shift
+        function apply_timezone_shift!(df, time_column::Symbol)
+            df[!, time_column] = DateTime.(df[!, time_column], "yyyy-mm-dd HH:MM:SS") .+ Hour(shift_hours)
+        end
+
+        apply_timezone_shift!(demand_df, Symbol("UTC Time"))
+        apply_timezone_shift!(solar_df, Symbol("UTC"))
+        apply_timezone_shift!(wind_df, Symbol("UTC"))
+        apply_timezone_shift!(hydro_df, Symbol("UTC"))
+    end
 
     rep_index = 1
 
@@ -84,12 +111,22 @@ function add_profiles(data)
     end
 end
 
+function make_date_subdirs(simdir, data)
+    for date in data["param"]["dates"]
+        dirname = joinpath(simdir, "output", date)
+        if !isdir(dirname)
+            mkdir(dirname)
+        end
+    end
+end
+
 function add_params_profiles(simdir)
     data = add_params(simdir)
     add_profiles(data)
+    make_date_subdirs(simdir, data)
 
     # Calculate and check the sum of representatives' probabilities
-    sum_probabilities = sum(values(data["representative_prob"]))
+    sum_probabilities = sum(values(data["param"]["representative_prob"]))
     if abs(sum_probabilities - 1) > 1e-5
         error_message = "Representatives' probabilities do not sum to 1: $sum_probabilities"
         throw(InvalidProbabilitySumError(error_message))

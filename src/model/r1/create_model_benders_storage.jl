@@ -60,6 +60,12 @@ function define_master_storage(data::Dict{String, Any}; prev_simdir=nothing)
         s_energy[i] <= 4.0 * s_power[i]
     )
 
+    # energy rating should be greater than power rating for each storage
+    JuMP.@constraint(master, 
+        more_energy_than_power[i in 1:N],
+        s_energy[i] >= s_power[i]
+    )
+
     # OPTIONAL: CANDIDATE STORAGE LOCATIONS ONLY
     if haskey(data["param"], "candidate_analysis_seqsimdir")
         seqsimdir = data["param"]["candidate_analysis_seqsimdir"]
@@ -145,10 +151,10 @@ function solve_subproblem_storage(simdir, y_val, data)
     JuMP.@variable(sub, pf[r=1:R, a=1:E, t=1:T])
 
     # power rating of storage
-    JuMP.@variable(sub, s_power[i=1:N] >= 0)
+    JuMP.@variable(sub, s_power[i=1:N])
 
     # energy rating of storage
-    JuMP.@variable(sub, s_energy[i=1:N] >= 0)
+    JuMP.@variable(sub, s_energy[i=1:N])
 
     # voltage angles
     JuMP.@variable(sub, va[r=1:R, i=1:N, t=1:T])
@@ -163,13 +169,7 @@ function solve_subproblem_storage(simdir, y_val, data)
     JuMP.@variable(sub, dis[r=1:R, i=1:N, t=1:T] >= 0)
 
     # binary variable for installation of storage
-    JuMP.@variable(sub, sigma[i=1:N], Bin)
-
-    # binary variable indicating charge/discharge
-    JuMP.@variable(sub, alpha[r=1:R, i=1:N, t=1:T], Bin)
-    
-    # linearizing (continuous) variable
-    JuMP.@variable(sub, beta[r=1:R, i=1:N, t=1:T] >= 0)
+    JuMP.@variable(sub, sigma[i=1:N])
 
     #
     #   II. Constraints
@@ -246,22 +246,14 @@ function solve_subproblem_storage(simdir, y_val, data)
         soc[r,i,t] <= s_energy[i]
     )
 
-    # ~~~ STORAGE SOC LINEARIZATION CONSTRAINTS ~~~
-    JuMP.@constraint(sub, 
-        storage_linearization_1[r in 1:R, i in 1:N, t in 1:T],
-        data["param"]["bess_efficiency"] * ch[r,i,t] <= beta[r,i,t]
+    # charge and discharge constraints
+    JuMP.@constraint(sub,
+        ch_ub[r in 1:R, i in 1:N, t in 1:T],
+        ch[r,i,t] * data["param"]["bess_efficiency"] <= s_power[i]  
     )
-    JuMP.@constraint(sub, 
-        storage_linearization_2[r in 1:R, i in 1:N, t in 1:T],
-        dis[r,i,t] / data["param"]["bess_efficiency"] <= s_power[i] - beta[r,i,t]
-    )
-    JuMP.@constraint(sub, 
-        storage_linearization_3[r in 1:R, i in 1:N, t in 1:T],
-        beta[r,i,t] <= data["param"]["max_power_rating"] * alpha[r,i,t]
-    )
-    JuMP.@constraint(sub, 
-        storage_linearization_4[r in 1:R, i in 1:N, t in 1:T],
-        s_power[i] - beta[r,i,t] <= data["param"]["max_power_rating"] * (1 - alpha[r,i,t])
+    JuMP.@constraint(sub,
+        dis_ub[r in 1:R, i in 1:N, t in 1:T],
+        dis[r,i,t] / data["param"]["bess_efficiency"] <= s_power[i]  
     )
 
     # MASTER PROBLEM FIXED DECISIONS
@@ -311,11 +303,13 @@ end
 function add_benders_cut_storage(master, theta, duals, y, y_val, theta_val)
     y_concat = vcat(y[1], y[2], y[3])   # Combine s_power, s_energy, sigma
     y_val_concat = vcat(y_val[1], y_val[2], y_val[3])
-    JuMP.@constraint(master, theta >= theta_val + dot(duals, y .- y_val))
+    duals_concat = vcat(duals[1], duals[2], duals[3])
+    JuMP.@constraint(master, theta >= theta_val + sum(duals_concat .* (y_concat .- y_val_concat)))
 end
 
 function benders_iteration_storage(simdir, master, y, theta, data)
     converged = false
+
     while !converged
         # solve master and decide investments
         optimize!(master)
@@ -326,16 +320,50 @@ function benders_iteration_storage(simdir, master, y, theta, data)
         
         # get the subproblem objective and duals
         theta_val, duals = solve_subproblem_storage(simdir, y_val, data)
+
+        # save the progress in a csv
+        filename = joinpath(simdir, "output", "benders_progress.csv")
+        benders_storage_write_to_csv(filename, objective_value(master), theta_val, value(master[:theta]), s_power_val, s_energy_val, sigma_val)
         
         if is_converged(theta_val, value.(master[:theta]))
             converged = true
         else
-            y = s_power, s_energy, sigma
-            add_benders_cut_storage(master, theta, duals, y, y_val, theta_val)
+            y = master[:s_power], master[:s_energy], master[:sigma]
+            add_benders_cut_storage(master, master[:theta], duals, y, y_val, theta_val)
         end
     end
+
+    return s_power_val, s_energy_val, sigma_val
 end
 
 function benders_only_storage(simdir, data)
     master, y, theta = define_master_storage(data)
     benders_iteration_storage(simdir, master, y, theta, data)
+end
+
+function is_converged(theta_val, theta_old, tol=0.01)
+    if theta_old == 0
+        return abs(theta_val) < tol * (1 + abs(theta_val))
+    else
+        return abs(theta_val - theta_old) / abs(theta_old) < tol
+    end
+end
+
+function benders_storage_write_to_csv(filename, master_obj, theta_val, theta_old_val, s_power_val, s_energy_val, sigma_val)
+    # Prepare the data row
+    df = DataFrame(
+        master_objective = [master_obj],
+        theta_val = [theta_val],
+        theta_old_val = [theta_old_val],
+        s_power = [s_power_val],
+        s_energy = [s_energy_val],
+        sigma = [sigma_val],
+    )
+
+    # Write to CSV, appending to it
+    if isfile(filename)
+        CSV.write(filename, df; append = true, header = false)
+    else
+        CSV.write(filename, df)
+    end
+end

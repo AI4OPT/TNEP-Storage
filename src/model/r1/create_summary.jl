@@ -39,22 +39,27 @@ function write_summary_to_csv(simdir, model, data)
     T = data["param"]["num_hours"]
     N = length(data["bus"])
 
+    operational_weight = 1
+    if haskey(data["param"], "operational_weight")
+        operational_weight = data["param"]["operational_weight"]
+    end
+
     # Generation costs
-    generation_costs = sum(data["representative_prob"][r] * 
+    generation_costs = operational_weight * sum(data["param"]["representative_prob"][r] * 
         sum(
             sum(compute_gen_cost(pg[r,g,t], data["gen"]["$g"]) for g in 1:G)
         for t in 1:T)
     for r in 1:R)
 
     # Overgeneration penalty
-    over_generation_penalty = sum(data["representative_prob"][r] * 
+    over_generation_penalty = operational_weight * sum(data["param"]["representative_prob"][r] * 
         sum(
             sum(data["param"]["over_generated_penalty"] * oe[r,i,t] for i in 1:N)
         for t in 1:T)
     for r in 1:R)
     
     # Underserved penalty
-    under_served_penalty = sum(data["representative_prob"][r] * 
+    under_served_penalty = operational_weight * sum(data["param"]["representative_prob"][r] * 
         sum(
             sum(data["param"]["under_served_penalty"] * ue[r,i,t] for i in 1:N)
         for t in 1:T)
