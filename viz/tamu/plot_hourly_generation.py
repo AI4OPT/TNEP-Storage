@@ -79,6 +79,7 @@ for rep_index in range(1, len(data["param"]["dates"]) + 1):
     plt.legend()
     plt.grid(True)
     plt.savefig(f'../../{simdir}/output/{date}/hourly_generation.png')
+    plt.close()
 
     # Second plot: stacked plot
     stacked_production = renewable_production + nonrenewable_outputs + discharge_amount
@@ -96,6 +97,7 @@ for rep_index in range(1, len(data["param"]["dates"]) + 1):
     plt.legend()
     plt.grid(True)
     plt.savefig(f'../../{simdir}/output/{date}/stacked_hourly_generation.png')
+    plt.close()
 
     # Third plot: unserved energy
     ue = np.zeros(NUM_HOURS)
@@ -113,6 +115,7 @@ for rep_index in range(1, len(data["param"]["dates"]) + 1):
     plt.legend()
     plt.grid(True)
     plt.savefig(f'../../{simdir}/output/{date}/ue.png')
+    plt.close()
 
     # Fourth plot: curtailed renewable energy
     plt.figure(figsize=(10,5))
@@ -123,4 +126,5 @@ for rep_index in range(1, len(data["param"]["dates"]) + 1):
     plt.legend()
     plt.grid(True)
     plt.savefig(f'../../{simdir}/output/{date}/curtailed_hourly.png')
+    plt.close()
 

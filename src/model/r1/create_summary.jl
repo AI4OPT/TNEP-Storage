@@ -1,3 +1,5 @@
+include("naive_candidates.jl")
+
 function write_summary_to_csv(simdir, model, data)
 
     # Get number of line investments
@@ -13,7 +15,6 @@ function write_summary_to_csv(simdir, model, data)
 
     # Average storage capacity
     avg_storage_capacity = total_storage_capacity / num_storage_investments
-
 
     # Get line investment costs
     col_data = df_line_investments[!, :Upgrade_Lvl]
@@ -65,6 +66,13 @@ function write_summary_to_csv(simdir, model, data)
         for t in 1:T)
     for r in 1:R)
 
+    # Number of storage candidates, if available
+    storage_cand_count = length(data["bus"])
+    if haskey(data["param"], "candidate_no_upgrades_dir")
+        bus_set = intersect_storage_candidates(data, data["param"]["candidate_no_upgrades_dir"])
+        storage_cand_count = length(bus_set)
+    end
+
     summary_data = DataFrame(
         Variable = [
             "over_generation_penalty", 
@@ -75,7 +83,8 @@ function write_summary_to_csv(simdir, model, data)
             "num_line_investments", 
             "num_storage_investments", 
             "total_storage_capacity", 
-            "avg_storage_capacity"
+            "avg_storage_capacity",
+            "storage_cand_count"
         ],
         Value = [
             over_generation_penalty, 
@@ -86,7 +95,8 @@ function write_summary_to_csv(simdir, model, data)
             num_line_investments, 
             num_storage_investments, 
             total_storage_capacity, 
-            avg_storage_capacity
+            avg_storage_capacity,
+            storage_cand_count
         ]
     )
 

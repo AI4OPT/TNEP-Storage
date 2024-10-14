@@ -297,11 +297,12 @@ function create_model_r1(data::Dict{String, Any}, optimizer; prev_simdir=nothing
     )
 
     # OPTIONAL: CANDIDATE STORAGE LOCATIONS ONLY
-    if haskey(data["param"], "candidate_analysis_seqsimdir")
-        seqsimdir = data["param"]["candidate_analysis_seqsimdir"]
-        decarbonization_year = data["param"]["decarbonization_year"]
-        filepath = "$(seqsimdir)/$(decarbonization_year)/output/energy.csv"
-        candidates, non_candidates = get_storage_candidates(data, filepath)
+    if haskey(data["param"], "candidate_no_upgrades_dir")
+        no_upgrades_dir = data["param"]["candidate_no_upgrades_dir"]
+        candidates = intersect_storage_candidates(data, no_upgrades_dir)
+
+        all_busses = Set(keys(data["bus"]))
+        non_candidates = setdiff(all_busses, candidates)
         non_candidates = Set(parse(Int, x) for x in non_candidates)
 
         # JuMP.@constraint(model, storage_non_candidate[i in non_candidates],
@@ -310,6 +311,8 @@ function create_model_r1(data::Dict{String, Any}, optimizer; prev_simdir=nothing
         for i in non_candidates
             fix(sigma[i], 0; force = true)
         end
+
+        println("Number of candidates: $(length(candidates))")
     end
 
     #

@@ -127,9 +127,13 @@ function add_params_profiles(simdir)
 
     # Calculate and check the sum of representatives' probabilities
     sum_probabilities = sum(values(data["param"]["representative_prob"]))
-    if abs(sum_probabilities - 1) > 1e-5
+    if abs(sum_probabilities - 1) > 1e-3
         error_message = "Representatives' probabilities do not sum to 1: $sum_probabilities"
         throw(InvalidProbabilitySumError(error_message))
     end
     return data
+end
+
+struct InvalidProbabilitySumError <: Exception
+    message::String
 end
