@@ -5,7 +5,7 @@ using DataFrames
 function round_df(df)
     for col_name in names(df)
         # Check if the column type is a subtype of AbstractFloat and the column name is not Lat or Lon
-        if eltype(df[!, col_name]) <: AbstractFloat && col_name != "Lat" && col_name != "Lon"
+        if eltype(df[!, col_name]) <: AbstractFloat
             df[!, col_name] = round.(df[!, col_name], digits=3)
         end
     end
@@ -51,45 +51,77 @@ function rename_columns_with_suffix!(df::DataFrame, suffix::String)
 end
 
 function export_energy_csv(simdir, model, data, rep_index)
-
     ue = value.(model[:ue])[rep_index, :, :]
-    oe = value.(model[:oe])[rep_index, :, :]
     ch = value.(model[:ch])[rep_index, :, :]
-    dis = value.(model[:dis])[rep_index, :, :]
-    # ch = mean(value.(model[:ch]), dims=1) * data["param"]["bess_efficiency"]
-    # dis = mean(value.(model[:dis]), dims=1) / data["param"]["bess_efficiency"]
-    imbalance = oe - ue # num_nodes x num_hours
+    
+    # Check if 'oe' exists in the model
+    has_oe = haskey(model, :oe)
+    oe = has_oe ? value.(model[:oe])[rep_index, :, :] : zeros(size(ue))
+    
+    # Check if 'dis' exists in the model
+    has_dis = haskey(model, :dis)
+    dis = has_dis ? value.(model[:dis])[rep_index, :, :] : zeros(size(ch))
+
+    # If 'dis' doesn't exist, infer discharge from negative 'ch' values
+    if !has_dis
+        for bus in 1:size(ch, 1), hour in 1:size(ch, 2)
+            if ch[bus, hour] < 0
+                dis[bus, hour] = -ch[bus, hour]  # Assign negative charge to discharge
+                ch[bus, hour] = 0                # Set charge to zero
+            end
+        end
+    end
+
+    imbalance = oe - ue  # num_nodes x num_hours
 
     num_nodes = size(imbalance, 1)
     num_hours = size(imbalance, 2)
 
-    # Mappings (you need to define these based on your data)
+    # Mappings
     node_indices_mapping = ["$i" for i in 1:length(data["bus"])]
     node_names_mapping = [data["bus"]["$i"]["bus_name"] for i in 1:length(data["bus"])]
     lat_mapping = [data["bus"]["$i"]["lat"] for i in 1:length(data["bus"])]
     lon_mapping = [data["bus"]["$i"]["lon"] for i in 1:length(data["bus"])]
     hours_mapping = 1:data["param"]["num_hours"]
 
-    column_names = [:Node_Index, :Node_Name, :Lat, :Lon, :Hour, :Energy_Imbalance, :Charge, :Discharge]
+    # Add OE to column names if it exists
+    column_names = if has_oe
+        [:Node_Index, :Node_Name, :Lat, :Lon, :Hour, :Energy_Imbalance, :Over_Energy, :Under_Energy, :Charge, :Discharge]
+    else
+        [:Node_Index, :Node_Name, :Lat, :Lon, :Hour, :Energy_Imbalance, :Charge, :Discharge]
+    end
 
-    # Flatten the array and create DataFrame
-    energy = [(node_indices_mapping[bus], 
-        node_names_mapping[bus],
-        lat_mapping[bus],
-        lon_mapping[bus],
-        hours_mapping[hour], 
-        imbalance[bus,hour],
-        ch[bus,hour],
-        dis[bus,hour]) 
-            for bus in 1:num_nodes, hour in 1:num_hours]
+    # Flatten the array and create DataFrame with optional OE
+    energy = if has_oe
+        [(node_indices_mapping[bus],
+          node_names_mapping[bus],
+          lat_mapping[bus],
+          lon_mapping[bus],
+          hours_mapping[hour],
+          imbalance[bus, hour],
+          oe[bus, hour],
+          ue[bus, hour],
+          ch[bus, hour],
+          dis[bus, hour])
+          for bus in 1:num_nodes, hour in 1:num_hours]
+    else
+        [(node_indices_mapping[bus],
+          node_names_mapping[bus],
+          lat_mapping[bus],
+          lon_mapping[bus],
+          hours_mapping[hour],
+          imbalance[bus, hour],
+          ch[bus, hour],
+          dis[bus, hour])
+          for bus in 1:num_nodes, hour in 1:num_hours]
+    end
 
     energy_flattened = [vec for row in eachrow(energy) for vec in row]
     df_imbalance = DataFrame(energy_flattened, Symbol.(column_names))
 
-
-    # Now create the generator output information by fuel type
-    pg = value.(model[:pg])[rep_index, :, :] # 1 x 210 x 24
-    
+    # Rest of the function remains the same
+    # Generator output by fuel type
+    pg = value.(model[:pg])[rep_index, :, :]
     gen_types = vcat(data["param"]["renewable_types"], data["param"]["nonrenewable_types"])
     gen_array = Float64[]
 
@@ -103,7 +135,7 @@ function export_energy_csv(simdir, model, data, rep_index)
     end
     df_generation = DataFrame(gen_array, Symbol.(gen_types))
 
-    # Now create the renewable production information by fuel type (before curtailment)
+    # Renewable production by bus
     dfs = DataFrame[]
     for i in 1:length(data["bus"])
         df_bus = get_renewable_production_by_bus("$i", data, rep_index)
@@ -112,9 +144,10 @@ function export_energy_csv(simdir, model, data, rep_index)
     df_renewable_prod = vcat(dfs...)
     rename_columns_with_suffix!(df_renewable_prod, "_production")
 
-    # Horizontally concatenate the imbalance and generation information
-    df_energy = hcat(df_imbalance, df_generation, df_renewable_prod) 
+    # Combine all DataFrames
+    df_energy = hcat(df_imbalance, df_generation, df_renewable_prod)
     df_energy = round_df(df_energy)
+    
     datestring = data["param"]["dates"][rep_index]
     CSV.write(joinpath(simdir, "output", datestring, "energy.csv"), df_energy)
 end
@@ -151,17 +184,43 @@ function export_investments_csv(simdir, model, data)
 end
 
 function export_flow(simdir, model, data, rep_index)
-    pfs = value.(model[:pf])[rep_index, :, :]
+    # Check if we're using PTDF model or direct flow variables
+    if haskey(model, :pf)
+        # Original model with direct flow variables
+        pfs = value.(model[:pf])[rep_index, :, :]
+    else
+        # PTDF model - calculate flows
+        pg_values = value.(model[:pg])[rep_index:rep_index, :, :]
+        ue_values = value.(model[:ue])[rep_index:rep_index, :, :]
+        
+        num_branches = length(data["branch"])
+        num_hours = data["param"]["num_hours"]
+        flows = zeros(num_branches, 1, num_hours)
+        
+        compute_flows!(flows, pg_values, ue_values, data, model.ext[:PTDF])
+        pfs = flows[:, 1, :]
+    end
+
     num_branches = size(pfs, 1)
     num_hours = size(pfs, 2)
 
-    # Mappings (you need to define these based on your data)
+    # Mappings (same as before)
     branch_indices_mapping = ["$i" for i in 1:length(data["branch"])]
     lat1_mapping = [data["bus"][string(data["branch"]["$i"]["f_bus"])]["lat"] for i in 1:length(data["branch"])]
     lon1_mapping = [data["bus"][string(data["branch"]["$i"]["f_bus"])]["lon"] for i in 1:length(data["branch"])]
     lat2_mapping = [data["bus"][string(data["branch"]["$i"]["t_bus"])]["lat"] for i in 1:length(data["branch"])]
     lon2_mapping = [data["bus"][string(data["branch"]["$i"]["t_bus"])]["lon"] for i in 1:length(data["branch"])]
-    thermal_limits_mapping = [data["branch"]["$i"]["rate_a"] for i in 1:length(data["branch"])]
+    
+    # Get thermal limits including any upgrades if they exist
+    if haskey(model, :gamma)
+        gamma_values = value.(model[:gamma])
+        thermal_limits_mapping = [
+            data["branch"]["$i"]["rate_a"] + gamma_values[i] * get_capacity_increment(data, i) 
+            for i in 1:length(data["branch"])
+        ]
+    else
+        thermal_limits_mapping = [data["branch"]["$i"]["rate_a"] for i in 1:length(data["branch"])]
+    end
 
     hours_mapping = 1:data["param"]["num_hours"]
 

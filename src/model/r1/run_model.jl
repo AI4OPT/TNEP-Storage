@@ -1,4 +1,5 @@
 using Gurobi
+# using CPLEX
 using JSON
 
 include("../../helpers/convert_units.jl")
@@ -6,23 +7,55 @@ include("../../helpers/setup_simdir.jl")
 include("add_params_profiles.jl")
 include("../n1/export_model.jl")
 include("create_model.jl")
+include("create_model_storage_linearized.jl")
 include("../n2/decarbonization.jl")
 include("create_summary.jl")
+include("ptdf/create_model_ptdf.jl")
+include("ptdf/ptdf_iterative.jl")
 
-function run_model(simdir; prev_simdir=nothing, timeout=84600)
+function run_model(simdir; timeout=84600)
     setup_simdir(simdir)
 
-    data = add_params_profiles(simdir)
-    data = update_decarbonization(simdir, data)
-    data = convert_units(data)
-    json_data = JSON.json(data)
-    open(joinpath(simdir, "data.json"), "w") do file
-        JSON.print(file, data)
+    data_path = joinpath(simdir, "data.json")
+    data = nothing
+    # if isfile(data_path)
+    if 0 == 1
+        # If file exists, read it directly
+        data = JSON.parsefile(data_path)
+    else
+        # Otherwise, perform the other actions and write the file
+        data = add_params_profiles(simdir)
+        data = update_decarbonization(simdir, data)
+        data = convert_units(data)
+        
+        # Write the JSON file once profiles are added and units fixed
+        open(data_path, "w") do file
+            JSON.print(file, data)
+        end
     end
 
+    # check if there are prior investments file
+    line_investments = isfile(joinpath(simdir, "line_investments.csv")) ? joinpath(simdir, "line_investments.csv") : nothing
+    storage_investments = isfile(joinpath(simdir, "storage_investments.csv")) ? joinpath(simdir, "storage_investments.csv") : nothing
+
     # create the model
+    # optimizer = CPLEX.Optimizer
     optimizer = Gurobi.Optimizer
-    model = create_model_r1(data, optimizer, prev_simdir=prev_simdir)
+
+    model = nothing
+    if !haskey(data["param"], "storage_linearized") || data["param"]["storage_linearized"] == false
+        model = create_model_r1(data, optimizer,  
+            line_investments=line_investments, 
+            storage_investments=storage_investments)
+    elseif data["param"]["storage_linearized"] == "ptdf"
+        model = create_model_r1_ptdf_iterative(data, optimizer,  
+            line_investments=line_investments, 
+            storage_investments=storage_investments)
+    else
+        model = create_model_r1_sl(data, optimizer,  
+            line_investments=line_investments, 
+            storage_investments=storage_investments)
+    end
 
     # set Gurobi log location
     set_optimizer_attribute(model, "LogFile", joinpath(simdir, "gurobi_logfile.log"))

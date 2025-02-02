@@ -67,10 +67,10 @@ data {
 
 using JuMP
 include("../../helpers/compute_gen_cost.jl")
-include("naive_candidates.jl")
+include("storage_candidates/naive_candidates.jl")
 include("rate_a_zero.jl")
 
-function create_model_r1(data::Dict{String, Any}, optimizer; prev_simdir=nothing)
+function create_model_r1(data::Dict{String, Any}, optimizer; line_investments=nothing, storage_investments=nothing)
 
     # Initialize model
     model = JuMP.Model(optimizer)
@@ -147,20 +147,29 @@ function create_model_r1(data::Dict{String, Any}, optimizer; prev_simdir=nothing
     # binary variable for installation of storage
     JuMP.@variable(model, sigma[i=1:N], Bin)
 
-    # binary variable indicating charge/discharge
-    JuMP.@variable(model, alpha[r=1:R, i=1:N, t=1:T], Bin)
-    
-    # linearizing (continuous) variable
-    JuMP.@variable(model, beta[r=1:R, i=1:N, t=1:T] >= 0)
+    if !haskey(data["param"], "charge_norm") || data["param"]["charge_norm"] == false
+        # binary variable indicating charge/discharge
+        JuMP.@variable(model, alpha[r=1:R, i=1:N, t=1:T], Bin)
+        
+        # linearizing (continuous) variable
+        JuMP.@variable(model, beta[r=1:R, i=1:N, t=1:T] >= 0)
+    end
 
     #
     #   II. Constraints
     #
 
     # if prev model as input, enforce old investment upgrades (gamma, s_power, s_energy)
-    if prev_simdir !== nothing
+    nonzero_storage_nodes = Set()
+    if haskey(data["param"], "prev_simdir")
+        prev_simdir = data["param"]["prev_simdir"]
         line_inv = CSV.read(joinpath(prev_simdir, "output", "line_investments.csv"), DataFrame)
         storage_inv = CSV.read(joinpath(prev_simdir, "output", "storage_investments.csv"), DataFrame)
+        for i in 1:N
+            if storage_inv[i, :Storage_Power] != 0 || storage_inv[i, :Storage_Energy] != 0
+                push!(nonzero_storage_nodes, "$i")
+            end
+        end
         JuMP.@constraint(model,
             old_gamma[a in 1:E],
             gamma[a] >= line_inv[a, :Upgrade_Lvl]
@@ -175,6 +184,30 @@ function create_model_r1(data::Dict{String, Any}, optimizer; prev_simdir=nothing
         )
     end
 
+    # if there are investments to test, enforce these exact upgrades
+    if line_investments !== nothing
+        inv = CSV.read(line_investments, DataFrame)
+        JuMP.@constraint(model,
+        inv_gamma[a in 1:E],
+        gamma[a] == inv[a, :Upgrade_Lvl]
+        )
+    end
+    if storage_investments !== nothing
+        inv = CSV.read(storage_investments, DataFrame)
+        JuMP.@constraint(model,
+        inv_s_power[i in 1:N],
+        s_power[i] == inv[i, :Storage_Power]
+        )
+        JuMP.@constraint(model,
+        inv_s_energy[i in 1:N],
+        s_energy[i] == inv[i, :Storage_Energy]
+        )
+        JuMP.@constraint(model,
+        inv_sigma[i in 1:N],
+        sigma[i] == ((inv[i, :Storage_Power] != 0 || inv[i, :Storage_Energy] != 0) ? 1 : 0)
+        )
+    end
+
     # flow constraints
     rate_a_zero, rate_a_nonzero = get_rate_a_zero(data)
     rate_a_zero = Set(parse(Int, x) for x in rate_a_zero)
@@ -182,11 +215,11 @@ function create_model_r1(data::Dict{String, Any}, optimizer; prev_simdir=nothing
 
     JuMP.@constraint(model, 
         flow_lb[r in 1:R, a in rate_a_nonzero, t in 1:T],
-        pf[r,a,t] >= -1 * data["branch"]["$a"]["rate_a"] - gamma[a] * data["param"]["cap_upgrade_increment"]
+        pf[r,a,t] >= -1 * data["branch"]["$a"]["rate_a"] - gamma[a] * get_capacity_increment(data, a)
     )
     JuMP.@constraint(model, 
         flow_ub[r in 1:R, a in rate_a_nonzero, t in 1:T],
-        pf[r,a,t] <= data["branch"]["$a"]["rate_a"] + gamma[a] * data["param"]["cap_upgrade_increment"]
+        pf[r,a,t] <= data["branch"]["$a"]["rate_a"] + gamma[a] * get_capacity_increment(data, a)
     )
 
     # if rate a is zero (unlimited), then don't allow upgrades
@@ -273,46 +306,61 @@ function create_model_r1(data::Dict{String, Any}, optimizer; prev_simdir=nothing
     )
 
     # ensure that all storage is short-duration, i.e. can only store 4-hours worth of discharge
-    JuMP.@constraint(model, 
-        short_duration[i in 1:N],
-        s_energy[i] <= 4.0 * s_power[i]
-    )
+    if storage_investments == nothing 
+        JuMP.@constraint(model, 
+            short_duration[i in 1:N],
+            s_energy[i] <= 4.0 * s_power[i]
+        )
+    end
 
     # ~~~ STORAGE SOC LINEARIZATION CONSTRAINTS ~~~
-    JuMP.@constraint(model, 
-        storage_linearization_1[r in 1:R, i in 1:N, t in 1:T],
-        data["param"]["bess_efficiency"] * ch[r,i,t] <= beta[r,i,t]
-    )
-    JuMP.@constraint(model, 
-        storage_linearization_2[r in 1:R, i in 1:N, t in 1:T],
-        dis[r,i,t] / data["param"]["bess_efficiency"] <= s_power[i] - beta[r,i,t]
-    )
-    JuMP.@constraint(model, 
-        storage_linearization_3[r in 1:R, i in 1:N, t in 1:T],
-        beta[r,i,t] <= data["param"]["max_power_rating"] * alpha[r,i,t]
-    )
-    JuMP.@constraint(model, 
-        storage_linearization_4[r in 1:R, i in 1:N, t in 1:T],
-        s_power[i] - beta[r,i,t] <= data["param"]["max_power_rating"] * (1 - alpha[r,i,t])
-    )
+    if !haskey(data["param"], "charge_norm") || data["param"]["charge_norm"] == false
+        JuMP.@constraint(model, 
+            storage_linearization_1[r in 1:R, i in 1:N, t in 1:T],
+            data["param"]["bess_efficiency"] * ch[r,i,t] <= beta[r,i,t]
+        )
+        JuMP.@constraint(model, 
+            storage_linearization_2[r in 1:R, i in 1:N, t in 1:T],
+            dis[r,i,t] / data["param"]["bess_efficiency"] <= s_power[i] - beta[r,i,t]
+        )
+        JuMP.@constraint(model, 
+            storage_linearization_3[r in 1:R, i in 1:N, t in 1:T],
+            beta[r,i,t] <= data["param"]["max_power_rating"] * alpha[r,i,t]
+        )
+        JuMP.@constraint(model, 
+            storage_linearization_4[r in 1:R, i in 1:N, t in 1:T],
+            s_power[i] - beta[r,i,t] <= data["param"]["max_power_rating"] * (1 - alpha[r,i,t])
+        )
+    else
+        JuMP.@constraint(model, 
+            storage_charge_power_limit[r in 1:R, i in 1:N, t in 1:T],
+            data["param"]["bess_efficiency"] * ch[r,i,t] <= s_power[i]
+        )
+        JuMP.@constraint(model, 
+            storage_discharge_power_limit[r in 1:R, i in 1:N, t in 1:T],
+            dis[r,i,t] / data["param"]["bess_efficiency"] <= s_power[i]
+        )
+    end
 
     # OPTIONAL: CANDIDATE STORAGE LOCATIONS ONLY
     if haskey(data["param"], "candidate_no_upgrades_dir")
         no_upgrades_dir = data["param"]["candidate_no_upgrades_dir"]
         candidates = intersect_storage_candidates(data, no_upgrades_dir)
 
+        # OPTIONAL OPTIONAL ADDITIONAL CAND STORAGE LOCATIONS
+        if haskey(data["param"], "additional_cand")
+            candidates = union!(candidates, string.(data["param"]["additional_cand"]))
+        end
+
         all_busses = Set(keys(data["bus"]))
-        non_candidates = setdiff(all_busses, candidates)
+        non_candidates = setdiff(all_busses, union(candidates, nonzero_storage_nodes))
         non_candidates = Set(parse(Int, x) for x in non_candidates)
 
-        # JuMP.@constraint(model, storage_non_candidate[i in non_candidates],
-        #     sigma[i] == 0
-        # )
         for i in non_candidates
             fix(sigma[i], 0; force = true)
         end
 
-        println("Number of candidates: $(length(candidates))")
+        println("Number of candidates in Gurobi model: $(length(candidates))")
     end
 
     #
@@ -324,21 +372,30 @@ function create_model_r1(data::Dict{String, Any}, optimizer; prev_simdir=nothing
         operational_weight = data["param"]["operational_weight"]
     end
 
-    JuMP.@objective(model, Min,
-    sum(s_power[i] * data["param"]["bess_power_cost"] + s_energy[i] * data["param"]["bess_energy_cost"] for i in 1:N) +
-    sum(sigma[i] for i in 1:N) * data["param"]["storage_fixed_cost"] + 
-    sum(data["param"]["cap_upgrade_cost"] * data["param"]["cap_upgrade_increment"] * data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
-    sum(
-        data["param"]["representative_prob"][r] *
-        (
-            sum(
-                sum(compute_gen_cost(pg[r,g,t], data["gen"]["$g"]) for g in 1:G) +
-                sum(data["param"]["over_generated_penalty"] * oe[r,i,t] for i in 1:N) + 
-                sum(data["param"]["under_served_penalty"] * ue[r,i,t] for i in 1:N)
-            for t in 1:T)
-        )
-    for r in 1:R) * operational_weight
-    )
+    # Define the base objective expression
+    base_objective = (sum(s_power[i] * data["param"]["bess_power_cost"] + s_energy[i] * data["param"]["bess_energy_cost"] for i in 1:N) +
+        sum(sigma[i] for i in 1:N) * data["param"]["storage_fixed_cost"] + 
+        sum(data["param"]["cap_upgrade_cost"] * get_capacity_increment(data, a) * data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
+        sum(
+            data["param"]["representative_prob"][r] *
+            (
+                sum(
+                    sum(compute_gen_cost(pg[r, g, t], data["gen"]["$g"]) for g in 1:G) +
+                    sum(data["param"]["over_generated_penalty"] * oe[r, i, t] for i in 1:N) + 
+                    sum(data["param"]["under_served_penalty"] * ue[r, i, t] for i in 1:N)
+                for t in 1:T)
+            )
+        for r in 1:R) * operational_weight)
+
+    # Conditionally add the charge/discharge penalty term
+    charge_discharge_penalty = 0.1 * data["param"]["over_generated_penalty"]
+    if haskey(data["param"], "charge_norm") && data["param"]["charge_norm"] == true
+        charge_norm_term = charge_discharge_penalty * sum(sum(sum(ch[r, i, t]^2 + dis[r, i, t]^2 for t in 1:T) for r in 1:R) for i in 1:N)
+        base_objective += charge_norm_term
+    end
+
+    # Set the objective once
+    JuMP.@objective(model, Min, base_objective)
     
     return model
 end
