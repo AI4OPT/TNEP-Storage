@@ -28,9 +28,11 @@ fig.add_trace(go.Scattergeo(
     ))
 
 fig.update_layout(
-        title = 'Nodes',
-        geo_scope='usa',
-        showlegend=False,
+    showlegend=False,
+    geo=dict(
+        fitbounds="locations",
+        showland=True
     )
+)
 
 fig.write_image("../../{}/visual/nodes.png".format(simdir))
