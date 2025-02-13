@@ -66,6 +66,7 @@ data {
 """
 
 using JuMP
+using CSV, DataFrames
 include("../../helpers/compute_gen_cost.jl")
 include("storage_candidates/naive_candidates.jl")
 include("rate_a_zero.jl")
@@ -398,4 +399,29 @@ function create_model_r1(data::Dict{String, Any}, optimizer; line_investments=no
     JuMP.@objective(model, Min, base_objective)
     
     return model
+end
+
+function save_congested(simdir, model, data)
+    # indexed by (r, a, t)
+    pfs = value.(model[:pf])[:, :, :]
+
+    # Initialize storage for congested constraints
+    congested_constraints = []
+
+    # Loop through all (arc, rep, time) to check for congestion
+    for (r, a, t) in Iterators.product(1:size(pfs, 1), 1:size(pfs, 2), 1:size(pfs, 3))
+        line_limit = data["branch"]["$a"]["rate_a"]  # Retrieve branch limit
+        if abs(pfs[r, a, t]) >= line_limit - 1e-2  # Check if flow exceeds limit
+            push!(congested_constraints, (a, r, t, true))
+        end
+    end
+
+    # Convert to DataFrame
+    df = DataFrame(arc = [c[1] for c in congested_constraints],
+                   rep = [c[2] for c in congested_constraints],
+                   time = [c[3] for c in congested_constraints],
+                   tracked = [c[4] for c in congested_constraints])
+
+    # Save to CSV
+    CSV.write(joinpath(simdir, "output", "congested_constraints.csv"), df)
 end

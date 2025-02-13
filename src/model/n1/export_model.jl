@@ -192,12 +192,13 @@ function export_flow(simdir, model, data, rep_index)
         # PTDF model - calculate flows
         pg_values = value.(model[:pg])[rep_index:rep_index, :, :]
         ue_values = value.(model[:ue])[rep_index:rep_index, :, :]
+        ch_values = value.(model[:ch])[rep_index:rep_index, :, :]
         
         num_branches = length(data["branch"])
         num_hours = data["param"]["num_hours"]
         flows = zeros(num_branches, 1, num_hours)
         
-        compute_flows!(flows, pg_values, ue_values, data, model.ext[:PTDF])
+        compute_flows!(flows, pg_values, ue_values, ch_values, data, model.ext[:PTDF])
         pfs = flows[:, 1, :]
     end
 

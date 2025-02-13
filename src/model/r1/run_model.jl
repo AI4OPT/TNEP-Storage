@@ -48,7 +48,7 @@ function run_model(simdir; timeout=84600)
             line_investments=line_investments, 
             storage_investments=storage_investments)
     elseif data["param"]["storage_linearized"] == "ptdf"
-        model = create_model_r1_ptdf_iterative(data, optimizer,  
+        model = create_model_r1_ptdf_iterative(simdir, data, optimizer,  
             line_investments=line_investments, 
             storage_investments=storage_investments)
     else
@@ -62,6 +62,11 @@ function run_model(simdir; timeout=84600)
     set_optimizer_attribute(model, "MIPGap", data["param"]["mip_gap"])
     set_optimizer_attribute(model, "TimeLimit", timeout)
     optimize!(model)
+
+    # save congested lines and hours
+    if !haskey(data["param"], "storage_linearized") || data["param"]["storage_linearized"] == false
+        save_congested(simdir, model, data)
+    end
 
     if termination_status(model) != MOI.OPTIMAL
         println("Termination status not optimal")

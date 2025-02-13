@@ -1,10 +1,11 @@
 using JuMP
+using CSV, DataFrames
 include("../../../helpers/compute_gen_cost.jl")
 include("../storage_candidates/naive_candidates.jl")
 include("../rate_a_zero.jl")
 include("base_ptdf.jl")
 
-function create_model_r1_ptdf_iterative(data::Dict{String, Any}, optimizer; 
+function create_model_r1_ptdf_iterative(simdir, data::Dict{String, Any}, optimizer; 
     line_investments=nothing, 
     storage_investments=nothing,
     max_ptdf_iterations::Int=32,
@@ -27,6 +28,9 @@ function create_model_r1_ptdf_iterative(data::Dict{String, Any}, optimizer;
         :max_ptdf_per_iteration => max_ptdf_per_iteration,
         :ptdf_tol => ptdf_tol
     )
+    logfile = joinpath(simdir, "gurobi_logfile.log")
+    set_optimizer_attribute(model, "LogFile", logfile)
+    set_optimizer_attribute(model, "MIPGap", data["param"]["mip_gap"])
 
     # Store PTDF matrix in model extension
     model.ext[:PTDF] = do_all_ptdf(data)
@@ -40,6 +44,41 @@ function create_model_r1_ptdf_iterative(data::Dict{String, Any}, optimizer;
     
     # Add container for flow constraints
     model[:ptdf_flow] = Dict{String, ConstraintRef}()
+
+    # warm-start the PTDF with certain flow constraints
+    # Add after PTDF matrix storage
+    if isfile(joinpath(simdir, "congested_constraints.csv"))
+        constraints_df = CSV.read(joinpath(simdir, "congested_constraints.csv"), DataFrame)
+        
+        rows_done = 0
+        for row in eachrow(constraints_df)
+            rows_done += 1
+            println(rows_done)
+            a, r, t = row.arc, row.rep, row.time
+            if row.tracked
+                line_limit = data["branch"]["$a"]["rate_a"] + model[:gamma][a] * get_capacity_increment(data, a)
+                row = model.ext[:PTDF][a,:]
+                
+                model[:ptdf_flow]["$(a)_$(r)_$(t)_ub"] = @constraint(model,
+                    sum(row[i-1] * (
+                        sum(model[:pg][r,g,t] for g in 1:G if data["gen"]["$g"]["gen_bus"] == i; init=0.0)
+                        - data["bus"]["$i"]["load"]["$r"][t]
+                        + model[:ue][r,i,t] - model[:ch][r,i,t]
+                    ) for i in 2:length(data["bus"])) <= line_limit
+                )
+                
+                model[:ptdf_flow]["$(a)_$(r)_$(t)_lb"] = @constraint(model,
+                    sum(row[i-1] * (
+                        sum(model[:pg][r,g,t] for g in 1:G if data["gen"]["$g"]["gen_bus"] == i; init=0.0)
+                        - data["bus"]["$i"]["load"]["$r"][t]
+                        + model[:ue][r,i,t] - model[:ch][r,i,t]
+                    ) for i in 2:length(data["bus"])) >= -line_limit
+                )
+                
+                model.ext[:tracked_constraints][(a,r,t)] = true
+            end
+        end
+    end
 
     # Begin lazy PTDF loop
     solved = false
@@ -57,11 +96,12 @@ function create_model_r1_ptdf_iterative(data::Dict{String, Any}, optimizer;
         # Get current solution values
         pg_values = value.(model[:pg])
         ue_values = value.(model[:ue])
+        ch_values = value.(model[:ch])
         gamma_values = value.(model[:gamma])
         
         # Compute all flows at once
         flows = zeros(length(model.ext[:rate_a_nonzero]), R, T)
-        compute_flows!(flows, pg_values, ue_values, data, model.ext[:PTDF])
+        compute_flows!(flows, pg_values, ue_values, ch_values, data, model.ext[:PTDF])
         
         # Check for violations
         n_violated = 0
@@ -89,16 +129,16 @@ function create_model_r1_ptdf_iterative(data::Dict{String, Any}, optimizer;
                             sum(row[i-1] * (
                                 sum(model[:pg][r,g,t] for g in 1:G if data["gen"]["$g"]["gen_bus"] == i; init=0.0)
                                 - data["bus"]["$i"]["load"]["$r"][t]
-                                + model[:ue][r,i,t]
-                            ) for i in 2:length(data["bus"])) <= line_limit
+                                + model[:ue][r,i,t] - model[:ch][r,i,t]
+                            ) for i in 2:length(data["bus"])) <= data["branch"]["$a"]["rate_a"] + model[:gamma][a] * get_capacity_increment(data, a)
                         )
                         
                         model[:ptdf_flow]["$(a)_$(r)_$(t)_lb"] = @constraint(model,
                             sum(row[i-1] * (
                                 sum(model[:pg][r,g,t] for g in 1:G if data["gen"]["$g"]["gen_bus"] == i; init=0.0)
                                 - data["bus"]["$i"]["load"]["$r"][t]
-                                + model[:ue][r,i,t]
-                            ) for i in 2:length(data["bus"])) >= -line_limit
+                                + model[:ue][r,i,t] - model[:ch][r,i,t]
+                            ) for i in 2:length(data["bus"])) >= -(data["branch"]["$a"]["rate_a"] + model[:gamma][a] * get_capacity_increment(data, a))
                         )
                         
                         model.ext[:tracked_constraints][(a,r,t)] = true
@@ -120,14 +160,14 @@ function create_model_r1_ptdf_iterative(data::Dict{String, Any}, optimizer;
         solved = (n_violated == 0)
         niter += 1
         println("approx. progress $(checked_count / E)")
-        
         println("Iteration $niter: Found $n_violated violations, added $n_added constraints")
     end
 
     # Record solve time
     solve_time = time() - t0
     model.ext[:solve_metadata][:solve_time] = solve_time
-    
+
+    save_tracked_constraints(simdir, model)
     return model
 end
 
@@ -142,6 +182,7 @@ function create_base_model(data::Dict{String, Any}, optimizer;
     T = data["param"]["num_hours"]
     G = length(data["gen"])
     K = data["param"]["num_cap_upgrades_max"]
+    rate_a_zero, rate_a_nonzero = get_rate_a_zero(data)
 
     model = JuMP.Model(optimizer)
 
@@ -186,14 +227,22 @@ function create_base_model(data::Dict{String, Any}, optimizer;
         power_balance[r in 1:R, t in 1:T],
         sum(pg[r,g,t] for g in 1:G)
         - sum(data["bus"]["$i"]["load"]["$r"][t] for i in 1:N)
-        + sum(ue[r,i,t] for i in 1:N) == 0
+        + sum(ue[r,i,t] for i in 1:N) 
+        - sum(ch[r,i,t] for i in 1:N) 
+        == 0
     )
 
     # Previous investment constraints if applicable
+    nonzero_storage_nodes = Set()
     if haskey(data["param"], "prev_simdir")
         prev_simdir = data["param"]["prev_simdir"]
         line_inv = CSV.read(joinpath(prev_simdir, "output", "line_investments.csv"), DataFrame)
         storage_inv = CSV.read(joinpath(prev_simdir, "output", "storage_investments.csv"), DataFrame)
+        for i in 1:N
+            if storage_inv[i, :Storage_Power] != 0 || storage_inv[i, :Storage_Energy] != 0
+                push!(nonzero_storage_nodes, "$i")
+            end
+        end
         
         @constraint(model,
             old_gamma[a in 1:E],
@@ -233,6 +282,95 @@ function create_base_model(data::Dict{String, Any}, optimizer;
         )
     end
 
+    # if rate a is zero (unlimited), then don't allow upgrades
+    JuMP.@constraint(model, 
+        rate_a_zero_line_upgrade[a in rate_a_zero],
+        gamma[a] == 0
+    )
+
+    # soc over time constraint
+    JuMP.@constraint(model, 
+        soc_over_time[r in 1:R, i in 1:N, t in 2:T],
+        soc[r,i,t] == soc[r,i,t-1] + ch[r,i,t]
+    )
+
+    # OPTIONAL: soc 0.5 constraint
+    JuMP.@constraint(model,
+        soc_start[r in 1:R, i in 1:N],
+        soc[r,i,1] == 0.5 * s_energy[i] + ch[r,i,1]
+    )
+    JuMP.@constraint(model,
+        soc_end[r in 1:R, i in 1:N],
+        soc[r,i,T] == 0.5 * s_energy[i]
+    )
+
+    # soc energy rating constraint
+    JuMP.@constraint(model, 
+        soc_energy_ub[r in 1:R, i in 1:N, t in 1:T],
+        soc[r,i,t] <= s_energy[i]
+    )
+
+    # energy rating only if storage installed
+    JuMP.@constraint(model, 
+        installed_energy_ub[i in 1:N],
+        s_energy[i] <= sigma[i] * data["param"]["max_energy_rating"]
+    )
+
+    # power rating only if storage installed
+    JuMP.@constraint(model, 
+        installed_power_ub[i in 1:N],
+        s_power[i] <= sigma[i] * data["param"]["max_power_rating"]
+    )
+
+    # ensure that all storage is short-duration, i.e. can only store 4-hours worth of discharge
+    if storage_investments == nothing 
+        JuMP.@constraint(model, 
+            short_duration[i in 1:N],
+            s_energy[i] <= 4.0 * s_power[i]
+        )
+    end
+
+    # charge/discharge must be constrained by power rating
+    JuMP.@constraint(model,
+        charge_discharge_lb[r in 1:R, i in 1:N, t in 1:T],
+        -s_power[i] <= ch[r,i,t]
+    )
+    JuMP.@constraint(model,
+        charge_discharge_ub[r in 1:R, i in 1:N, t in 1:T],
+        ch[r,i,t] <= s_power[i]
+    )
+
+    # charge/discharge must be constrained by installation
+    JuMP.@constraint(model,
+        charge_discharge_i_lb[r in 1:R, i in 1:N, t in 1:T],
+        -sigma[i] * data["param"]["max_power_rating"] <= ch[r,i,t]
+    )
+    JuMP.@constraint(model,
+        charge_discharge_i_ub[r in 1:R, i in 1:N, t in 1:T],
+        ch[r,i,t] <= sigma[i] * data["param"]["max_power_rating"]
+    )
+
+    # OPTIONAL: CANDIDATE STORAGE LOCATIONS ONLY
+    if haskey(data["param"], "candidate_no_upgrades_dir")
+        no_upgrades_dir = data["param"]["candidate_no_upgrades_dir"]
+        candidates = intersect_storage_candidates(data, no_upgrades_dir)
+
+        # OPTIONAL OPTIONAL ADDITIONAL CAND STORAGE LOCATIONS
+        if haskey(data["param"], "additional_cand")
+            candidates = union!(candidates, string.(data["param"]["additional_cand"]))
+        end
+
+        all_busses = Set(keys(data["bus"]))
+        non_candidates = setdiff(all_busses, union(candidates, nonzero_storage_nodes))
+        non_candidates = Set(parse(Int, x) for x in non_candidates)
+
+        for i in non_candidates
+            fix(sigma[i], 0; force = true)
+        end
+
+        println("Number of candidates in Gurobi model: $(length(candidates))")
+    end
+
     # Objective
     operational_weight = get(data["param"], "operational_weight", 1)
     @objective(model, Min,
@@ -253,7 +391,7 @@ function create_base_model(data::Dict{String, Any}, optimizer;
     return model
 end
 
-function compute_flows!(flows, pg_values, ue_values, data, PTDF)
+function compute_flows!(flows, pg_values, ue_values, ch_values, data, PTDF)
     # Preallocate net injection vector
     n_buses = length(data["bus"])
     net_injections = zeros(n_buses-1)  # PTDF matrix is (n_branches × (n_buses-1))
@@ -268,11 +406,24 @@ function compute_flows!(flows, pg_values, ue_values, data, PTDF)
                                     if data["gen"]["$g"]["gen_bus"] == i; 
                                     init=0.0)
             # Subtract load and add unserved energy
+            # and ALSO CHARGE
             net_injections[i-1] -= data["bus"]["$i"]["load"]["$r"][t]
             net_injections[i-1] += ue_values[r,i,t]
+            net_injections[i-1] -= ch_values[r,i,t]
         end
         
         # Compute flows for all branches at once using PTDF
         flows[:,r,t] = PTDF * net_injections
     end
+end
+
+function save_tracked_constraints(simdir, model)
+    # Convert dictionary to DataFrame
+    df = DataFrame(arc = [k[1] for k in keys(model.ext[:tracked_constraints])],
+    rep = [k[2] for k in keys(model.ext[:tracked_constraints])],
+    time = [k[3] for k in keys(model.ext[:tracked_constraints])],
+    tracked = collect(values(model.ext[:tracked_constraints])))
+
+    # Save to CSV
+    CSV.write(joinpath(simdir, "output", "tracked_constraints.csv"), df)
 end
