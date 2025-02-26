@@ -1,6 +1,8 @@
 using SparseArrays
 using LinearAlgebra
 
+REF_IDX = 1
+
 function create_susceptance_admittance_matrix(data::Dict{String, Any})
     branches = data["branch"]
     num_branches = length(branches)
@@ -10,11 +12,12 @@ function create_susceptance_admittance_matrix(data::Dict{String, Any})
     t_bus = [branches[string(i)]["t_bus"] for i in 1:num_branches]
     x = [branches[string(i)]["br_x"] for i in 1:num_branches]
     inv_x = [1/reactance for reactance in x]
+    # inv_x = min.(inv_x, 500)
 
     # create diag(B) matrix
     diag_B = spdiagm(0 => inv_x)
 
-    # create reduced admittance matrix A_r
+    # create admittance matrix A
     num_buses = length(data["bus"]) 
 
     rows = Int[]
@@ -23,30 +26,44 @@ function create_susceptance_admittance_matrix(data::Dict{String, Any})
 
     # Populate the entries of the admittance matrix
     for e in 1:num_branches
-        if f_bus[e] != 1  # Exclude the slack bus
-            push!(rows, e)          # Branch index (row)
-            push!(cols, f_bus[e]-1) # Adjust for N-1 (exclude slack bus)
-            push!(vals, 1.0)        # +1 for from-bus
-        end
+        push!(rows, e)          # Branch index (row)
+        push!(cols, f_bus[e])   # From-bus index (col)
+        push!(vals, 1.0)        # +1 for from-bus
 
-        if t_bus[e] != 1  # Exclude the slack bus
-            push!(rows, e)          # Branch index (row)
-            push!(cols, t_bus[e]-1) # Adjust for N-1 (exclude slack bus)
-            push!(vals, -1.0)       # -1 for to-bus
-        end
+        push!(rows, e)          # Branch index (row)
+        push!(cols, t_bus[e])   # To-bus index (col)
+        push!(vals, -1.0)       # -1 for to-bus
     end
-    A_r = sparse(rows, cols, vals, num_branches, num_buses-1)
+    A = sparse(rows, cols, vals, num_branches, num_buses)
 
-    return diag_B, A_r
+    return diag_B, A
 end
 
-function compute_ptdf(diag_B, A_r)
-    # Step 1: Compute A_r_T * diag_B * A_r
-    L = A_r' * diag_B * A_r  # (N-1) x (N-1)
-    # Step 2: Invert the matrix
-    L_inv = inv(Matrix(L))  # Convert to dense for inversion
-    # Step 3: Compute PTDF
-    PTDF = diag_B * A_r * L_inv  # E x (N-1)
+function compute_ptdf(diag_B, A)
+    # Step 1: Compute A_T * diag_B * A
+    L = A' * diag_B * A  # N x N
+
+    # Adjust row and col corr. to slack bus
+    L_reduced = L[2:end, 2:end]
+
+    # Step 2: Invert the matrix...
+    F = ldlt(L_reduced)  
+    
+    # Step 3: Solve the system
+    dim = size(A, 2) - 1
+    L_inv = Matrix{Float64}(I, dim, dim)  # Identity matrix
+
+    for i in 1:dim
+        L_inv[:, i] = F \ L_inv[:, i]
+    end
+
+    # Add back the slack bus dimension
+    new_size = size(L_inv, 1) + 1
+    L_inv_expanded = zeros(eltype(L_inv), new_size, new_size)
+    L_inv_expanded[2:end, 2:end] = L_inv
+
+    # Step 4: Get PTDF
+    PTDF = diag_B * A * L_inv_expanded  # E x N
 
     return PTDF
 end

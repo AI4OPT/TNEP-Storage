@@ -8,7 +8,7 @@ include("base_ptdf.jl")
 function create_model_r1_ptdf_iterative(simdir, data::Dict{String, Any}, optimizer; 
     line_investments=nothing, 
     storage_investments=nothing,
-    max_ptdf_iterations::Int=32,
+    max_ptdf_iterations::Int=128,
     max_ptdf_per_iteration::Int=64,
     ptdf_tol::Float64=1e-6)
 
@@ -60,19 +60,19 @@ function create_model_r1_ptdf_iterative(simdir, data::Dict{String, Any}, optimiz
                 row = model.ext[:PTDF][a,:]
                 
                 model[:ptdf_flow]["$(a)_$(r)_$(t)_ub"] = @constraint(model,
-                    sum(row[i-1] * (
+                    sum(row[i] * (
                         sum(model[:pg][r,g,t] for g in 1:G if data["gen"]["$g"]["gen_bus"] == i; init=0.0)
                         - data["bus"]["$i"]["load"]["$r"][t]
                         + model[:ue][r,i,t] - model[:ch][r,i,t]
-                    ) for i in 2:length(data["bus"])) <= line_limit
+                    ) for i in 1:length(data["bus"])) <= line_limit
                 )
                 
                 model[:ptdf_flow]["$(a)_$(r)_$(t)_lb"] = @constraint(model,
-                    sum(row[i-1] * (
+                    sum(row[i] * (
                         sum(model[:pg][r,g,t] for g in 1:G if data["gen"]["$g"]["gen_bus"] == i; init=0.0)
                         - data["bus"]["$i"]["load"]["$r"][t]
                         + model[:ue][r,i,t] - model[:ch][r,i,t]
-                    ) for i in 2:length(data["bus"])) >= -line_limit
+                    ) for i in 1:length(data["bus"])) >= -line_limit
                 )
                 
                 model.ext[:tracked_constraints][(a,r,t)] = true
@@ -126,19 +126,19 @@ function create_model_r1_ptdf_iterative(simdir, data::Dict{String, Any}, optimiz
                         
                         # Add both constraints
                         model[:ptdf_flow]["$(a)_$(r)_$(t)_ub"] = @constraint(model,
-                            sum(row[i-1] * (
+                            sum(row[i] * (
                                 sum(model[:pg][r,g,t] for g in 1:G if data["gen"]["$g"]["gen_bus"] == i; init=0.0)
                                 - data["bus"]["$i"]["load"]["$r"][t]
                                 + model[:ue][r,i,t] - model[:ch][r,i,t]
-                            ) for i in 2:length(data["bus"])) <= data["branch"]["$a"]["rate_a"] + model[:gamma][a] * get_capacity_increment(data, a)
+                            ) for i in 1:length(data["bus"])) <= data["branch"]["$a"]["rate_a"] + model[:gamma][a] * get_capacity_increment(data, a)
                         )
                         
                         model[:ptdf_flow]["$(a)_$(r)_$(t)_lb"] = @constraint(model,
-                            sum(row[i-1] * (
+                            sum(row[i] * (
                                 sum(model[:pg][r,g,t] for g in 1:G if data["gen"]["$g"]["gen_bus"] == i; init=0.0)
                                 - data["bus"]["$i"]["load"]["$r"][t]
                                 + model[:ue][r,i,t] - model[:ch][r,i,t]
-                            ) for i in 2:length(data["bus"])) >= -(data["branch"]["$a"]["rate_a"] + model[:gamma][a] * get_capacity_increment(data, a))
+                            ) for i in 1:length(data["bus"])) >= -(data["branch"]["$a"]["rate_a"] + model[:gamma][a] * get_capacity_increment(data, a))
                         )
                         
                         model.ext[:tracked_constraints][(a,r,t)] = true
@@ -168,6 +168,7 @@ function create_model_r1_ptdf_iterative(simdir, data::Dict{String, Any}, optimiz
     model.ext[:solve_metadata][:solve_time] = solve_time
 
     save_tracked_constraints(simdir, model)
+    save_power_injections(simdir, model, data)
     return model
 end
 
@@ -223,6 +224,7 @@ function create_base_model(data::Dict{String, Any}, optimizer;
     JuMP.@variable(model, sigma[i=1:N], Bin) # binary variable for installation of storage
 
     # Add all non-PTDF constraints
+    # Global power balance
     @constraint(model, 
         power_balance[r in 1:R, t in 1:T],
         sum(pg[r,g,t] for g in 1:G)
@@ -394,22 +396,23 @@ end
 function compute_flows!(flows, pg_values, ue_values, ch_values, data, PTDF)
     # Preallocate net injection vector
     n_buses = length(data["bus"])
-    net_injections = zeros(n_buses-1)  # PTDF matrix is (n_branches × (n_buses-1))
+    net_injections = zeros(n_buses)  # PTDF matrix is (n_branches × n_buses)
     
     # For each timestep
     for r in 1:size(pg_values, 1), t in 1:size(pg_values, 3)
+        fill!(net_injections, 0.0)
+
         # Compute net injections at each bus
-        for i in 2:n_buses  # Skip reference bus
+        for i in 1:n_buses 
             # Sum generation at bus i
-            net_injections[i-1] = sum(pg_values[r,g,t] 
+            net_injections[i] = sum(pg_values[r,g,t] 
                                     for g in 1:length(data["gen"]) 
                                     if data["gen"]["$g"]["gen_bus"] == i; 
                                     init=0.0)
-            # Subtract load and add unserved energy
-            # and ALSO CHARGE
-            net_injections[i-1] -= data["bus"]["$i"]["load"]["$r"][t]
-            net_injections[i-1] += ue_values[r,i,t]
-            net_injections[i-1] -= ch_values[r,i,t]
+            # Subtract load, add unserved energy, subtract charging
+            net_injections[i] -= data["bus"]["$i"]["load"]["$r"][t]
+            net_injections[i] += ue_values[r,i,t]
+            net_injections[i] -= ch_values[r,i,t]
         end
         
         # Compute flows for all branches at once using PTDF
@@ -427,3 +430,55 @@ function save_tracked_constraints(simdir, model)
     # Save to CSV
     CSV.write(joinpath(simdir, "output", "tracked_constraints.csv"), df)
 end
+
+function save_power_injections(simdir, model, data)
+    # Get solution values
+    pg_values = value.(model[:pg])
+    ue_values = value.(model[:ue])
+    ch_values = value.(model[:ch])
+    
+    # Create storage for rows
+    rows = []
+    
+    # Extract dimensions
+    R = data["param"]["num_representatives"]
+    G = length(data["gen"])
+    N = length(data["bus"])
+    T = data["param"]["num_hours"]
+    
+    # Gather all power injections
+    for r in 1:R, t in 1:T
+        # Generation
+        for g in 1:G
+            bus = data["gen"]["$g"]["gen_bus"]
+            push!(rows, (rep=r, time=t, bus=bus, gen=g, variable="pg", value=pg_values[r, g, t]))
+        end
+        
+        # Unserved energy
+        for i in 1:N
+            if ue_values[r, i, t] > 1e-6
+                push!(rows, (rep=r, time=t, bus=i, gen=0, variable="ue", value=ue_values[r, i, t]))
+            end
+        end
+        
+        # Storage
+        for i in 1:N
+            if abs(ch_values[r, i, t]) > 1e-6
+                push!(rows, (rep=r, time=t, bus=i, gen=0, variable="ch", value=ch_values[r, i, t]))
+            end
+        end
+    end
+    
+    # Convert to DataFrame
+    df = DataFrame(rows)
+    
+    # Save to CSV for each representative period
+    for r in 1:R
+        datestring = data["param"]["dates"][r]
+        output_dir = joinpath(simdir, "output", datestring)
+        mkpath(output_dir)
+        
+        df_rep = filter(row -> row.rep == r, df)
+        CSV.write(joinpath(simdir, "output", "power_injections.csv"), df_rep)
+    end
+ end

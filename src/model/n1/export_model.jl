@@ -51,47 +51,83 @@ function rename_columns_with_suffix!(df::DataFrame, suffix::String)
 end
 
 function export_energy_csv(simdir, model, data, rep_index)
+    num_nodes = length(data["bus"])
+    num_hours = data["param"]["num_hours"]
+
+    # Retrieve model values once to avoid multiple calls to value()
     ue = value.(model[:ue])[rep_index, :, :]
     ch = value.(model[:ch])[rep_index, :, :]
-    
+
     # Check if 'oe' exists in the model
     has_oe = haskey(model, :oe)
     oe = has_oe ? value.(model[:oe])[rep_index, :, :] : zeros(size(ue))
-    
+
     # Check if 'dis' exists in the model
     has_dis = haskey(model, :dis)
     dis = has_dis ? value.(model[:dis])[rep_index, :, :] : zeros(size(ch))
 
-    # If 'dis' doesn't exist, infer discharge from negative 'ch' values
+    # Infer 'dis' from negative 'ch' values if it does not exist
     if !has_dis
-        for bus in 1:size(ch, 1), hour in 1:size(ch, 2)
-            if ch[bus, hour] < 0
-                dis[bus, hour] = -ch[bus, hour]  # Assign negative charge to discharge
-                ch[bus, hour] = 0                # Set charge to zero
-            end
+        dis .= max.(-ch, 0)  # Set dis to -ch when ch < 0, else 0
+        ch .= max.(ch, 0)     # Keep only positive charge values
+    end
+
+    ### **Optimized Power Flow Retrieval**
+    has_pf = haskey(model, :pf)
+    if has_pf
+        # Use precomputed power flows (DCOPF case)
+        pfs = value.(model[:pf])[rep_index, :, :]
+        # Since nodal balance is already enforced in DCOPF, we can directly use ue - oe
+        imbalance = ue - oe
+    else
+        # Compute power flows using PTDF
+        pg_values = value.(model[:pg])[rep_index:rep_index, :, :]
+        ue_values = value.(model[:ue])[rep_index:rep_index, :, :]
+        ch_values = value.(model[:ch])[rep_index:rep_index, :, :]
+        
+        num_branches = length(data["branch"])
+        flows = zeros(num_branches, 1, num_hours)
+        
+        compute_flows!(flows, pg_values, ue_values, ch_values, data, model.ext[:PTDF])
+        pfs = flows[:, 1, :]
+
+        ### **Precompute Generator Dispatch**
+        pg_values = value.(model[:pg])[rep_index, :, :]
+
+        ### **Precompute Nodal Connectivity for Efficient Lookup**
+        arcs_from = Dict(i => [a for a in get(data["arcs_from"], "$i", []) if data["branch"]["$a"]["f_bus"] == i] for i in 1:num_nodes)
+        arcs_to = Dict(i => [a for a in get(data["arcs_from"], "$i", []) if data["branch"]["$a"]["t_bus"] == i] for i in 1:num_nodes)
+
+        ### **Compute Nodal Power Balance Efficiently (PTDF Case Only)**
+        imbalance = zeros(num_nodes, num_hours)
+        for bus in 1:num_nodes, hour in 1:num_hours
+            generation = sum(pg_values[g, hour] for g in 1:length(data["gen"]) if data["gen"]["$g"]["gen_bus"] == bus; init=0.0)
+            demand = data["bus"]["$bus"]["load"]["$rep_index"][hour]
+            discharge = dis[bus, hour]
+            charge = ch[bus, hour]
+
+            flow_in = sum(pfs[branch, hour] for branch in get(arcs_to, bus, []); init=0.0)
+            flow_out = sum(pfs[branch, hour] for branch in get(arcs_from, bus, []); init=0.0)
+
+            imbalance[bus, hour] = (generation + discharge + ue[bus, hour] + flow_in) - (flow_out + demand + oe[bus, hour] + charge)
         end
     end
 
-    imbalance = oe - ue  # num_nodes x num_hours
+    ### **Data Mapping for Export**
+    node_indices_mapping = ["$i" for i in 1:num_nodes]
+    node_names_mapping = [data["bus"]["$i"]["bus_name"] for i in 1:num_nodes]
+    lat_mapping = [data["bus"]["$i"]["lat"] for i in 1:num_nodes]
+    lon_mapping = [data["bus"]["$i"]["lon"] for i in 1:num_nodes]
+    hours_mapping = 1:num_hours
 
-    num_nodes = size(imbalance, 1)
-    num_hours = size(imbalance, 2)
-
-    # Mappings
-    node_indices_mapping = ["$i" for i in 1:length(data["bus"])]
-    node_names_mapping = [data["bus"]["$i"]["bus_name"] for i in 1:length(data["bus"])]
-    lat_mapping = [data["bus"]["$i"]["lat"] for i in 1:length(data["bus"])]
-    lon_mapping = [data["bus"]["$i"]["lon"] for i in 1:length(data["bus"])]
-    hours_mapping = 1:data["param"]["num_hours"]
-
-    # Add OE to column names if it exists
+    ### **Column Names**
     column_names = if has_oe
         [:Node_Index, :Node_Name, :Lat, :Lon, :Hour, :Energy_Imbalance, :Over_Energy, :Under_Energy, :Charge, :Discharge]
     else
         [:Node_Index, :Node_Name, :Lat, :Lon, :Hour, :Energy_Imbalance, :Charge, :Discharge]
     end
 
-    # Flatten the array and create DataFrame with optional OE
+    ### **Flatten Data Efficiently**
     energy = if has_oe
         [(node_indices_mapping[bus],
           node_names_mapping[bus],
@@ -119,32 +155,18 @@ function export_energy_csv(simdir, model, data, rep_index)
     energy_flattened = [vec for row in eachrow(energy) for vec in row]
     df_imbalance = DataFrame(energy_flattened, Symbol.(column_names))
 
-    # Rest of the function remains the same
-    # Generator output by fuel type
-    pg = value.(model[:pg])[rep_index, :, :]
+    ### **Generator Output by Fuel Type**
+    pg_values = value.(model[:pg])[rep_index, :, :]
     gen_types = vcat(data["param"]["renewable_types"], data["param"]["nonrenewable_types"])
-    gen_array = Float64[]
+    gen_array = [vec(transpose([gen_energy(bus, gen_type, hour, pg_values, data) for bus in 1:num_nodes, hour in 1:num_hours])) for gen_type in gen_types]
+    df_generation = DataFrame(hcat(gen_array...), Symbol.(gen_types))
 
-    for gen_type in gen_types
-        x = vec(transpose([gen_energy(bus, gen_type, hour, pg, data) for bus in 1:num_nodes, hour in 1:num_hours]))
-        if isempty(gen_array)
-            gen_array = x
-        else
-            gen_array = hcat(gen_array, x)
-        end
-    end
-    df_generation = DataFrame(gen_array, Symbol.(gen_types))
-
-    # Renewable production by bus
-    dfs = DataFrame[]
-    for i in 1:length(data["bus"])
-        df_bus = get_renewable_production_by_bus("$i", data, rep_index)
-        push!(dfs, df_bus)
-    end
+    ### **Renewable Production by Bus**
+    dfs = [get_renewable_production_by_bus("$i", data, rep_index) for i in 1:num_nodes]
     df_renewable_prod = vcat(dfs...)
     rename_columns_with_suffix!(df_renewable_prod, "_production")
 
-    # Combine all DataFrames
+    ### **Combine & Save CSV**
     df_energy = hcat(df_imbalance, df_generation, df_renewable_prod)
     df_energy = round_df(df_energy)
     
@@ -167,7 +189,8 @@ function export_investments_csv(simdir, model, data)
         Upgrade_Lvl = [gammas[i] for i in 1:length(data["branch"])]
     )
 
-    df_lines = round_df(df_lines)
+    # DON'T ROUND THE LINES ANYMORE
+    # df_lines = round_df(df_lines)
     CSV.write(joinpath(simdir, "output", "line_investments.csv"), df_lines)
 
     df_storage = DataFrame(
@@ -179,7 +202,8 @@ function export_investments_csv(simdir, model, data)
         Storage_Energy = [s_energys[i] for i in 1:length(data["bus"])]
     )
 
-    df_storage = round_df(df_storage)
+    # DON'T ROUND THE STORAGE
+    # df_storage = round_df(df_storage)
     CSV.write(joinpath(simdir, "output", "storage_investments.csv"), df_storage)
 end
 
@@ -241,7 +265,8 @@ function export_flow(simdir, model, data, rep_index)
     flow_flattened = [vec for row in eachrow(flow) for vec in row]
     df_flow = DataFrame(flow_flattened, Symbol.(column_names))
 
-    df_flow = round_df(df_flow)
+    # DON'T ROUND FLOW ANYMORE
+    # df_flow = round_df(df_flow)
     datestring = data["param"]["dates"][rep_index]
     CSV.write(joinpath(simdir, "output", datestring, "flow.csv"), df_flow)
 end

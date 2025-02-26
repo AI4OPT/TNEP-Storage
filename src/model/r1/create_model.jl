@@ -196,17 +196,19 @@ function create_model_r1(data::Dict{String, Any}, optimizer; line_investments=no
     if storage_investments !== nothing
         inv = CSV.read(storage_investments, DataFrame)
         JuMP.@constraint(model,
-        inv_s_power[i in 1:N],
-        s_power[i] == inv[i, :Storage_Power]
-        )
-        JuMP.@constraint(model,
-        inv_s_energy[i in 1:N],
-        s_energy[i] == inv[i, :Storage_Energy]
-        )
-        JuMP.@constraint(model,
         inv_sigma[i in 1:N],
         sigma[i] == ((inv[i, :Storage_Power] != 0 || inv[i, :Storage_Energy] != 0) ? 1 : 0)
         )
+        if !get(data["param"], "manual_candidates", false)
+            JuMP.@constraint(model,
+            inv_s_power[i in 1:N],
+            s_power[i] == inv[i, :Storage_Power]
+            )
+            JuMP.@constraint(model,
+            inv_s_energy[i in 1:N],
+            s_energy[i] == inv[i, :Storage_Energy]
+            )
+        end
     end
 
     # flow constraints
@@ -242,6 +244,7 @@ function create_model_r1(data::Dict{String, Any}, optimizer; line_investments=no
     )
 
     # Voltage difference limits
+    """
     JuMP.@constraint(model,
         voltage_diff_ub[r in 1:R, a in 1:E, t in 1:T],
         va[r,tbus[a],t] - va[r,fbus[a],t] <= data["param"]["voltage_angle_difference_max"]
@@ -249,7 +252,7 @@ function create_model_r1(data::Dict{String, Any}, optimizer; line_investments=no
     JuMP.@constraint(model,
         voltage_diff_lb[r in 1:R, a in 1:E, t in 1:T],
         va[r,tbus[a],t] - va[r,fbus[a],t] >= -1 * data["param"]["voltage_angle_difference_max"]
-    )
+    )"""
 
     # nodal power balance
     JuMP.@constraint(model, 
@@ -307,7 +310,7 @@ function create_model_r1(data::Dict{String, Any}, optimizer; line_investments=no
     )
 
     # ensure that all storage is short-duration, i.e. can only store 4-hours worth of discharge
-    if storage_investments == nothing 
+    if storage_investments == nothing || get(data["param"], "manual_candidates", false)
         JuMP.@constraint(model, 
             short_duration[i in 1:N],
             s_energy[i] <= 4.0 * s_power[i]
@@ -353,6 +356,8 @@ function create_model_r1(data::Dict{String, Any}, optimizer; line_investments=no
             candidates = union!(candidates, string.(data["param"]["additional_cand"]))
         end
 
+        save_to_json(candidates, joinpath(simdir, "output", "candidates.json"))
+
         all_busses = Set(keys(data["bus"]))
         non_candidates = setdiff(all_busses, union(candidates, nonzero_storage_nodes))
         non_candidates = Set(parse(Int, x) for x in non_candidates)
@@ -397,6 +402,9 @@ function create_model_r1(data::Dict{String, Any}, optimizer; line_investments=no
 
     # Set the objective once
     JuMP.@objective(model, Min, base_objective)
+
+    # plug in power injections
+    plug_in_power_injections(simdir, model, data, R, G, N, T)
     
     return model
 end
@@ -424,4 +432,41 @@ function save_congested(simdir, model, data)
 
     # Save to CSV
     CSV.write(joinpath(simdir, "output", "congested_constraints.csv"), df)
+end
+
+function plug_in_power_injections(simdir, model, data, R, G, N, T)
+    # If power_injections file is available, fix all the pg, ue, and ch to be fixed
+    csv_file = joinpath(simdir, "power_injections.csv")
+    if !isfile(csv_file)
+        return
+    end
+
+    df = CSV.read(csv_file, DataFrame)
+
+    """
+    for r in 1:R, g in 1:G, t in 1:T
+        fix(model[:pg][r,g,t], 0.0; force=true)
+    end
+    for r in 1:R, i in 1:N, t in 1:T
+        fix(model[:ue][r,i,t], 0.0; force=true)
+        fix(model[:ch][r,i,t], 0.0; force=true)
+        fix(model[:dis][r,i,t], 0.0; force=true)
+    end"""
+    
+    # Override with non-zero values from df
+    for row in eachrow(df)
+        if row.variable == "pg"
+            fix(model[:pg][row.rep, row.gen, row.time], row.value; force=true)
+        elseif row.variable == "ue"
+            fix(model[:ue][row.rep, row.bus, row.time], row.value; force=true)
+        elseif row.variable == "ch"
+            if row.value >= 0
+                fix(model[:ch][row.rep, row.bus, row.time], row.value; force=true)
+            else
+                fix(model[:dis][row.rep, row.bus, row.time], abs(row.value); force=true)
+            end
+        end
+    end
+
+    return 0
 end

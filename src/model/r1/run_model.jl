@@ -63,9 +63,9 @@ function run_model(simdir; timeout=84600)
     set_optimizer_attribute(model, "TimeLimit", timeout)
     optimize!(model)
 
-    # save congested lines and hours
-    if !haskey(data["param"], "storage_linearized") || data["param"]["storage_linearized"] == false
-        save_congested(simdir, model, data)
+    if primal_status(model) != MOI.FEASIBLE_POINT
+        # error("Primal status not feasible point")
+        return model, data
     end
 
     if termination_status(model) != MOI.OPTIMAL
@@ -76,12 +76,13 @@ function run_model(simdir; timeout=84600)
         return model, data
     end
 
-    if primal_status(model) != MOI.FEASIBLE_POINT
-        error("Primal status not feasible point")
-    end
-
     export_model(simdir, model, data)
     write_summary_to_csv(simdir, model, data)
+
+    # save congested lines and hours
+    if !haskey(data["param"], "storage_linearized") || data["param"]["storage_linearized"] == false
+        save_congested(simdir, model, data)
+    end
 
     return model, data
 
