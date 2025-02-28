@@ -451,7 +451,7 @@ function compute_flows!(flows, pg_values, ue_values, ch_values, data, PTDF)
     end
 end
 
-function save_tracked_constraints(simdir, model)
+function save_tracked_constraints(simdir, model::JuMP.Model)
     # Convert dictionary to DataFrame
     df = DataFrame(
         arc = [k[1] for k in keys(model.ext[:tracked_constraints])],

@@ -87,7 +87,7 @@ function define_master_ptdf(data::Dict{String, Any})
 
 end
 
-function solve_subproblem_ptdf(simdir, y_val, data, max_ptdf_iterations=32, max_ptdf_per_iteration=64, ptdf_tol=1e-6)
+function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints, max_ptdf_iterations=32, max_ptdf_per_iteration=64, ptdf_tol=1e-6)
     # unpack investment decisions
     gamma_val, s_power_val, s_energy_val, sigma_val = y_val
 
@@ -115,8 +115,8 @@ function solve_subproblem_ptdf(simdir, y_val, data, max_ptdf_iterations=32, max_
     # Compute PTDF matrix
     sub.ext[:PTDF] = do_all_ptdf(data)
 
-    # Track which constraints have been added
-    sub.ext[:tracked_constraints] = Dict{Tuple{Int,Int,Int}, Bool}()
+    # Initialize tracked constraints with the passed dictionary
+    sub.ext[:tracked_constraints] = deepcopy(tracked_constraints)
     
     # Get sets of branches with/without thermal limits
     rate_a_zero, rate_a_nonzero = get_rate_a_zero(data)
@@ -236,6 +236,55 @@ function solve_subproblem_ptdf(simdir, y_val, data, max_ptdf_iterations=32, max_
         for r=1:R) * operational_weight
     )
 
+    # Apply warm-start using tracked constraints
+    if !isempty(tracked_constraints)
+        println("Beginning optimized warm-start for subproblem")
+        
+        # Convert dictionary to DataFrame for grouping
+        arc_list = [k[1] for k in keys(tracked_constraints)]
+        rep_list = [k[2] for k in keys(tracked_constraints)]
+        time_list = [k[3] for k in keys(tracked_constraints)]
+        tracked_df = DataFrame(arc=arc_list, rep=rep_list, time=time_list)
+        
+        # Group by arc for efficient processing
+        arc_groups = groupby(tracked_df, :arc)
+        total_constraints = 0
+        
+        for group in arc_groups
+            a = first(group).arc
+            line_limit_base = data["branch"]["$a"]["rate_a"]
+            cap_increment = get_capacity_increment(data, a)
+            ptdf_row = sub.ext[:PTDF][a,:]
+            
+            constraints_batch = collect(eachrow(group))
+            batch_size = length(constraints_batch)
+            total_constraints += batch_size
+            
+            # Get all (r,t) pairs for this arc
+            rep_time_pairs = [(row.arc, row.rep, row.time) for row in constraints_batch]
+            
+            # Generate constraints efficiently
+            for (a, r, t) in rep_time_pairs
+                # Expression using the fixed gamma from master problem
+                line_limit = line_limit_base + sub[:gamma][a] * cap_increment
+                
+                # Create flow expression once and reuse
+                flow_expr = sum(ptdf_row[i] * (
+                    sum(sub[:pg][r,g,t] for g in 1:G if gen_bus_map[g] == i; init=0.0) -
+                    data["bus"]["$i"]["load"]["$r"][t] +
+                    sub[:ue][r,i,t] -
+                    sub[:ch][r,i,t]
+                ) for i in 1:N)
+                
+                # Add both constraints
+                sub[:ptdf_flow]["$(a)_$(r)_$(t)_ub"] = @constraint(sub, flow_expr <= line_limit)
+                sub[:ptdf_flow]["$(a)_$(r)_$(t)_lb"] = @constraint(sub, flow_expr >= -line_limit)
+            end
+        end
+        
+        println("Warm-started subproblem with $total_constraints constraints")
+    end
+
     # Solve using lazy PTDF constraints
     solved = false
     niter = 0
@@ -334,7 +383,7 @@ function solve_subproblem_ptdf(simdir, y_val, data, max_ptdf_iterations=32, max_
         dual_sigma = [dual(master_sigma[i]) for i=1:N]
         
         duals = (dual_gamma, dual_s_power, dual_s_energy, dual_sigma)
-        return objective_value(sub), duals
+        return objective_value(sub), duals, sub.ext[:tracked_constraints]
     else
         error("Subproblem failed to solve optimally: $(termination_status(sub))")
     end
@@ -363,6 +412,21 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=5
     # Unpack y variables
     gamma, s_power, s_energy, sigma = y
 
+    # Initialize tracked constraints dictionary to store across iterations
+    tracked_constraints = Dict{Tuple{Int,Int,Int}, Bool}()
+
+    # Load previous constraints if available
+    if isfile(joinpath(simdir, "tracked_constraints.csv"))
+        tracked_df = CSV.read(joinpath(simdir, "tracked_constraints.csv"), DataFrame)
+        println("Loading $(nrow(tracked_df)) previously tracked constraints")
+        
+        for row in eachrow(tracked_df)
+            if row.tracked
+                tracked_constraints[(row.arc, row.rep, row.time)] = true
+            end
+        end
+    end
+
     while !converged && iter < max_iterations
         # Solve master problem
         optimize!(master)
@@ -381,7 +445,10 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=5
         y_val = (gamma_val, s_power_val, s_energy_val, sigma_val)
 
         # Solve subproblem with fixed investments
-        phi_val, duals = solve_subproblem_ptdf(simdir, y_val, data)
+        phi_val, duals, new_tracked_constraints = solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints)
+
+        # Update tracked constraints
+        tracked_constraints = new_tracked_constraints
 
         # Save progress to CSV
         filename = joinpath(simdir, "output", "benders_progress.csv")
@@ -405,6 +472,8 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=5
     if !converged
         println("Benders decomposition did not converge after $max_iterations iterations")
     end
+
+    save_tracked_constraints(simdir, tracked_constraints)
     
     # Return final solution
     return (value.(gamma), value.(s_power), value.(s_energy), value.(sigma))
@@ -458,7 +527,17 @@ function benders_ptdf_write_to_csv(filename, master_obj, theta_val, phi_val, gam
     end
 end
 
-
+function save_tracked_constraints(simdir, tracked_constraints::Dict{Tuple{Int,Int,Int}, Bool})
+    df = DataFrame(
+        arc = [k[1] for k in keys(tracked_constraints)],
+        rep = [k[2] for k in keys(tracked_constraints)],
+        time = [k[3] for k in keys(tracked_constraints)],
+        tracked = fill(true, length(tracked_constraints))
+    )
+    
+    CSV.write(joinpath(simdir, "output", "tracked_constraints.csv"), df)
+    println("Saved $(nrow(df)) tracked constraints for future warm starts")
+end
 
 
 
