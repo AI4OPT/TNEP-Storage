@@ -1,0 +1,469 @@
+using JuMP
+using Gurobi
+using CSV, DataFrames
+include("../../../helpers/compute_gen_cost.jl")
+include("../rate_a_zero.jl")
+include("base_ptdf.jl")
+
+function define_master_ptdf(data::Dict{String, Any})
+    # Initialize model
+    optimizer = Gurobi.Optimizer
+    master = JuMP.Model(optimizer)
+
+    # Initialize sets
+    R = data["param"]["num_representatives"]
+    N = length(data["bus"])
+    E = length(data["branch"])
+    T = data["param"]["num_hours"]
+    G = length(data["gen"])
+    K = data["param"]["num_cap_upgrades_max"]
+
+    fbus::Vector{Int} = [data["branch"]["$a"]["f_bus"] for a in 1:E]                # from bus
+    tbus::Vector{Int} = [data["branch"]["$a"]["t_bus"] for a in 1:E]                # to bus
+
+    #
+    #   I. Variables
+    #
+
+    # investment level of capacity upgrade
+    JuMP.@variable(master, 0 <= gamma[a=1:E] <= K, Int)
+
+    # power rating of storage
+    JuMP.@variable(master, s_power[i=1:N] >= 0)
+
+    # energy rating of storage
+    JuMP.@variable(master, s_energy[i=1:N] >= 0)
+
+    # binary variable for installation of storage
+    JuMP.@variable(master, sigma[i=1:N], Bin)
+
+    # subproblem objective(s)
+    JuMP.@variable(master, theta >= 0)
+
+    #
+    #   II. Constraints
+    #
+    rate_a_zero, rate_a_nonzero = get_rate_a_zero(data)
+    rate_a_zero = Set(parse(Int, x) for x in rate_a_zero)
+    rate_a_nonzero = Set(parse(Int, x) for x in rate_a_nonzero)
+
+    # if rate a is zero (unlimited), then don't allow upgrades
+    JuMP.@constraint(master, 
+        rate_a_zero_line_upgrade[a in rate_a_zero],
+        gamma[a] == 0
+    )
+
+    # energy rating only if storage installed
+    JuMP.@constraint(master, 
+        installed_energy_ub[i in 1:N],
+        s_energy[i] <= sigma[i] * data["param"]["max_energy_rating"]
+    )
+
+    # power rating only if storage installed
+    JuMP.@constraint(master, 
+        installed_power_ub[i in 1:N],
+        s_power[i] <= sigma[i] * data["param"]["max_power_rating"]
+    )
+
+    # ensure that all storage is short-duration, i.e. can only store 4-hours worth of discharge
+    JuMP.@constraint(master, 
+        short_duration[i in 1:N],
+        s_energy[i] <= 4.0 * s_power[i]
+    )
+
+    #
+    #   III. Objective
+    #
+    JuMP.@objective(master, Min,
+    sum(data["param"]["cap_upgrade_cost"] * data["param"]["cap_upgrade_increment"] * data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
+    sum(s_power[i] * data["param"]["bess_power_cost"] + s_energy[i] * data["param"]["bess_energy_cost"] for i in 1:N) +
+    sum(sigma[i] for i in 1:N) * data["param"]["storage_fixed_cost"] +
+    theta
+    )
+
+    y = gamma, s_power, s_energy, sigma
+
+    return master, y, theta
+
+end
+
+function solve_subproblem_ptdf(simdir, y_val, data, max_ptdf_iterations=32, max_ptdf_per_iteration=64, ptdf_tol=1e-6)
+    # unpack investment decisions
+    gamma_val, s_power_val, s_energy_val, sigma_val = y_val
+
+    # Initialize sets
+    R = data["param"]["num_representatives"]
+    N = length(data["bus"])
+    E = length(data["branch"])
+    T = data["param"]["num_hours"]
+    G = length(data["gen"])
+    K = data["param"]["num_cap_upgrades_max"]
+
+    # Initialize model
+    sub_optimizer = Gurobi.Optimizer
+    sub = JuMP.Model(sub_optimizer)
+    set_optimizer_attribute(sub, "LogFile", joinpath(simdir, "gurobi_sub_logfile.log"))
+    set_optimizer_attribute(sub, "MIPGap", data["param"]["mip_gap"])
+
+    # Set up the PTDF metadata
+    sub.ext[:solve_metadata] = Dict(
+        :max_ptdf_iterations => max_ptdf_iterations,
+        :max_ptdf_per_iteration => max_ptdf_per_iteration,
+        :ptdf_tol => ptdf_tol
+    )
+    
+    # Compute PTDF matrix
+    sub.ext[:PTDF] = do_all_ptdf(data)
+
+    # Track which constraints have been added
+    sub.ext[:tracked_constraints] = Dict{Tuple{Int,Int,Int}, Bool}()
+    
+    # Get sets of branches with/without thermal limits
+    rate_a_zero, rate_a_nonzero = get_rate_a_zero(data)
+    sub.ext[:rate_a_nonzero] = Set(parse(Int, x) for x in rate_a_nonzero)
+
+    # Container for flow constraints
+    sub[:ptdf_flow] = Dict{String, ConstraintRef}()
+
+    # Pre-compute useful mappings that don't change during the solution process
+    gen_bus_map = Dict(parse(Int, g) => data["gen"]["$g"]["gen_bus"] for g in keys(data["gen"]))
+
+    #
+    #   I. Variables
+    #
+    
+    # generator active dispatch
+    nonrenewable_generators = filter(g -> lowercase(data["gen"][g]["gen_type"]) ∉ data["param"]["renewable_types"], keys(data["gen"]))
+    JuMP.@variable(sub, pg[r in 1:R, g in 1:G, t in 1:T])
+
+    for g in 1:G
+        gen = data["gen"]["$g"]
+        is_renewable = gen["gen_type"] ∈ data["param"]["renewable_types"]
+        is_foreign = gen["gen_type"]  ∈ ["foreign"]
+        if is_renewable
+            set_lower_bound.(pg[:, g, :], 0.0)
+            for r in 1:R, t in 1:T
+                set_upper_bound(pg[r, g, t], max(0, gen["profile"]["$r"][t]))
+            end
+        elseif is_foreign
+            for r in 1:R, t in 1:T
+                fix(pg[r, g, t], gen["profile"]["$r"][t])
+            end
+        else
+            set_lower_bound.(pg[:, g, :], gen["pmin"])
+            set_upper_bound.(pg[:, g, :], gen["pmax"])
+        end
+    end
+
+    # Under-served energy
+    @variable(sub, ue[r=1:R, i=1:N, t=1:T] >= 0)
+    
+    # Storage operation
+    @variable(sub, ch[r=1:R, i=1:N, t=1:T])  # Charging/discharging
+    @variable(sub, soc[r=1:R, i=1:N, t=1:T] >= 0)  # State of charge
+
+    # Fix investment variables based on master problem decisions
+    @variable(sub, gamma[a=1:E])
+    @variable(sub, s_power[i=1:N])
+    @variable(sub, s_energy[i=1:N])
+    @variable(sub, sigma[i=1:N])
+
+    #
+    #   II. Constraints
+    #
+
+    # FIX INVESTMENT DECISIONS FROM MASTER PROBLEM (DUALS USED FOR CUTS)
+    @constraint(sub, master_gamma[a=1:E], gamma[a] == gamma_val[a])
+    @constraint(sub, master_s_power[i=1:N], s_power[i] == s_power_val[i])
+    @constraint(sub, master_s_energy[i=1:N], s_energy[i] == s_energy_val[i])
+    @constraint(sub, master_sigma[i=1:N], sigma[i] == sigma_val[i])
+
+    # Global power balance
+    @constraint(sub, 
+        power_balance[r=1:R, t=1:T],
+        sum(pg[r,g,t] for g=1:G)
+        - sum(data["bus"]["$i"]["load"]["$r"][t] for i=1:N)
+        + sum(ue[r,i,t] for i=1:N)
+        - sum(ch[r,i,t] for i=1:N)
+        == 0
+    )
+
+    # Storage constraints
+    # SOC evolution
+    @constraint(sub, 
+        soc_over_time[r=1:R, i=1:N, t=2:T],
+        soc[r,i,t] == soc[r,i,t-1] + ch[r,i,t]
+    )
+    
+    # Initial and final SOC
+    @constraint(sub,
+        soc_start[r=1:R, i=1:N],
+        soc[r,i,1] == 0.5 * s_energy[i] + ch[r,i,1]
+    )
+    @constraint(sub,
+        soc_end[r=1:R, i=1:N],
+        soc[r,i,T] == 0.5 * s_energy[i]
+    )
+
+    # SOC limits
+    @constraint(sub, 
+        soc_energy_ub[r=1:R, i=1:N, t=1:T],
+        soc[r,i,t] <= s_energy[i]
+    )
+    
+    # Charging/discharging limits
+    @constraint(sub,
+        charge_discharge_lb[r=1:R, i=1:N, t=1:T],
+        -s_power[i] <= ch[r,i,t]
+    )
+    @constraint(sub,
+        charge_discharge_ub[r=1:R, i=1:N, t=1:T],
+        ch[r,i,t] <= s_power[i]
+    )
+
+    # Objective function
+    operational_weight = get(data["param"], "operational_weight", 1)
+
+    @objective(sub, Min,
+        sum(
+            data["param"]["representative_prob"][r] *
+            (
+                sum(
+                    sum(compute_gen_cost(pg[r, g, t], data["gen"]["$g"]) for g=1:G) +
+                    sum(data["param"]["under_served_penalty"] * ue[r, i, t] for i=1:N)
+                for t=1:T)
+            )
+        for r=1:R) * operational_weight
+    )
+
+    # Solve using lazy PTDF constraints
+    solved = false
+    niter = 0
+
+    while !solved && niter < sub.ext[:solve_metadata][:max_ptdf_iterations]
+        # Solve model
+        optimize!(sub)
+        
+        # Exit if not solved optimally
+        st = termination_status(sub)
+        st ∈ (MOI.OPTIMAL, MOI.LOCALLY_SOLVED) || break
+
+        # Get current solution values
+        pg_values = value.(sub[:pg])
+        ue_values = value.(sub[:ue])
+        ch_values = value.(sub[:ch])
+        gamma_values = value.(sub[:gamma])
+
+        # Compute all flows at once
+        flows = zeros(length(sub.ext[:rate_a_nonzero]), R, T)
+        compute_flows!(flows, pg_values, ue_values, ch_values, data, sub.ext[:PTDF])
+
+        # Hybrid approach: Branch-by-branch with vectorized (r,t) checks
+        n_violated = 0
+        n_added = 0
+        checked_count = 0
+
+        for a in sub.ext[:rate_a_nonzero]
+            checked_count += 1
+
+            # Pre-compute for this branch
+            ptdf_row = sub.ext[:PTDF][a,:]
+            cap_increment = get_capacity_increment(data, a)
+            line_limit_base = data["branch"]["$a"]["rate_a"]
+            line_limit_fixed = line_limit_base + gamma_values[a] * cap_increment
+            line_limit_expr = line_limit_base + sub[:gamma][a] * cap_increment
+
+            # Create a matrix of all (r,t) combinations for this branch
+            rt_pairs = [(r, t) for r in 1:R for t in 1:T]
+            
+            # Filter out already tracked combinations (vectorized)
+            untracked_rt = filter(rt -> !get(sub.ext[:tracked_constraints], (a, rt[1], rt[2]), false), rt_pairs)
+
+            # Check all flows for this branch at once (vectorized)
+            branch_violations = filter(rt -> begin
+                r, t = rt
+                return abs(flows[a,r,t]) > line_limit_fixed + sub.ext[:solve_metadata][:ptdf_tol]
+            end, untracked_rt)
+
+            # Update total violations count
+            branch_violation_count = length(branch_violations)
+            n_violated += branch_violation_count
+
+            # If any violations, add constraints up to the limit
+            if branch_violation_count > 0
+                # Determine how many violations to process for this branch
+                remaining_slots = sub.ext[:solve_metadata][:max_ptdf_per_iteration] - n_added
+                to_process = branch_violations[1:min(length(branch_violations), remaining_slots)]
+                
+                # Process violations for this branch
+                for (r, t) in to_process
+                    # Create flow expression only once
+                    flow_expr = sum(ptdf_row[i] * (
+                        sum(sub[:pg][r,g,t] for g in 1:G if gen_bus_map[g] == i; init=0.0) 
+                        - data["bus"]["$i"]["load"]["$r"][t] 
+                        + sub[:ue][r,i,t] - sub[:ch][r,i,t]
+                    ) for i in 1:N)
+                    
+                    # Add both constraints with the same expression
+                    sub[:ptdf_flow]["$(a)_$(r)_$(t)_ub"] = @constraint(sub, flow_expr <= line_limit_expr)
+                    sub[:ptdf_flow]["$(a)_$(r)_$(t)_lb"] = @constraint(sub, flow_expr >= -line_limit_expr)
+                    
+                    sub.ext[:tracked_constraints][(a,r,t)] = true
+                    n_added += 1
+                end
+                
+                # Check if we've hit the limit
+                if n_added >= sub.ext[:solve_metadata][:max_ptdf_per_iteration]
+                    break
+                end
+            end
+        end
+        
+        solved = (n_violated == 0)
+        niter += 1
+        println("approx. progress $(checked_count / E)")
+        println("PTDF Subproblem Iteration $niter: Found $n_violated violations, added $n_added constraints")
+    end
+
+    # Extract duals for Benders cuts
+    # Note: Ensure the model is solved to optimality before extracting duals
+    if termination_status(sub) ∈ (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+        dual_gamma = [dual(master_gamma[a]) for a=1:E]
+        dual_s_power = [dual(master_s_power[i]) for i=1:N]
+        dual_s_energy = [dual(master_s_energy[i]) for i=1:N]
+        dual_sigma = [dual(master_sigma[i]) for i=1:N]
+        
+        duals = (dual_gamma, dual_s_power, dual_s_energy, dual_sigma)
+        return objective_value(sub), duals
+    else
+        error("Subproblem failed to solve optimally: $(termination_status(sub))")
+    end
+end
+
+function add_benders_cut_ptdf(master, theta, duals, y, y_val, phi_val)
+    # Unpack y variables and duals
+    gamma, s_power, s_energy, sigma = y
+    dual_gamma, dual_s_power, dual_s_energy, dual_sigma = duals
+    gamma_val, s_power_val, s_energy_val, sigma_val = y_val
+
+    # Add Benders cut
+    @constraint(master, 
+        theta >= phi_val + 
+        sum(dual_gamma[a] * (gamma[a] - gamma_val[a]) for a=1:length(gamma)) +
+        sum(dual_s_power[i] * (s_power[i] - s_power_val[i]) for i=1:length(s_power)) +
+        sum(dual_s_energy[i] * (s_energy[i] - s_energy_val[i]) for i=1:length(s_energy)) +
+        sum(dual_sigma[i] * (sigma[i] - sigma_val[i]) for i=1:length(sigma))
+    )
+end
+
+function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=50, tolerance=0.01)
+    converged = false
+    iter = 0
+    
+    # Unpack y variables
+    gamma, s_power, s_energy, sigma = y
+
+    while !converged && iter < max_iterations
+        # Solve master problem
+        optimize!(master)
+        
+        if termination_status(master) != MOI.OPTIMAL
+            error("Master problem failed to solve optimally: $(termination_status(master))")
+        end
+        
+        # Get master solution
+        gamma_val = value.(gamma)
+        s_power_val = value.(s_power)
+        s_energy_val = value.(s_energy)
+        sigma_val = value.(sigma)
+        theta_val = value(theta)
+
+        y_val = (gamma_val, s_power_val, s_energy_val, sigma_val)
+
+        # Solve subproblem with fixed investments
+        phi_val, duals = solve_subproblem_ptdf(simdir, y_val, data)
+
+        # Save progress to CSV
+        filename = joinpath(simdir, "output", "benders_progress.csv")
+        benders_ptdf_write_to_csv(filename, objective_value(master), theta_val, phi_val, gamma_val, s_power_val, s_energy_val, sigma_val)
+
+        # Check convergence
+        gap = abs(theta_val - phi_val) / (1e-10 + abs(phi_val))
+        println("Benders iteration $(iter+1): Master objective = $(objective_value(master)), theta = $(theta_val), phi = $(phi_val), gap = $(gap)")
+
+        if gap < tolerance
+            converged = true
+            println("Benders decomposition converged after $(iter+1) iterations")
+        else
+            # Add new Benders cut to master problem
+            add_benders_cut_ptdf(master, theta, duals, y, y_val, phi_val)
+        end
+        
+        iter += 1
+    end
+
+    if !converged
+        println("Benders decomposition did not converge after $max_iterations iterations")
+    end
+    
+    # Return final solution
+    return (value.(gamma), value.(s_power), value.(s_energy), value.(sigma))
+end
+
+function benders_ptdf_solve(simdir)
+    data = JSON.parsefile(joinpath(simdir, "data.json"))
+    # Create master problem
+    master, y, theta = define_master_ptdf(data)
+    
+    # Get optimal solution through Benders iterations
+    gamma_val, s_power_val, s_energy_val, sigma_val = benders_iteration_ptdf(simdir, master, y, theta, data)
+    
+    # Save final solution
+    save_investment_results(simdir, gamma_val, s_power_val, s_energy_val, sigma_val)
+    
+    return objective_value(master)
+end
+
+function save_investment_results(simdir, gamma_val, s_power_val, s_energy_val, sigma_val)
+    # Save line investments
+    line_df = DataFrame(Upgrade_Lvl = gamma_val)
+    CSV.write(joinpath(simdir, "output", "line_investments.csv"), line_df)
+    
+    # Save storage investments
+    storage_df = DataFrame(
+        Storage_Power = s_power_val,
+        Storage_Energy = s_energy_val,
+        Storage_Indicator = sigma_val
+    )
+    CSV.write(joinpath(simdir, "output", "storage_investments.csv"), storage_df)
+end
+
+function benders_ptdf_write_to_csv(filename, master_obj, theta_val, phi_val, gamma_val, s_power_val, s_energy_val, sigma_val)
+    # Prepare the data row
+    df = DataFrame(
+        master_objective = [master_obj],
+        theta_val = [theta_val],
+        phi_val = [phi_val],
+        total_line_upgrades = [sum(gamma_val)],
+        total_storage_power = [sum(s_power_val)],
+        total_storage_energy = [sum(s_energy_val)],
+        total_storage_sites = [sum(sigma_val)]
+    )
+
+    # Write to CSV, appending to it
+    if isfile(filename)
+        CSV.write(filename, df; append = true, header = false)
+    else
+        CSV.write(filename, df)
+    end
+end
+
+
+
+
+
+    
+
+
+
+

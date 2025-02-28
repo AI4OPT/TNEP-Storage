@@ -45,39 +45,62 @@ function create_model_r1_ptdf_iterative(simdir, data::Dict{String, Any}, optimiz
     # Add container for flow constraints
     model[:ptdf_flow] = Dict{String, ConstraintRef}()
 
-    # warm-start the PTDF with certain flow constraints
-    # Add after PTDF matrix storage
-    if isfile(joinpath(simdir, "congested_constraints.csv"))
-        constraints_df = CSV.read(joinpath(simdir, "congested_constraints.csv"), DataFrame)
+    # Pre-compute useful mappings that don't change during the solution process
+    gen_bus_map = Dict(parse(Int, g) => data["gen"]["$g"]["gen_bus"] for g in keys(data["gen"]))
+
+    # Optimized warm-start for PTDF with matrix operations
+    if isfile(joinpath(simdir, "tracked_constraints.csv"))
+        tracked_df = CSV.read(joinpath(simdir, "tracked_constraints.csv"), DataFrame)
+        println("Beginning optimized warm-start process")
         
-        rows_done = 0
-        for row in eachrow(constraints_df)
-            rows_done += 1
-            println(rows_done)
-            a, r, t = row.arc, row.rep, row.time
-            if row.tracked
-                line_limit = data["branch"]["$a"]["rate_a"] + model[:gamma][a] * get_capacity_increment(data, a)
-                row = model.ext[:PTDF][a,:]
+        # Group the constraints by arc once
+        arc_groups = groupby(tracked_df, :arc)
+        total_constraints = 0
+        
+        for group in arc_groups
+            a = first(group).arc
+            line_limit_base = data["branch"]["$a"]["rate_a"]
+            cap_increment = get_capacity_increment(data, a)
+            ptdf_row = model.ext[:PTDF][a,:]
+            
+            # Process constraints for this arc in batches
+            constraints_batch = collect(eachrow(group))
+            batch_size = length(constraints_batch)
+            total_constraints += batch_size
+            
+            # Extract all the (r,t) pairs for this arc
+            rep_time_pairs = [(cons.rep, cons.time) for cons in constraints_batch]
+            
+            # Pre-compute the line limits for all constraints in this group
+            line_limit = line_limit_base + model[:gamma][a] * cap_increment
+            
+            # Create a matrix expression for faster constraint generation
+            for (idx, (r, t)) in enumerate(rep_time_pairs)
+                # Build the net injection vector for this (r,t) pair
+                # We can create this once and reuse it for both upper and lower bounds
+                # This is the vectorized equivalent of inner sum:
+                # sum(row[i] * (net_injection at bus i) for i in 1:N)
                 
-                model[:ptdf_flow]["$(a)_$(r)_$(t)_ub"] = @constraint(model,
-                    sum(row[i] * (
-                        sum(model[:pg][r,g,t] for g in 1:G if data["gen"]["$g"]["gen_bus"] == i; init=0.0)
-                        - data["bus"]["$i"]["load"]["$r"][t]
-                        + model[:ue][r,i,t] - model[:ch][r,i,t]
-                    ) for i in 1:length(data["bus"])) <= line_limit
-                )
+                # Define the constraint expression using matrix operations
+                flow_expr = sum(ptdf_row[i] * (
+                    sum(model[:pg][r,g,t] for g in 1:G if gen_bus_map[g] == i; init=0.0) -
+                    data["bus"]["$i"]["load"]["$r"][t] +
+                    model[:ue][r,i,t] -
+                    model[:ch][r,i,t]
+                ) for i in 1:N)
                 
-                model[:ptdf_flow]["$(a)_$(r)_$(t)_lb"] = @constraint(model,
-                    sum(row[i] * (
-                        sum(model[:pg][r,g,t] for g in 1:G if data["gen"]["$g"]["gen_bus"] == i; init=0.0)
-                        - data["bus"]["$i"]["load"]["$r"][t]
-                        + model[:ue][r,i,t] - model[:ch][r,i,t]
-                    ) for i in 1:length(data["bus"])) >= -line_limit
-                )
+                # Add both constraints at once
+                model[:ptdf_flow]["$(a)_$(r)_$(t)_ub"] = @constraint(model, flow_expr <= line_limit)
+                model[:ptdf_flow]["$(a)_$(r)_$(t)_lb"] = @constraint(model, flow_expr >= -line_limit)
                 
+                # Track the constraint
                 model.ext[:tracked_constraints][(a,r,t)] = true
             end
+            
+            println("Progress: Cumulatively added $total_constraints constraints")
         end
+        
+        println("Warm-started with $total_constraints constraints")
     end
 
     # Begin lazy PTDF loop
@@ -102,58 +125,66 @@ function create_model_r1_ptdf_iterative(simdir, data::Dict{String, Any}, optimiz
         # Compute all flows at once
         flows = zeros(length(model.ext[:rate_a_nonzero]), R, T)
         compute_flows!(flows, pg_values, ue_values, ch_values, data, model.ext[:PTDF])
-        
-        # Check for violations
+
+        # Hybrid approach: Branch-by-branch with vectorized (r,t) checks
         n_violated = 0
         n_added = 0
-        
-        # First find violations without modifying the model
         checked_count = 0
+        
+        # Keep track of all tracked combinations for this branch to avoid lookups
         for a in model.ext[:rate_a_nonzero]
             checked_count += 1
-            line_limit = data["branch"]["$a"]["rate_a"] + gamma_values[a] * get_capacity_increment(data, a)
             
-            for r in 1:R, t in 1:T
-                if get(model.ext[:tracked_constraints], (a,r,t), false)
-                    continue
+            # Pre-compute for this branch
+            ptdf_row = model.ext[:PTDF][a,:]
+            cap_increment = get_capacity_increment(data, a)
+            line_limit_base = data["branch"]["$a"]["rate_a"]
+            line_limit_fixed = line_limit_base + gamma_values[a] * cap_increment
+            line_limit_expr = line_limit_base + model[:gamma][a] * cap_increment
+            
+            # Create a matrix of all (r,t) combinations for this branch
+            rt_pairs = [(r, t) for r in 1:R for t in 1:T]
+            
+            # Filter out already tracked combinations (vectorized)
+            untracked_rt = filter(rt -> !get(model.ext[:tracked_constraints], (a, rt[1], rt[2]), false), rt_pairs)
+            
+            # Check all flows for this branch at once (vectorized)
+            branch_violations = filter(rt -> begin
+                r, t = rt
+                return abs(flows[a,r,t]) > line_limit_fixed + model.ext[:solve_metadata][:ptdf_tol]
+            end, untracked_rt)
+            
+            # Update total violations count
+            branch_violation_count = length(branch_violations)
+            n_violated += branch_violation_count
+            
+            # If any violations, add constraints up to the limit
+            if branch_violation_count > 0
+                # Determine how many violations to process for this branch
+                remaining_slots = model.ext[:solve_metadata][:max_ptdf_per_iteration] - n_added
+                to_process = branch_violations[1:min(length(branch_violations), remaining_slots)]
+                
+                # Process violations for this branch
+                for (r, t) in to_process
+                    # Create flow expression only once
+                    flow_expr = sum(ptdf_row[i] * (
+                        sum(model[:pg][r,g,t] for g in 1:G if gen_bus_map[g] == i; init=0.0) 
+                        - data["bus"]["$i"]["load"]["$r"][t] 
+                        + model[:ue][r,i,t] - model[:ch][r,i,t]
+                    ) for i in 1:N)
+                    
+                    # Add both constraints with the same expression
+                    model[:ptdf_flow]["$(a)_$(r)_$(t)_ub"] = @constraint(model, flow_expr <= line_limit_expr)
+                    model[:ptdf_flow]["$(a)_$(r)_$(t)_lb"] = @constraint(model, flow_expr >= -line_limit_expr)
+                    
+                    model.ext[:tracked_constraints][(a,r,t)] = true
+                    n_added += 1
                 end
                 
-                if abs(flows[a,r,t]) > line_limit + model.ext[:solve_metadata][:ptdf_tol]
-                    n_violated += 1
-                    
-                    if n_added < model.ext[:solve_metadata][:max_ptdf_per_iteration]
-                        row = model.ext[:PTDF][a,:]
-                        
-                        # Add both constraints
-                        model[:ptdf_flow]["$(a)_$(r)_$(t)_ub"] = @constraint(model,
-                            sum(row[i] * (
-                                sum(model[:pg][r,g,t] for g in 1:G if data["gen"]["$g"]["gen_bus"] == i; init=0.0)
-                                - data["bus"]["$i"]["load"]["$r"][t]
-                                + model[:ue][r,i,t] - model[:ch][r,i,t]
-                            ) for i in 1:length(data["bus"])) <= data["branch"]["$a"]["rate_a"] + model[:gamma][a] * get_capacity_increment(data, a)
-                        )
-                        
-                        model[:ptdf_flow]["$(a)_$(r)_$(t)_lb"] = @constraint(model,
-                            sum(row[i] * (
-                                sum(model[:pg][r,g,t] for g in 1:G if data["gen"]["$g"]["gen_bus"] == i; init=0.0)
-                                - data["bus"]["$i"]["load"]["$r"][t]
-                                + model[:ue][r,i,t] - model[:ch][r,i,t]
-                            ) for i in 1:length(data["bus"])) >= -(data["branch"]["$a"]["rate_a"] + model[:gamma][a] * get_capacity_increment(data, a))
-                        )
-                        
-                        model.ext[:tracked_constraints][(a,r,t)] = true
-                        n_added += 1
-                        
-                        
-                        if n_added >= model.ext[:solve_metadata][:max_ptdf_per_iteration]
-                            break
-                        end
-                    end
+                # Check if we've hit the limit
+                if n_added >= model.ext[:solve_metadata][:max_ptdf_per_iteration]
+                    break
                 end
-            end
-            
-            if n_added >= model.ext[:solve_metadata][:max_ptdf_per_iteration]
-                break
             end
         end
         
@@ -422,10 +453,15 @@ end
 
 function save_tracked_constraints(simdir, model)
     # Convert dictionary to DataFrame
-    df = DataFrame(arc = [k[1] for k in keys(model.ext[:tracked_constraints])],
-    rep = [k[2] for k in keys(model.ext[:tracked_constraints])],
-    time = [k[3] for k in keys(model.ext[:tracked_constraints])],
-    tracked = collect(values(model.ext[:tracked_constraints])))
+    df = DataFrame(
+        arc = [k[1] for k in keys(model.ext[:tracked_constraints])],
+        rep = [k[2] for k in keys(model.ext[:tracked_constraints])],
+        time = [k[3] for k in keys(model.ext[:tracked_constraints])],
+        tracked = collect(values(model.ext[:tracked_constraints]))
+    )
+
+    # Sort DataFrame by arc first, then rep, then time
+    sort!(df, [:arc, :rep, :time])
 
     # Save to CSV
     CSV.write(joinpath(simdir, "output", "tracked_constraints.csv"), df)
