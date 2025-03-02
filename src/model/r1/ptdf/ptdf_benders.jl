@@ -28,12 +28,6 @@ function define_master_ptdf(data::Dict{String, Any})
     # investment level of capacity upgrade
     JuMP.@variable(master, 0 <= gamma[a=1:E] <= K, Int)
 
-    # power rating of storage
-    JuMP.@variable(master, s_power[i=1:N] >= 0)
-
-    # energy rating of storage
-    JuMP.@variable(master, s_energy[i=1:N] >= 0)
-
     # binary variable for installation of storage
     JuMP.@variable(master, sigma[i=1:N], Bin)
 
@@ -53,43 +47,24 @@ function define_master_ptdf(data::Dict{String, Any})
         gamma[a] == 0
     )
 
-    # energy rating only if storage installed
-    JuMP.@constraint(master, 
-        installed_energy_ub[i in 1:N],
-        s_energy[i] <= sigma[i] * data["param"]["max_energy_rating"]
-    )
-
-    # power rating only if storage installed
-    JuMP.@constraint(master, 
-        installed_power_ub[i in 1:N],
-        s_power[i] <= sigma[i] * data["param"]["max_power_rating"]
-    )
-
-    # ensure that all storage is short-duration, i.e. can only store 4-hours worth of discharge
-    JuMP.@constraint(master, 
-        short_duration[i in 1:N],
-        s_energy[i] <= 4.0 * s_power[i]
-    )
-
     #
     #   III. Objective
     #
     JuMP.@objective(master, Min,
     sum(data["param"]["cap_upgrade_cost"] * data["param"]["cap_upgrade_increment"] * data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
-    sum(s_power[i] * data["param"]["bess_power_cost"] + s_energy[i] * data["param"]["bess_energy_cost"] for i in 1:N) +
     sum(sigma[i] for i in 1:N) * data["param"]["storage_fixed_cost"] +
     theta
     )
 
-    y = gamma, s_power, s_energy, sigma
+    y = gamma, sigma
 
     return master, y, theta
 
 end
 
-function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints, max_ptdf_iterations=32, max_ptdf_per_iteration=64, ptdf_tol=1e-6)
+function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints, max_ptdf_iterations=64, max_ptdf_per_iteration=32, ptdf_tol=1e-6)
     # unpack investment decisions
-    gamma_val, s_power_val, s_energy_val, sigma_val = y_val
+    gamma_val, sigma_val = y_val
 
     # Initialize sets
     R = data["param"]["num_representatives"]
@@ -131,6 +106,12 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints, max_ptd
     #
     #   I. Variables
     #
+
+    # power rating of storage
+    JuMP.@variable(sub, s_power[i=1:N] >= 0)
+
+    # energy rating of storage
+    JuMP.@variable(sub, s_energy[i=1:N] >= 0)
     
     # generator active dispatch
     nonrenewable_generators = filter(g -> lowercase(data["gen"][g]["gen_type"]) ∉ data["param"]["renewable_types"], keys(data["gen"]))
@@ -164,8 +145,6 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints, max_ptd
 
     # Fix investment variables based on master problem decisions
     @variable(sub, gamma[a=1:E])
-    @variable(sub, s_power[i=1:N])
-    @variable(sub, s_energy[i=1:N])
     @variable(sub, sigma[i=1:N])
 
     #
@@ -174,8 +153,6 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints, max_ptd
 
     # FIX INVESTMENT DECISIONS FROM MASTER PROBLEM (DUALS USED FOR CUTS)
     @constraint(sub, master_gamma[a=1:E], gamma[a] == gamma_val[a])
-    @constraint(sub, master_s_power[i=1:N], s_power[i] == s_power_val[i])
-    @constraint(sub, master_s_energy[i=1:N], s_energy[i] == s_energy_val[i])
     @constraint(sub, master_sigma[i=1:N], sigma[i] == sigma_val[i])
 
     # Global power balance
@@ -189,6 +166,24 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints, max_ptd
     )
 
     # Storage constraints
+    # energy rating only if storage installed
+    JuMP.@constraint(sub, 
+        installed_energy_ub[i in 1:N],
+        s_energy[i] <= sigma[i] * data["param"]["max_energy_rating"]
+    )
+
+    # power rating only if storage installed
+    JuMP.@constraint(sub, 
+        installed_power_ub[i in 1:N],
+        s_power[i] <= sigma[i] * data["param"]["max_power_rating"]
+    )
+
+    # ensure that all storage is short-duration, i.e. can only store 4-hours worth of discharge
+    JuMP.@constraint(sub, 
+        short_duration[i in 1:N],
+        s_energy[i] <= 4.0 * s_power[i]
+    )
+
     # SOC evolution
     @constraint(sub, 
         soc_over_time[r=1:R, i=1:N, t=2:T],
@@ -225,6 +220,7 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints, max_ptd
     operational_weight = get(data["param"], "operational_weight", 1)
 
     @objective(sub, Min,
+        sum(s_power[i] * data["param"]["bess_power_cost"] + s_energy[i] * data["param"]["bess_energy_cost"] for i in 1:N) + 
         sum(
             data["param"]["representative_prob"][r] *
             (
@@ -261,10 +257,10 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints, max_ptd
             total_constraints += batch_size
             
             # Get all (r,t) pairs for this arc
-            rep_time_pairs = [(row.arc, row.rep, row.time) for row in constraints_batch]
+            rep_time_pairs = [(row.rep, row.time) for row in constraints_batch]
             
             # Generate constraints efficiently
-            for (a, r, t) in rep_time_pairs
+            for (r, t) in rep_time_pairs
                 # Expression using the fixed gamma from master problem
                 line_limit = line_limit_base + sub[:gamma][a] * cap_increment
                 
@@ -378,12 +374,10 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints, max_ptd
     # Note: Ensure the model is solved to optimality before extracting duals
     if termination_status(sub) ∈ (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
         dual_gamma = [dual(master_gamma[a]) for a=1:E]
-        dual_s_power = [dual(master_s_power[i]) for i=1:N]
-        dual_s_energy = [dual(master_s_energy[i]) for i=1:N]
         dual_sigma = [dual(master_sigma[i]) for i=1:N]
         
-        duals = (dual_gamma, dual_s_power, dual_s_energy, dual_sigma)
-        return objective_value(sub), duals, sub.ext[:tracked_constraints]
+        duals = (dual_gamma, dual_sigma)
+        return sub, objective_value(sub), duals, sub.ext[:tracked_constraints]
     else
         error("Subproblem failed to solve optimally: $(termination_status(sub))")
     end
@@ -391,26 +385,24 @@ end
 
 function add_benders_cut_ptdf(master, theta, duals, y, y_val, phi_val)
     # Unpack y variables and duals
-    gamma, s_power, s_energy, sigma = y
-    dual_gamma, dual_s_power, dual_s_energy, dual_sigma = duals
-    gamma_val, s_power_val, s_energy_val, sigma_val = y_val
+    gamma, sigma = y
+    dual_gamma, dual_sigma = duals
+    gamma_val, sigma_val = y_val
 
     # Add Benders cut
     @constraint(master, 
         theta >= phi_val + 
         sum(dual_gamma[a] * (gamma[a] - gamma_val[a]) for a=1:length(gamma)) +
-        sum(dual_s_power[i] * (s_power[i] - s_power_val[i]) for i=1:length(s_power)) +
-        sum(dual_s_energy[i] * (s_energy[i] - s_energy_val[i]) for i=1:length(s_energy)) +
         sum(dual_sigma[i] * (sigma[i] - sigma_val[i]) for i=1:length(sigma))
     )
 end
 
-function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=50, tolerance=0.01)
+function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=100, tolerance=0.01)
     converged = false
     iter = 0
     
     # Unpack y variables
-    gamma, s_power, s_energy, sigma = y
+    gamma, sigma = y
 
     # Initialize tracked constraints dictionary to store across iterations
     tracked_constraints = Dict{Tuple{Int,Int,Int}, Bool}()
@@ -437,15 +429,15 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=5
         
         # Get master solution
         gamma_val = value.(gamma)
-        s_power_val = value.(s_power)
-        s_energy_val = value.(s_energy)
         sigma_val = value.(sigma)
         theta_val = value(theta)
 
-        y_val = (gamma_val, s_power_val, s_energy_val, sigma_val)
+        y_val = (gamma_val, sigma_val)
 
         # Solve subproblem with fixed investments
-        phi_val, duals, new_tracked_constraints = solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints)
+        sub_model, phi_val, duals, new_tracked_constraints = solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints)
+        s_power_val = value.(sub_model[:s_power])
+        s_energy_val = value.(sub_model[:s_energy])
 
         # Update tracked constraints
         tracked_constraints = new_tracked_constraints
@@ -476,7 +468,7 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=5
     save_tracked_constraints(simdir, tracked_constraints)
     
     # Return final solution
-    return (value.(gamma), value.(s_power), value.(s_energy), value.(sigma))
+    return (gamma_val, s_power_val, s_energy_val, sigma_val)
 end
 
 function benders_ptdf_solve(simdir)
@@ -538,11 +530,3 @@ function save_tracked_constraints(simdir, tracked_constraints::Dict{Tuple{Int,In
     CSV.write(joinpath(simdir, "output", "tracked_constraints.csv"), df)
     println("Saved $(nrow(df)) tracked constraints for future warm starts")
 end
-
-
-
-    
-
-
-
-
