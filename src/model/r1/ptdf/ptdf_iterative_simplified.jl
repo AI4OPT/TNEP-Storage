@@ -5,7 +5,7 @@ include("../storage_candidates/naive_candidates.jl")
 include("../rate_a_zero.jl")
 include("base_ptdf.jl")
 
-function create_model_r1_ptdf_iterative(simdir, data::Dict{String, Any}, optimizer; 
+function create_model_r1_ptdf_iterative_simplified(simdir, data::Dict{String, Any}, optimizer; 
     line_investments=nothing, 
     storage_investments=nothing,
     max_ptdf_iterations::Int=128,
@@ -248,14 +248,21 @@ function create_base_model(data::Dict{String, Any}, optimizer;
         end
     end
 
+    # Conditional variable declaration based on whether relaxed model is used
+    if haskey(data["param"], "relaxed") && data["param"]["relaxed"] == true
+        # Use continuous variables for relaxed model
+        JuMP.@variable(model, 0 <= gamma[a=1:E] <= K)
+    else
+        # Use integer variables for standard model
+        JuMP.@variable(model, 0 <= gamma[a=1:E] <= K, Int) # investment level of capacity upgrade
+    end
     JuMP.@variable(model, ue[r=1:R, i=1:N, t=1:T] >= 0) # under-served energy at bus
-    JuMP.@variable(model, 0 <= gamma[a=1:E] <= K, Int) # investment level of capacity upgrade
     # JuMP.@variable(model, pf[r=1:R, a=1:E, t=1:T]) # branch flows
     JuMP.@variable(model, s_power[i=1:N] >= 0) # power rating of storage
     JuMP.@variable(model, s_energy[i=1:N] >= 0) # energy rating of storage
     JuMP.@variable(model, soc[r=1:R, i=1:N, t=1:T] >= 0) # state of charge of storage
     JuMP.@variable(model, ch[r=1:R, i=1:N, t=1:T]) # charging of storage
-    JuMP.@variable(model, sigma[i=1:N], Bin) # binary variable for installation of storage
+    # JuMP.@variable(model, sigma[i=1:N], Bin) # binary variable for installation of storage
 
     # Add all non-PTDF constraints
     # Global power balance
@@ -312,10 +319,6 @@ function create_base_model(data::Dict{String, Any}, optimizer;
             inv_s_energy[i in 1:N],
             s_energy[i] == inv[i, :Storage_Energy]
         )
-        @constraint(model,
-            inv_sigma[i in 1:N],
-            sigma[i] == ((inv[i, :Storage_Power] != 0 || inv[i, :Storage_Energy] != 0) ? 1 : 0)
-        )
     end
 
     # if rate a is zero (unlimited), then don't allow upgrades
@@ -346,18 +349,6 @@ function create_base_model(data::Dict{String, Any}, optimizer;
         soc[r,i,t] <= s_energy[i]
     )
 
-    # energy rating only if storage installed
-    JuMP.@constraint(model, 
-        installed_energy_ub[i in 1:N],
-        s_energy[i] <= sigma[i] * data["param"]["max_energy_rating"]
-    )
-
-    # power rating only if storage installed
-    JuMP.@constraint(model, 
-        installed_power_ub[i in 1:N],
-        s_power[i] <= sigma[i] * data["param"]["max_power_rating"]
-    )
-
     # ensure that all storage is short-duration, i.e. can only store 4-hours worth of discharge
     if storage_investments == nothing 
         JuMP.@constraint(model, 
@@ -376,16 +367,6 @@ function create_base_model(data::Dict{String, Any}, optimizer;
         ch[r,i,t] <= s_power[i]
     )
 
-    # charge/discharge must be constrained by installation
-    JuMP.@constraint(model,
-        charge_discharge_i_lb[r in 1:R, i in 1:N, t in 1:T],
-        -sigma[i] * data["param"]["max_power_rating"] <= ch[r,i,t]
-    )
-    JuMP.@constraint(model,
-        charge_discharge_i_ub[r in 1:R, i in 1:N, t in 1:T],
-        ch[r,i,t] <= sigma[i] * data["param"]["max_power_rating"]
-    )
-
     # OPTIONAL: CANDIDATE STORAGE LOCATIONS ONLY
     if haskey(data["param"], "candidate_no_upgrades_dir")
         no_upgrades_dir = data["param"]["candidate_no_upgrades_dir"]
@@ -401,7 +382,7 @@ function create_base_model(data::Dict{String, Any}, optimizer;
         non_candidates = Set(parse(Int, x) for x in non_candidates)
 
         for i in non_candidates
-            fix(sigma[i], 0; force = true)
+            fix(s_energy[i], 0; force = true)
         end
 
         println("Number of candidates in Gurobi model: $(length(candidates))")
@@ -411,7 +392,6 @@ function create_base_model(data::Dict{String, Any}, optimizer;
     operational_weight = get(data["param"], "operational_weight", 1)
     @objective(model, Min,
         sum(s_power[i] * data["param"]["bess_power_cost"] + s_energy[i] * data["param"]["bess_energy_cost"] for i in 1:N) +
-        sum(sigma[i] for i in 1:N) * data["param"]["storage_fixed_cost"] + 
         sum(data["param"]["cap_upgrade_cost"] * get_capacity_increment(data, a) * data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
         sum(
             data["param"]["representative_prob"][r] *
