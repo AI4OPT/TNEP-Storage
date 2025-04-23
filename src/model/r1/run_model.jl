@@ -8,11 +8,13 @@ include("add_params_profiles.jl")
 include("../n1/export_model.jl")
 include("create_model.jl")
 include("create_model_storage_linearized.jl")
+include("create_model_simplified.jl")
 include("../n2/decarbonization.jl")
 include("create_summary.jl")
 include("ptdf/create_model_ptdf.jl")
 include("ptdf/ptdf_iterative.jl")
 include("ptdf/ptdf_iterative_simplified.jl")
+include("ptdf/ptdf_iterative_simplified_sorted.jl")
 
 function run_model(simdir; timeout=84600)
     setup_simdir(simdir)
@@ -54,6 +56,10 @@ function run_model(simdir; timeout=84600)
             storage_investments=storage_investments)
     elseif data["param"]["storage_linearized"] == "ptdf_simplified"
         model = create_model_r1_ptdf_iterative_simplified(simdir, data, optimizer,  
+            line_investments=line_investments, 
+            storage_investments=storage_investments)
+    elseif data["param"]["storage_linearized"] == "ptdf_simplified_sorted"
+        model = create_model_r1_ptdf_iterative_simplified_sorted(simdir, data, optimizer,  
             line_investments=line_investments, 
             storage_investments=storage_investments)
     else

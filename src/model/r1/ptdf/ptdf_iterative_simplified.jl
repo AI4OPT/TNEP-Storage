@@ -357,6 +357,18 @@ function create_base_model(data::Dict{String, Any}, optimizer;
         )
     end
 
+    # energy rating only if storage installed
+    JuMP.@constraint(model, 
+        installed_energy_ub[i in 1:N],
+        s_energy[i] <= data["param"]["max_energy_rating"]
+    )
+
+    # power rating only if storage installed
+    JuMP.@constraint(model, 
+        installed_power_ub[i in 1:N],
+        s_power[i] <= data["param"]["max_power_rating"]
+    )
+
     # charge/discharge must be constrained by power rating
     JuMP.@constraint(model,
         charge_discharge_lb[r in 1:R, i in 1:N, t in 1:T],
