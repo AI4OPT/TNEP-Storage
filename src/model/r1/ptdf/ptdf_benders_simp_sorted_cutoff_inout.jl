@@ -21,8 +21,20 @@ function define_master_ptdf(data::Dict{String, Any})
     G = length(data["gen"])
     K = data["param"]["num_cap_upgrades_max"]
 
-    fbus::Vector{Int} = [data["branch"]["$a"]["f_bus"] for a in 1:E]                # from bus
-    tbus::Vector{Int} = [data["branch"]["$a"]["t_bus"] for a in 1:E]                # to bus
+    # Get incidence matrix from extension
+    incidence_matrix = master.ext[:INCIDENCE] = do_all_incidence(data)
+
+    # Get sets of branches with/without thermal limits
+    rate_a_zero, rate_a_nonzero = get_rate_a_zero(data)
+    rate_a_zero = Set(parse(Int, x) for x in rate_a_zero)
+    rate_a_nonzero = Set(parse(Int, x) for x in rate_a_nonzero)
+
+    # Pre-compute useful mappings that don't change during the solution process
+    gen_bus_map = Dict(parse(Int, g) => data["gen"]["$g"]["gen_bus"] for g in keys(data["gen"]))
+    
+    # Branch metadata
+    from_bus = Dict(parse(Int, a) => data["branch"]["$a"]["f_bus"] for a in keys(data["branch"]))
+    to_bus = Dict(parse(Int, a) => data["branch"]["$a"]["t_bus"] for a in keys(data["branch"]))
 
     #
     #   I. Variables
@@ -45,10 +57,7 @@ function define_master_ptdf(data::Dict{String, Any})
 
     #
     #   II. Constraints
-    #
-    rate_a_zero, rate_a_nonzero = get_rate_a_zero(data)
-    rate_a_zero = Set(parse(Int, x) for x in rate_a_zero)
-    rate_a_nonzero = Set(parse(Int, x) for x in rate_a_nonzero)
+    #    
 
     # if rate a is zero (unlimited), then don't allow upgrades
     JuMP.@constraint(master, 
@@ -82,6 +91,118 @@ function define_master_ptdf(data::Dict{String, Any})
     sum(data["param"]["cap_upgrade_cost"] * data["param"]["cap_upgrade_increment"] * data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
     theta
     )
+
+    # if embed transport_flow, then solve the transport flow model in the master problem
+    if haskey(data["param"], "embed_transport_flow") && data["param"]["embed_transport_flow"] != false
+
+        # --- ADDITIONAL VARIABLES ---
+
+        # Generator active dispatch
+        nonrenewable_generators = filter(g -> lowercase(data["gen"][g]["gen_type"]) ∉ data["param"]["renewable_types"], keys(data["gen"]))
+        JuMP.@variable(master, pg[r in 1:R, g in 1:G, t in 1:T])
+
+        for g in 1:G
+            gen = data["gen"]["$g"]
+            is_renewable = gen["gen_type"] ∈ data["param"]["renewable_types"]
+            is_foreign = gen["gen_type"] ∈ ["foreign"]
+            if is_renewable
+                set_lower_bound.(pg[:, g, :], 0.0)
+                for r in 1:R, t in 1:T
+                    set_upper_bound(pg[r, g, t], max(0, gen["profile"]["$r"][t]))
+                end
+            elseif is_foreign
+                for r in 1:R, t in 1:T
+                    fix(pg[r, g, t], gen["profile"]["$r"][t])
+                end
+            else
+                set_lower_bound.(pg[:, g, :], gen["pmin"])
+                set_upper_bound.(pg[:, g, :], gen["pmax"])
+            end
+        end
+
+        # Under-served energy
+        @variable(master, ue[r=1:R, i=1:N, t=1:T] >= 0)
+        
+        # Storage operation
+        @variable(master, ch[r=1:R, i=1:N, t=1:T])  # Charging/discharging
+        @variable(master, soc[r=1:R, i=1:N, t=1:T] >= 0)  # State of charge
+
+        # Power flow variables (transport model)
+        @variable(master, flow[r=1:R, a=1:E, t=1:T])
+
+        # --- ADDITIONAL CONSTRAINTS ---
+
+        # Node power balance using incidence matrix
+        @constraint(master,
+            network_flow[r=1:R, i=1:N, t=1:T],
+            sum(incidence_matrix[i,a] * flow[r,a,t] for a=1:E) == 
+            sum(pg[r,g,t] for g=1:G if gen_bus_map[g] == i; init=0.0) - 
+            data["bus"]["$i"]["load"]["$r"][t] + 
+            ue[r,i,t] - 
+            ch[r,i,t]
+        )
+
+        # Line capacity constraints
+        @constraint(master,
+            line_capacity_ub[r=1:R, a=1:E, t=1:T],
+            flow[r,a,t] <= data["branch"]["$a"]["rate_a"] + gamma[a] * get_capacity_increment(data, a)
+        )
+
+        @constraint(master,
+            line_capacity_lb[r=1:R, a=1:E, t=1:T],
+            flow[r,a,t] >= -(data["branch"]["$a"]["rate_a"] + gamma[a] * get_capacity_increment(data, a))
+        )
+
+        # Storage constraints
+
+        # SOC evolution
+        @constraint(master, 
+            soc_over_time[r=1:R, i=1:N, t=2:T],
+            soc[r,i,t] == soc[r,i,t-1] + ch[r,i,t]
+        )
+
+        # Initial and final SOC
+        @constraint(master,
+            soc_start[r=1:R, i=1:N],
+            soc[r,i,1] == 0.5 * s_energy[i] + ch[r,i,1]
+        )
+        @constraint(master,
+            soc_end[r=1:R, i=1:N],
+            soc[r,i,T] == 0.5 * s_energy[i]
+        )
+
+        # SOC limits
+        @constraint(master, 
+            soc_energy_ub[r=1:R, i=1:N, t=1:T],
+            soc[r,i,t] <= s_energy[i]
+        )
+
+        # Charging/discharging limits
+        @constraint(master,
+            charge_discharge_lb[r=1:R, i=1:N, t=1:T],
+            -s_power[i] <= ch[r,i,t]
+        )
+        @constraint(master,
+            charge_discharge_ub[r=1:R, i=1:N, t=1:T],
+            ch[r,i,t] <= s_power[i]
+        )
+
+        # TRANSPORT FLOW OBJECTIVE CONSTRAINT
+        operational_weight = get(data["param"], "operational_weight", 1)
+
+        @constraint(master,
+            transport_flow_relaxation_objective,
+            theta >= sum(
+                data["param"]["representative_prob"][r] *
+                (
+                    sum(
+                        sum(compute_gen_cost(pg[r, g, t], data["gen"]["$g"]) for g=1:G) +
+                        sum(data["param"]["under_served_penalty"] * ue[r, i, t] for i=1:N)
+                    for t=1:T)
+                )
+            for r=1:R) * operational_weight
+        )
+    end
 
     y = gamma, s_power, s_energy
 
@@ -117,7 +238,7 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints, max_ptd
     # Compute PTDF matrix
     sub.ext[:PTDF] = do_all_ptdf(data)
 
-    if haskey(data["param"], "ptdf_cutoff")
+    if haskey(data["param"], "ptdf_cutoff") && data["param"]["ptdf_cutoff"] != false
         ptdf_matrix = sub.ext[:PTDF]
         ptdf_sparse = map(abs, ptdf_matrix) .>= data["param"]["ptdf_cutoff"]  # retain only significant entries
         ptdf_trimmed = ptdf_matrix .* ptdf_sparse  # zero out small ones
@@ -479,7 +600,7 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
 
         # Solve subproblem with fixed investments
         sub_model, phi_val, duals, new_tracked_constraints = solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints)
-        subrel_model, phirel_val, duals_rel = solve_subrel_transport(simdir, y_val, data)
+        subrel_model, phirel_val = solve_subrel_transport(simdir, y_val, data)
 
         # Update tracked constraints
         tracked_constraints = new_tracked_constraints

@@ -15,6 +15,9 @@ function solve_subrel_transport(simdir, y_val, data)
     set_optimizer_attribute(subrel, "LogFile", joinpath(simdir, "gurobi_subrel_logfile.log"))
     set_optimizer_attribute(subrel, "MIPGap", data["param"]["mip_gap"])
 
+    # Get incidence matrix from extension
+    incidence_matrix = subrel.ext[:INCIDENCE] = do_all_incidence(data)
+
     # Get sets of branches with/without thermal limits
     rate_a_zero, rate_a_nonzero = get_rate_a_zero(data)
     
@@ -75,16 +78,15 @@ function solve_subrel_transport(simdir, y_val, data)
     @constraint(subrel, master_gamma[a=1:E], gamma[a] == gamma_val[a])
     @constraint(subrel, master_power[i=1:N], s_power[i] == s_power_val[i])
     @constraint(subrel, master_energy[i=1:N], s_energy[i] == s_energy_val[i])
-
-    # Node power balance (conservation of flow)
-    @constraint(subrel, 
-        node_balance[r=1:R, i=1:N, t=1:T],
-        sum(pg[r,g,t] for g=1:G if gen_bus_map[g] == i; init=0.0) + 
-        sum(flow[r,a,t] for a=1:E if to_bus[a] == i; init=0.0) -
-        sum(flow[r,a,t] for a=1:E if from_bus[a] == i; init=0.0) -
+    
+    # Network flow balance using incidence matrix - directly in constraint
+    @constraint(subrel,
+        network_flow[r=1:R, i=1:N, t=1:T],
+        sum(incidence_matrix[i,a] * flow[r,a,t] for a=1:E) == 
+        sum(pg[r,g,t] for g=1:G if gen_bus_map[g] == i) - 
         data["bus"]["$i"]["load"]["$r"][t] + 
         ue[r,i,t] - 
-        ch[r,i,t] == 0
+        ch[r,i,t]
     )
 
     # Line capacity constraints
@@ -161,12 +163,6 @@ function solve_subrel_transport(simdir, y_val, data)
     subrel.ext[:solve_time] = solve_time
     println("Transport subrelproblem solved in $solve_time seconds")
     
-    # Extract duals for Benders cuts
-    dual_gamma = [dual(master_gamma[a]) for a=1:E]
-    dual_power = [dual(master_power[i]) for i=1:N]
-    
-    duals = (dual_gamma, dual_power)
-    
     # Return solution
-    return subrel, objective_value(subrel), duals
+    return subrel, objective_value(subrel)
 end

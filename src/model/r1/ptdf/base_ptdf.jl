@@ -74,3 +74,32 @@ function do_all_ptdf(data)
 
     return ptdf
 end
+
+function do_all_incidence(data)
+    branches = data["branch"]
+    buses = data["bus"]
+
+    num_branches = length(branches)
+    num_buses = length(buses)
+
+    f_bus = [branches[string(i)]["f_bus"] for i in 1:num_branches]
+    t_bus = [branches[string(i)]["t_bus"] for i in 1:num_branches]
+
+    # Prepare to build incidence matrix (rows = buses, cols = branches)
+    rows = Int[]
+    cols = Int[]
+    vals = Float64[]
+
+    for (l, (f, t)) in enumerate(zip(f_bus, t_bus))
+        push!(rows, f)   # From bus: -1
+        push!(cols, l)
+        push!(vals, -1.0)
+
+        push!(rows, t)   # To bus: +1
+        push!(cols, l)
+        push!(vals, +1.0)
+    end
+
+    A = sparse(rows, cols, vals, num_buses, num_branches)
+    return A
+end

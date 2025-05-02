@@ -36,7 +36,7 @@ function create_model_r1_ptdf_iterative_simplified_sorted(simdir, data::Dict{Str
     # Store PTDF matrix in model extension
     model.ext[:PTDF] = do_all_ptdf(data)
 
-    if haskey(data["param"], "ptdf_cutoff")
+    if haskey(data["param"], "ptdf_cutoff") && data["param"]["ptdf_cutoff"] != false
         ptdf_matrix = model.ext[:PTDF]
         ptdf_sparse = map(abs, ptdf_matrix) .>= data["param"]["ptdf_cutoff"]  # retain only significant entries
         ptdf_trimmed = ptdf_matrix .* ptdf_sparse  # zero out small ones
