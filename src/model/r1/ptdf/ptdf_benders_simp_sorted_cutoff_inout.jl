@@ -2,11 +2,13 @@ using JuMP
 using Gurobi
 using CSV, DataFrames
 using DataStructures
+include("../run_model.jl")
 include("../../../helpers/compute_gen_cost.jl")
 include("../rate_a_zero.jl")
 include("base_ptdf.jl")
 include("ptdf_save_data.jl")
 include("ptdf_benders_transport_flow_subproblem.jl")
+include("ptdf_core_point.jl")
 
 function define_master_ptdf(data::Dict{String, Any})
     # Initialize model
@@ -555,10 +557,17 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
     end
 
     # Initialize variables for stabilization
-    prev_gamma_val, prev_s_power_val, prev_s_energy_val = nothing, nothing, nothing
     gamma_val, s_power_val, s_energy_val = nothing, nothing, nothing
     y_val = nothing
-    LAMBDA = 0.5
+    
+    cor_gamma_val, cor_s_power_val, cor_s_energy_val = nothing, nothing, nothing
+    pert_gamma_val, pert_s_power_val, pert_s_energy_val = nothing, nothing, nothing
+
+    # prev_gamma_val, prev_s_power_val, prev_s_energy_val = nothing, nothing, nothing
+    # stab_gamma_val, stab_s_power_val, stab_s_energy_val = nothing, nothing, nothing
+
+    # stab_lambda = get(data["param"], "stabilization_lambda", 0.0)
+    core_lambda_vec = get(data["param"], "core_lambda", [0.0, 0.0, 0.0])
 
     while !converged && iter < max_iterations
         # Solve master problem
@@ -574,28 +583,20 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
         s_energy_val = value.(s_energy)
         theta_val = value(theta)
 
-        # Apply stabilization if we have a previous solution (starting from second iteration)
-        if iter > 0 && prev_gamma_val !== nothing
-            # Calculate stabilized solution (midpoint between previous and current)
-            stab_gamma_val = LAMBDA * prev_gamma_val + (1 - LAMBDA) * gamma_val
-            stab_s_power_val = LAMBDA * prev_s_power_val + (1 - LAMBDA) * s_power_val
-            stab_s_energy_val = LAMBDA * prev_s_energy_val + (1 - LAMBDA) * s_energy_val
-            
-            # Use stabilized solution for subproblem
-            y_val = (stab_gamma_val, stab_s_power_val, stab_s_energy_val)
-            
-            # Store current solution for next iteration
-            prev_gamma_val = gamma_val
-            prev_s_power_val = s_power_val
-            prev_s_energy_val = s_energy_val
+        # Use the presolved core point if configured
+        # Apply stabilization if enabled
+        if haskey(data["param"], "core_point") && data["param"]["core_point"] == true
+            # descending lambda
+            core_lambda = max(core_lambda_vec[3], core_lambda_vec[1] - iter * core_lambda_vec[2])
+            # compute core point
+            cor_gamma_val, cor_s_power_val, cor_s_energy_val = get_rep_day_core_point(data["param"]["core_point_simdir"])
+            # compute perturbed point
+            pert_gamma_val = core_lambda * cor_gamma_val + (1 - core_lambda) * gamma_val
+            pert_s_power_val = core_lambda * cor_s_power_val + (1 - core_lambda) * s_power_val
+            pert_s_energy_val = core_lambda * cor_s_energy_val + (1 - core_lambda) * s_energy_val
+            y_val = (pert_gamma_val, pert_s_power_val, pert_s_energy_val)
         else
-            # First iteration - no stabilization, just use the direct solution
             y_val = (gamma_val, s_power_val, s_energy_val)
-            
-            # Store current solution for next iteration
-            prev_gamma_val = gamma_val
-            prev_s_power_val = s_power_val
-            prev_s_energy_val = s_energy_val
         end
 
         # Solve subproblem with fixed investments
@@ -607,15 +608,45 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
 
         # Save progress to CSV
         filename = joinpath(simdir, "output", "benders_progress.csv")
-        benders_ptdf_write_to_csv(filename, objective_value(master), theta_val, phi_val, gamma_val, s_power_val, s_energy_val, phirel_val)
+        # The benders log will show the perturbed / stabilized point
+        benders_ptdf_write_to_csv(filename, objective_value(master), theta_val, phi_val, y_val, phirel_val)
 
         # Check convergence
         gap = abs(theta_val - phi_val) / (1e-10 + abs(phi_val))
         println("Benders iteration $(iter+1): Master objective = $(objective_value(master)), theta = $(theta_val), phi = $(phi_val), gap = $(gap)")
 
         if gap < tolerance
-            converged = true
-            println("Benders decomposition converged after $(iter+1) iterations")
+            println("Convergence detected with stabilized solution. Performing final cut check at discrete solution...")
+            # Add new Benders cut to master problem
+            add_benders_cut_ptdf(master, theta, duals, y, y_val, phi_val)
+            optimize!(master)
+    
+            # Get updated unstabilized master solution
+            gamma_val = value.(gamma)
+            s_power_val = value.(s_power)
+            s_energy_val = value.(s_energy)
+            theta_val = value(theta)
+
+            # Final subproblem solve at discrete solution
+            y_final = (gamma_val, s_power_val, s_energy_val)
+            _, final_phi_val, final_duals, final_tracked_constraints = solve_subproblem_ptdf(simdir, y_final, data, tracked_constraints)
+            final_subrel_model, final_phirel_val = solve_subrel_transport(simdir, y_final, data)
+            tracked_constraints = final_tracked_constraints
+
+            # Save progress to CSV
+            filename = joinpath(simdir, "output", "benders_progress.csv")
+            # The benders log will show the final checked point
+            benders_ptdf_write_to_csv(filename, objective_value(master), theta_val, final_phi_val, y_final, final_phirel_val)
+
+            final_gap = abs(theta_val - final_phi_val) / (1e-10 + abs(final_phi_val))
+
+            if final_gap < tolerance
+                println("Final gap at discrete solution = $(final_gap) < $(tolerance). Converged after $(iter+1) iterations.")
+                converged = true
+            else
+                # If still not converged, add another cut and continue
+                add_benders_cut_ptdf(master, theta, final_duals, y, y_final, final_phi_val)
+            end
         else
             # Add new Benders cut to master problem
             add_benders_cut_ptdf(master, theta, duals, y, y_val, phi_val)
@@ -633,7 +664,9 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
 end
 
 function benders_ptdf_solve(simdir)
-    data = JSON.parsefile(joinpath(simdir, "data.json"))
+    setup_simdir(simdir)
+
+    data = set_up_data(simdir)
     # Create master problem
     master, y, theta = define_master_ptdf(data)
     
@@ -659,7 +692,10 @@ function save_investment_results(simdir, gamma_val, s_power_val, s_energy_val)
     CSV.write(joinpath(simdir, "output", "storage_investments.csv"), storage_df)
 end
 
-function benders_ptdf_write_to_csv(filename, master_obj, theta_val, phi_val, gamma_val, s_power_val, s_energy_val, phirel_val=nothing)
+function benders_ptdf_write_to_csv(filename, master_obj, theta_val, phi_val, y_val, phirel_val=nothing)
+    # Decompose y_val
+    gamma_val, s_power_val, s_energy_val = y_val
+
     # Prepare the base data row
     data_dict = OrderedDict(
         "master_objective" => master_obj,

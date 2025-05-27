@@ -15,26 +15,23 @@ include("ptdf/ptdf_iterative.jl")
 include("ptdf/ptdf_iterative_simplified.jl")
 include("ptdf/ptdf_iterative_simplified_sorted.jl")
 
+function set_up_data(simdir)
+    data_path = joinpath(simdir, "data.json")
+    data = add_params_profiles(simdir)
+    data = update_decarbonization(simdir, data)
+    data = convert_units(data)
+    
+    # Write the JSON file once profiles are added and units fixed
+    open(data_path, "w") do file
+        JSON.print(file, data)
+    end
+
+    return data
+end
+
 function run_model(simdir; timeout=84600)
     setup_simdir(simdir)
-
-    data_path = joinpath(simdir, "data.json")
-    data = nothing
-    # if isfile(data_path)
-    if 0 == 1
-        # If file exists, read it directly
-        data = JSON.parsefile(data_path)
-    else
-        # Otherwise, perform the other actions and write the file
-        data = add_params_profiles(simdir)
-        data = update_decarbonization(simdir, data)
-        data = convert_units(data)
-        
-        # Write the JSON file once profiles are added and units fixed
-        open(data_path, "w") do file
-            JSON.print(file, data)
-        end
-    end
+    data = set_up_data(simdir)
 
     # check if there are prior investments file
     line_investments = isfile(joinpath(simdir, "line_investments.csv")) ? joinpath(simdir, "line_investments.csv") : nothing
