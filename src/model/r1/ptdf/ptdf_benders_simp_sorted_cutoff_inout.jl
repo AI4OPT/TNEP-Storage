@@ -1,5 +1,6 @@
 using JuMP
 using Gurobi
+using Dualization
 using CSV, DataFrames
 using DataStructures
 include("../run_model.jl")
@@ -601,6 +602,22 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
 
         # Solve subproblem with fixed investments
         sub_model, phi_val, duals, new_tracked_constraints = solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints)
+        """
+        # create dual of subproblem
+        dual_sub_model = dualize(sub_model)
+        # add validity constraint
+        dual_objective_expr = objective_function(dual_sub_model)
+        @constraint(dual_sub_model, cut_validity, dual_objective_expr == objective_value(sub_model))
+
+        # replace objective to maximize violation
+        @objective(dual_sub_model, Max, ) # TODO: what's the objective value???
+        optimize!(dual_sub_model)
+
+        # extract the cut
+
+
+        """
+
         subrel_model, phirel_val = solve_subrel_transport(simdir, y_val, data)
 
         # Update tracked constraints

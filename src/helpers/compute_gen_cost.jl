@@ -35,7 +35,11 @@ function compute_gen_cost(pg, gen_data)
         C_Pmax = a + b * pmax + c * pmax^2
         m = (C_Pmax - C_Pmin) / (pmax - pmin)
        return C_Pmin + m * (pg - pmin)"""
-       return sum([cost[k] * pg^(k-1) for k in 1:2])
+
+       # this is the correct linear version (deleting the quadratic term)
+       # return sum([cost[k] * pg^(k-1) for k in 1:2])
+       # this is the linear version that ignores the constant cost in the objective
+       return cost[2] * pg
     else
         error("Unsupported cost model type: $model")
     end
