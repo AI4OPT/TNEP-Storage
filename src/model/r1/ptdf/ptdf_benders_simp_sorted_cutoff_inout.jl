@@ -10,6 +10,7 @@ include("base_ptdf.jl")
 include("ptdf_save_data.jl")
 include("ptdf_benders_transport_flow_subproblem.jl")
 include("ptdf_core_point.jl")
+include("ptdf_benders_pareto.jl")
 
 function define_master_ptdf(data::Dict{String, Any})
     # Initialize model
@@ -23,6 +24,14 @@ function define_master_ptdf(data::Dict{String, Any})
     T = data["param"]["num_hours"]
     G = length(data["gen"])
     K = data["param"]["num_cap_upgrades_max"]
+
+    # Create extension for tracking iterations of y_raw, y_eval, and y_core
+    master.ext[:y_raw] = Vector{Vector{Vector{Float64}}}()
+    master.ext[:y_eval] = Vector{Vector{Vector{Float64}}}()
+    master.ext[:y_core] = Vector{Vector{Vector{Float64}}}()
+
+    # Create extension for tracking whether transport flow should be embedded
+    master.ext[:transport] = haskey(data["param"], "embed_transport_flow") && data["param"]["embed_transport_flow"] == true
 
     # Get incidence matrix from extension
     incidence_matrix = master.ext[:INCIDENCE] = do_all_incidence(data)
@@ -96,8 +105,7 @@ function define_master_ptdf(data::Dict{String, Any})
     )
 
     # if embed transport_flow, then solve the transport flow model in the master problem
-    if haskey(data["param"], "embed_transport_flow") && data["param"]["embed_transport_flow"] != false
-
+    if master.ext[:transport]
         # --- ADDITIONAL VARIABLES ---
 
         # Generator active dispatch
@@ -167,11 +175,11 @@ function define_master_ptdf(data::Dict{String, Any})
         # Initial and final SOC
         @constraint(master,
             soc_start[r=1:R, i=1:N],
-            soc[r,i,1] == 0.5 * s_energy[i] + ch[r,i,1]
+            soc[r,i,1] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy[i] + ch[r,i,1]
         )
         @constraint(master,
             soc_end[r=1:R, i=1:N],
-            soc[r,i,T] == 0.5 * s_energy[i]
+            soc[r,i,T] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy[i]
         )
 
         # SOC limits
@@ -213,7 +221,12 @@ function define_master_ptdf(data::Dict{String, Any})
 
 end
 
-function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints, max_ptdf_iterations=256, max_ptdf_per_iteration=32, ptdf_tol=1e-6)
+function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptdf_iterations=256, max_ptdf_per_iteration=32, ptdf_tol=1e-6, logging=nothing)
+
+    if !isnothing(logging)
+        println("[DEBUG] $logging: Beginning subproblem solve")
+    end
+
     # unpack investment decisions
     gamma_val, s_power_val, s_energy_val = y_val
 
@@ -330,11 +343,11 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints, max_ptd
     # Initial and final SOC
     @constraint(sub,
         soc_start[r=1:R, i=1:N],
-        soc[r,i,1] == 0.5 * s_energy[i] + ch[r,i,1]
+        soc[r,i,1] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy[i] + ch[r,i,1]
     )
     @constraint(sub,
         soc_end[r=1:R, i=1:N],
-        soc[r,i,T] == 0.5 * s_energy[i]
+        soc[r,i,T] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy[i]
     )
 
     # SOC limits
@@ -370,7 +383,7 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints, max_ptd
 
     # Apply warm-start using tracked constraints
     if !isempty(tracked_constraints)
-        println("Beginning optimized warm-start for subproblem")
+        println("[DEBUG] Beginning optimized warm-start for subproblem")
         
         # Convert dictionary to DataFrame for grouping
         arc_list = [k[1] for k in keys(tracked_constraints)]
@@ -414,7 +427,7 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints, max_ptd
             end
         end
         
-        println("Warm-started subproblem with $total_constraints constraints")
+        println("[DEBUG] Warm-started subproblem with $total_constraints constraints")
     end
 
     # Solve using lazy PTDF constraints
@@ -424,6 +437,7 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints, max_ptd
 
     while !solved && niter < sub.ext[:solve_metadata][:max_ptdf_iterations]
         # Solve model
+        println("[DEBUG] Solving PTDF subproblem for constraint discovery: subiteration $niter")
         optimize!(sub)
         
         # Exit if not solved optimally
@@ -501,7 +515,7 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints, max_ptd
         niter += 1
 
         # println("approx. progress $(checked_count / E)")
-        println("PTDF Subproblem Iteration $niter: Found $n_violated violations, added $n_added constraints")
+        println("[DEBUG] PTDF Subproblem Iteration $niter: Found $n_violated violations, added $n_added constraints")
     end
 
     # Record solve time
@@ -548,7 +562,7 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
     # Load previous constraints if available
     if isfile(joinpath(simdir, "tracked_constraints.csv"))
         tracked_df = CSV.read(joinpath(simdir, "tracked_constraints.csv"), DataFrame)
-        println("Loading $(nrow(tracked_df)) previously tracked constraints")
+        println("[DEBUG] Loading $(nrow(tracked_df)) previously tracked constraints")
         
         for row in eachrow(tracked_df)
             if row.tracked
@@ -557,21 +571,12 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
         end
     end
 
-    # Initialize variables for stabilization
-    gamma_val, s_power_val, s_energy_val = nothing, nothing, nothing
-    y_val = nothing
-    
-    cor_gamma_val, cor_s_power_val, cor_s_energy_val = nothing, nothing, nothing
-    pert_gamma_val, pert_s_power_val, pert_s_energy_val = nothing, nothing, nothing
-
-    # prev_gamma_val, prev_s_power_val, prev_s_energy_val = nothing, nothing, nothing
-    # stab_gamma_val, stab_s_power_val, stab_s_energy_val = nothing, nothing, nothing
-
-    # stab_lambda = get(data["param"], "stabilization_lambda", 0.0)
-    core_lambda_vec = get(data["param"], "core_lambda", [0.0, 0.0, 0.0])
-
     while !converged && iter < max_iterations
         # Solve master problem
+        println("[DEBUG] Solving master problem: iteration $iter")
+        if iter > 10
+            master.ext[:transport] = false
+        end
         optimize!(master)
         
         if termination_status(master) != MOI.OPTIMAL
@@ -583,101 +588,101 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
         s_power_val = value.(s_power)
         s_energy_val = value.(s_energy)
         theta_val = value(theta)
+        y_raw = [gamma_val, s_power_val, s_energy_val]
+        push!(master.ext[:y_raw], y_raw)
 
-        # Use the presolved core point if configured
-        # Apply stabilization if enabled
-        if haskey(data["param"], "core_point") && data["param"]["core_point"] == true
-            # descending lambda
-            core_lambda = max(core_lambda_vec[3], core_lambda_vec[1] - iter * core_lambda_vec[2])
-            # compute core point
-            cor_gamma_val, cor_s_power_val, cor_s_energy_val = get_rep_day_core_point(data["param"]["core_point_simdir"])
-            # compute perturbed point
-            pert_gamma_val = core_lambda * cor_gamma_val + (1 - core_lambda) * gamma_val
-            pert_s_power_val = core_lambda * cor_s_power_val + (1 - core_lambda) * s_power_val
-            pert_s_energy_val = core_lambda * cor_s_energy_val + (1 - core_lambda) * s_energy_val
-            y_val = (pert_gamma_val, pert_s_power_val, pert_s_energy_val)
-        else
-            y_val = (gamma_val, s_power_val, s_energy_val)
-        end
+        y_eval, y_core = compute_eval_core_points(master, data, iter)
 
+
+        # Solve core point subproblem to find the PTDF constraints
+        core_model, core_phi_val, core_duals, core_tracked_constraints = solve_subproblem_ptdf(simdir, y_core, data, tracked_constraints, logging="Core Point iter $iter")
         # Solve subproblem with fixed investments
-        sub_model, phi_val, duals, new_tracked_constraints = solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints)
-        """
-        # create dual of subproblem
-        dual_sub_model = dualize(sub_model)
-        # add validity constraint
-        dual_objective_expr = objective_function(dual_sub_model)
-        @constraint(dual_sub_model, cut_validity, dual_objective_expr == objective_value(sub_model))
+        sub_model, phi_val, duals, eval_tracked_constraints = solve_subproblem_ptdf(simdir, y_eval, data, core_tracked_constraints, logging="Eval Point iter $iter")
 
-        # replace objective to maximize violation
-        @objective(dual_sub_model, Max, ) # TODO: what's the objective value???
-        optimize!(dual_sub_model)
-
-        # extract the cut
-
-
-        """
-
-        subrel_model, phirel_val = solve_subrel_transport(simdir, y_val, data)
+        # Solve transport model to collect data
+        subrel_model, phirel_val = solve_subrel_transport(simdir, y_eval, data)
 
         # Update tracked constraints
-        tracked_constraints = new_tracked_constraints
+        tracked_constraints = eval_tracked_constraints
 
         # Save progress to CSV
         filename = joinpath(simdir, "output", "benders_progress.csv")
         # The benders log will show the perturbed / stabilized point
-        benders_ptdf_write_to_csv(filename, objective_value(master), theta_val, phi_val, y_val, phirel_val)
+        benders_ptdf_write_to_csv(filename, objective_value(master), theta_val, phi_val, y_eval, phirel_val)
 
         # Check convergence
         gap = abs(theta_val - phi_val) / (1e-10 + abs(phi_val))
-        println("Benders iteration $(iter+1): Master objective = $(objective_value(master)), theta = $(theta_val), phi = $(phi_val), gap = $(gap)")
+        println("[DEBUG] Benders iteration $(iter+1): Master objective = $(objective_value(master)), theta = $(theta_val), phi = $(phi_val), gap = $(gap)")
 
-        if gap < tolerance
-            println("Convergence detected with stabilized solution. Performing final cut check at discrete solution...")
+        # if gap < tolerance
+        if false
+            println("[DEBUG] Convergence detected with stabilized solution. Performing final cut check at discrete solution...")
             # Add new Benders cut to master problem
-            add_benders_cut_ptdf(master, theta, duals, y, y_val, phi_val)
+            add_appropriate_cut(master, sub_model, data, theta, y, y_eval, y_core, duals, phi_val)
             optimize!(master)
-    
+        
             # Get updated unstabilized master solution
             gamma_val = value.(gamma)
             s_power_val = value.(s_power)
             s_energy_val = value.(s_energy)
             theta_val = value(theta)
-
+        
             # Final subproblem solve at discrete solution
-            y_final = (gamma_val, s_power_val, s_energy_val)
+            y_final = [gamma_val, s_power_val, s_energy_val]
             _, final_phi_val, final_duals, final_tracked_constraints = solve_subproblem_ptdf(simdir, y_final, data, tracked_constraints)
             final_subrel_model, final_phirel_val = solve_subrel_transport(simdir, y_final, data)
             tracked_constraints = final_tracked_constraints
-
+        
             # Save progress to CSV
             filename = joinpath(simdir, "output", "benders_progress.csv")
-            # The benders log will show the final checked point
             benders_ptdf_write_to_csv(filename, objective_value(master), theta_val, final_phi_val, y_final, final_phirel_val)
-
+        
             final_gap = abs(theta_val - final_phi_val) / (1e-10 + abs(final_phi_val))
-
+        
             if final_gap < tolerance
-                println("Final gap at discrete solution = $(final_gap) < $(tolerance). Converged after $(iter+1) iterations.")
+                println("[DEBUG] Final gap at discrete solution = $(final_gap) < $(tolerance). Converged after $(iter+1) iterations.")
                 converged = true
             else
                 # If still not converged, add another cut and continue
-                add_benders_cut_ptdf(master, theta, final_duals, y, y_final, final_phi_val)
+                add_appropriate_cut(master, sub_model, data, theta, y, y_eval, y_core, duals, phi_val)
             end
         else
             # Add new Benders cut to master problem
-            add_benders_cut_ptdf(master, theta, duals, y, y_val, phi_val)
+            add_appropriate_cut(master, sub_model, data, theta, y, y_eval, y_core, duals, phi_val)
         end
         
         iter += 1
     end
 
     if !converged
-        println("Benders decomposition did not converge after $max_iterations iterations")
+        println("[DEBUG] Benders decomposition did not converge after $max_iterations iterations")
     end
     
     # Return final solution
-    return (gamma_val, s_power_val, s_energy_val)
+    return [gamma_val, s_power_val, s_energy_val]
+end
+
+# Helper function to add the appropriate cut
+function add_appropriate_cut(master, sub_model, data, theta, y, y_eval, y_core, duals, phi_val)
+    if haskey(data["param"], "benders_technique") && data["param"]["benders_technique"] == "pareto"
+        solve_pareto_and_cut(master, sub_model, data, theta, y, y_eval, y_core)
+    elseif haskey(data["param"], "benders_technique") && data["param"]["benders_technique"] == "both"
+        solve_pareto_and_cut(master, sub_model, data, theta, y, y_eval, y_core)
+        add_benders_cut_ptdf(master, theta, duals, y, y_eval, phi_val)
+    else
+        add_benders_cut_ptdf(master, theta, duals, y, y_eval, phi_val)
+    end
+end
+
+function solve_pareto_and_cut(master, sub_model, data, theta, y, y_eval, y_core)
+    dual_sub_model = make_dual_subproblem(sub_model, data, y_eval)
+                
+    # modify dual to instead solve for pareto optimal duals
+    optimal_obj = objective_bound(sub_model)
+    dual_sub_model = solve_for_pareto(dual_sub_model, sub_model, data, optimal_obj, y_eval, y_core)
+
+    # add cut to the master
+    add_pareto_cut(master, dual_sub_model, sub_model, data, theta, y)
 end
 
 function benders_ptdf_solve(simdir)

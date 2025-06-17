@@ -335,14 +335,14 @@ function create_base_model(data::Dict{String, Any}, optimizer;
         soc[r,i,t] == soc[r,i,t-1] + ch[r,i,t]
     )
 
-    # OPTIONAL: soc 0.5 constraint
+    # OPTIONAL: soc init and end constraint
     JuMP.@constraint(model,
         soc_start[r in 1:R, i in 1:N],
-        soc[r,i,1] == 0.5 * s_energy[i] + ch[r,i,1]
+        soc[r,i,1] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy[i] + ch[r,i,1]
     )
     JuMP.@constraint(model,
         soc_end[r in 1:R, i in 1:N],
-        soc[r,i,T] == 0.5 * s_energy[i]
+        soc[r,i,T] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy[i]
     )
 
     # soc energy rating constraint
