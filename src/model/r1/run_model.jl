@@ -14,6 +14,7 @@ include("ptdf/create_model_ptdf.jl")
 include("ptdf/ptdf_iterative.jl")
 include("ptdf/ptdf_iterative_simplified.jl")
 include("ptdf/ptdf_iterative_simplified_sorted.jl")
+include("ptdf/ptdf_iterative_simplified_sorted_efficiency.jl")
 
 function set_up_data(simdir)
     data_path = joinpath(simdir, "data.json")
@@ -43,22 +44,32 @@ function run_model(simdir; timeout=84600)
 
     model = nothing
     if !haskey(data["param"], "storage_linearized") || data["param"]["storage_linearized"] == false
+        println("create_model_r1")
         model = create_model_r1(data, optimizer,  
             line_investments=line_investments, 
             storage_investments=storage_investments)
     elseif data["param"]["storage_linearized"] == "ptdf"
+        println("create_model_r1_ptdf_iterative")
         model = create_model_r1_ptdf_iterative(simdir, data, optimizer,  
             line_investments=line_investments, 
             storage_investments=storage_investments)
     elseif data["param"]["storage_linearized"] == "ptdf_simplified"
+        println("create_model_r1_ptdf_iterative_simplified")
         model = create_model_r1_ptdf_iterative_simplified(simdir, data, optimizer,  
             line_investments=line_investments, 
             storage_investments=storage_investments)
+    elseif data["param"]["storage_linearized"] == "ptdf_simplified_sorted" && haskey(data["param"], "bess_efficiency") && data["param"]["bess_efficiency"] < 1.0
+        println("create_model_r1_ptdf_iterative_simplified_sorted_efficiency")
+        model = create_model_r1_ptdf_iterative_simplified_sorted_efficiency(simdir, data, optimizer,  
+            line_investments=line_investments, 
+            storage_investments=storage_investments)
     elseif data["param"]["storage_linearized"] == "ptdf_simplified_sorted"
+        println("create_model_r1_ptdf_iterative_simplified_sorted")
         model = create_model_r1_ptdf_iterative_simplified_sorted(simdir, data, optimizer,  
             line_investments=line_investments, 
             storage_investments=storage_investments)
     else
+        println("create_model_r1_sl")
         model = create_model_r1_sl(data, optimizer,  
             line_investments=line_investments, 
             storage_investments=storage_investments)

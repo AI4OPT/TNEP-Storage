@@ -6,7 +6,7 @@ include("../rate_a_zero.jl")
 include("base_ptdf.jl")
 include("ptdf_save_data.jl")
 
-function create_model_r1_ptdf_iterative_simplified_sorted(simdir, data::Dict{String, Any}, optimizer; 
+function create_model_r1_ptdf_iterative_simplified_sorted_efficiency(simdir, data::Dict{String, Any}, optimizer; 
     line_investments=nothing, 
     storage_investments=nothing,
     max_ptdf_iterations::Int=256,
@@ -94,7 +94,8 @@ function create_model_r1_ptdf_iterative_simplified_sorted(simdir, data::Dict{Str
                     sum(model[:pg][r,g,t] for g in 1:G if gen_bus_map[g] == i; init=0.0) -
                     data["bus"]["$i"]["load"]["$r"][t] +
                     model[:ue][r,i,t] -
-                    model[:ch][r,i,t]
+                    model[:ch][r,i,t] +
+                    model[:dis][r,i,t]
                 ) for i in 1:N)
                 
                 # Add both constraints at once
@@ -128,11 +129,12 @@ function create_model_r1_ptdf_iterative_simplified_sorted(simdir, data::Dict{Str
         pg_values = value.(model[:pg])
         ue_values = value.(model[:ue])
         ch_values = value.(model[:ch])
+        dis_values = value.(model[:dis])
         gamma_values = value.(model[:gamma])
         
         # Compute all flows at once
         flows = zeros(length(model.ext[:rate_a_nonzero]), R, T)
-        compute_flows!(flows, pg_values, ue_values, ch_values, data, model.ext[:PTDF])
+        compute_flows!(flows, pg_values, ue_values, ch_values, dis_values, data, model.ext[:PTDF])
 
         # Add violations prioritizing by size
         violations = []
@@ -177,7 +179,7 @@ function create_model_r1_ptdf_iterative_simplified_sorted(simdir, data::Dict{Str
             flow_expr = sum(ptdf_row[i] * (
                 sum(model[:pg][r, g, t] for g in 1:G if gen_bus_map[g] == i; init=0.0)
                 - data["bus"]["$i"]["load"]["$r"][t]
-                + model[:ue][r, i, t] - model[:ch][r, i, t]
+                + model[:ue][r, i, t] - model[:ch][r, i, t] + model[:dis][r, i, t]
             ) for i in 1:N)
         
             # Add both constraints
@@ -263,7 +265,8 @@ function create_base_model(data::Dict{String, Any}, optimizer;
     JuMP.@variable(model, s_power[i=1:N] >= 0) # power rating of storage
     JuMP.@variable(model, s_energy[i=1:N] >= 0) # energy rating of storage
     JuMP.@variable(model, soc[r=1:R, i=1:N, t=1:T] >= 0) # state of charge of storage
-    JuMP.@variable(model, ch[r=1:R, i=1:N, t=1:T]) # charging of storage
+    JuMP.@variable(model, ch[r=1:R, i=1:N, t=1:T] >= 0) # charging of storage
+    JuMP.@variable(model, dis[r=1:R, i=1:N, t=1:T] >= 0) # discharging of storage
     # JuMP.@variable(model, sigma[i=1:N], Bin) # binary variable for installation of storage
 
     # Add all non-PTDF constraints
@@ -273,7 +276,8 @@ function create_base_model(data::Dict{String, Any}, optimizer;
         sum(pg[r,g,t] for g in 1:G)
         - sum(data["bus"]["$i"]["load"]["$r"][t] for i in 1:N)
         + sum(ue[r,i,t] for i in 1:N) 
-        - sum(ch[r,i,t] for i in 1:N) 
+        - sum(ch[r,i,t] for i in 1:N)
+        + sum(dis[r,i,t] for i in 1:N) 
         == 0
     )
 
@@ -332,13 +336,13 @@ function create_base_model(data::Dict{String, Any}, optimizer;
     # soc over time constraint
     JuMP.@constraint(model, 
         soc_over_time[r in 1:R, i in 1:N, t in 2:T],
-        soc[r,i,t] == soc[r,i,t-1] + ch[r,i,t]
+        soc[r,i,t] == soc[r,i,t-1] + ch[r,i,t] * data["param"]["bess_efficiency"] - dis[r,i,t] / data["param"]["bess_efficiency"]
     )
 
     # OPTIONAL: soc init and end constraint
     JuMP.@constraint(model,
         soc_start[r in 1:R, i in 1:N],
-        soc[r,i,1] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy[i] + ch[r,i,1]
+        soc[r,i,1] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy[i] + ch[r,i,1] * data["param"]["bess_efficiency"] - dis[r,i,1] / data["param"]["bess_efficiency"]
     )
     JuMP.@constraint(model,
         soc_end[r in 1:R, i in 1:N],
@@ -374,7 +378,7 @@ function create_base_model(data::Dict{String, Any}, optimizer;
     # charge/discharge must be constrained by power rating
     JuMP.@constraint(model,
         charge_discharge_lb[r in 1:R, i in 1:N, t in 1:T],
-        -s_power[i] <= ch[r,i,t]
+        dis[r,i,t] <= s_power[i]
     )
     JuMP.@constraint(model,
         charge_discharge_ub[r in 1:R, i in 1:N, t in 1:T],
@@ -430,7 +434,7 @@ function create_base_model(data::Dict{String, Any}, optimizer;
                 sum(
                     sum(compute_gen_cost(pg[r, g, t], data["gen"]["$g"]) for g in 1:G) +
                     sum(data["param"]["under_served_penalty"] * ue[r, i, t] for i in 1:N) +
-                    sum(get(data["param"], "storage_operation_cost", 0.0) * ch[r,i,t] for i=1:N)
+                    sum(get(data["param"], "storage_operation_cost", 0.0) * (ch[r,i,t] + dis[r,i,t]) for i=1:N)
                 for t in 1:T)
             )
         for r in 1:R) * operational_weight
@@ -439,7 +443,7 @@ function create_base_model(data::Dict{String, Any}, optimizer;
     return model
 end
 
-function compute_flows!(flows, pg_values, ue_values, ch_values, data, PTDF)
+function compute_flows!(flows, pg_values, ue_values, ch_values, dis_values, data, PTDF)
     # Preallocate net injection vector
     n_buses = length(data["bus"])
     net_injections = zeros(n_buses)  # PTDF matrix is (n_branches × n_buses)
@@ -455,10 +459,11 @@ function compute_flows!(flows, pg_values, ue_values, ch_values, data, PTDF)
                                     for g in 1:length(data["gen"]) 
                                     if data["gen"]["$g"]["gen_bus"] == i; 
                                     init=0.0)
-            # Subtract load, add unserved energy, subtract charging
+            # Subtract load, add unserved energy, subtract charging, add discharging
             net_injections[i] -= data["bus"]["$i"]["load"]["$r"][t]
             net_injections[i] += ue_values[r,i,t]
             net_injections[i] -= ch_values[r,i,t]
+            net_injections[i] += dis_values[r,i,t]
         end
         
         # Compute flows for all branches at once using PTDF

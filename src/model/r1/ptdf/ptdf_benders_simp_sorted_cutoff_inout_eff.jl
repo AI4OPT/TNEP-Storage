@@ -136,7 +136,8 @@ function define_master_ptdf(data::Dict{String, Any})
         @variable(master, ue[r=1:R, i=1:N, t=1:T] >= 0)
         
         # Storage operation
-        @variable(master, ch[r=1:R, i=1:N, t=1:T])  # Charging/discharging
+        @variable(master, ch[r=1:R, i=1:N, t=1:T] >= 0)  # Charging/discharging
+        @variable(master, dis[r=1:R, i=1:N, t=1:T] >= 0) 
         @variable(master, soc[r=1:R, i=1:N, t=1:T] >= 0)  # State of charge
 
         # Power flow variables (transport model)
@@ -151,7 +152,8 @@ function define_master_ptdf(data::Dict{String, Any})
             sum(pg[r,g,t] for g=1:G if gen_bus_map[g] == i; init=0.0) - 
             data["bus"]["$i"]["load"]["$r"][t] + 
             ue[r,i,t] - 
-            ch[r,i,t]
+            ch[r,i,t] +
+            dis[r,i,t]
         )
 
         # Line capacity constraints
@@ -170,13 +172,13 @@ function define_master_ptdf(data::Dict{String, Any})
         # SOC evolution
         @constraint(master, 
             soc_over_time[r=1:R, i=1:N, t=2:T],
-            soc[r,i,t] == soc[r,i,t-1] + ch[r,i,t]
+            soc[r,i,t] == soc[r,i,t-1] + ch[r,i,t] * data["param"]["bess_efficiency"] - dis[r,i,t] / data["param"]["bess_efficiency"]
         )
 
         # Initial and final SOC
         @constraint(master,
             soc_start[r=1:R, i=1:N],
-            soc[r,i,1] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy[i] + ch[r,i,1]
+            soc[r,i,1] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy[i] + ch[r,i,1] * data["param"]["bess_efficiency"] - dis[r,i,1] / data["param"]["bess_efficiency"]
         )
         @constraint(master,
             soc_end[r=1:R, i=1:N],
@@ -192,7 +194,7 @@ function define_master_ptdf(data::Dict{String, Any})
         # Charging/discharging limits
         @constraint(master,
             charge_discharge_lb[r=1:R, i=1:N, t=1:T],
-            -s_power[i] <= ch[r,i,t]
+            dis[r,i,t] <= s_power[i] 
         )
         @constraint(master,
             charge_discharge_ub[r=1:R, i=1:N, t=1:T],
@@ -306,7 +308,8 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptd
     @variable(sub, ue[r=1:R, i=1:N, t=1:T] >= 0)
     
     # Storage operation
-    @variable(sub, ch[r=1:R, i=1:N, t=1:T])  # Charging/discharging
+    @variable(sub, ch[r=1:R, i=1:N, t=1:T] >= 0)  # Charging/discharging
+    @variable(sub, dis[r=1:R, i=1:N, t=1:T] >= 0)
     @variable(sub, soc[r=1:R, i=1:N, t=1:T] >= 0)  # State of charge
 
     # Fix investment variables based on master problem decisions
@@ -330,6 +333,7 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptd
         - sum(data["bus"]["$i"]["load"]["$r"][t] for i=1:N)
         + sum(ue[r,i,t] for i=1:N)
         - sum(ch[r,i,t] for i=1:N)
+        + sum(dis[r,i,t] for i=1:N)
         == 0
     )
 
@@ -338,13 +342,13 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptd
     # SOC evolution
     @constraint(sub, 
         soc_over_time[r=1:R, i=1:N, t=2:T],
-        soc[r,i,t] == soc[r,i,t-1] + ch[r,i,t]
+        soc[r,i,t] == soc[r,i,t-1] + ch[r,i,t] * data["param"]["bess_efficiency"] - dis[r,i,t] / data["param"]["bess_efficiency"]
     )
     
     # Initial and final SOC
     @constraint(sub,
         soc_start[r=1:R, i=1:N],
-        soc[r,i,1] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy[i] + ch[r,i,1]
+        soc[r,i,1] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy[i] + ch[r,i,1] * data["param"]["bess_efficiency"] - dis[r,i,1] / data["param"]["bess_efficiency"]
     )
     @constraint(sub,
         soc_end[r=1:R, i=1:N],
@@ -360,7 +364,7 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptd
     # Charging/discharging limits
     @constraint(sub,
         charge_discharge_lb[r=1:R, i=1:N, t=1:T],
-        -s_power[i] <= ch[r,i,t]
+        dis[r,i,t] <= s_power[i]
     )
     @constraint(sub,
         charge_discharge_ub[r=1:R, i=1:N, t=1:T],
@@ -377,7 +381,7 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptd
                 sum(
                     sum(compute_gen_cost(pg[r, g, t], data["gen"]["$g"]) for g=1:G) +
                     sum(data["param"]["under_served_penalty"] * ue[r, i, t] for i=1:N) + 
-                    sum(get(data["param"], "storage_operation_cost", 0.0) * ch[r,i,t] for i=1:N)
+                    sum(get(data["param"], "storage_operation_cost", 0.0) * (ch[r,i,t] + dis[r,i,t]) for i=1:N)
                 for t=1:T)
             )
         for r=1:R) * operational_weight
@@ -420,7 +424,8 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptd
                     sum(sub[:pg][r,g,t] for g in 1:G if gen_bus_map[g] == i; init=0.0) -
                     data["bus"]["$i"]["load"]["$r"][t] +
                     sub[:ue][r,i,t] -
-                    sub[:ch][r,i,t]
+                    sub[:ch][r,i,t] +
+                    sub[:dis][r,i,t]
                 ) for i in 1:N)
                 
                 # Add both constraints
@@ -450,11 +455,12 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptd
         pg_values = value.(sub[:pg])
         ue_values = value.(sub[:ue])
         ch_values = value.(sub[:ch])
+        dis_values = value.(sub[:dis])
         gamma_values = value.(sub[:gamma])
 
         # Compute all flows at once
         flows = zeros(length(sub.ext[:rate_a_nonzero]), R, T)
-        compute_flows!(flows, pg_values, ue_values, ch_values, data, sub.ext[:PTDF])
+        compute_flows!(flows, pg_values, ue_values, ch_values, dis_values, data, sub.ext[:PTDF])
 
         # Add violations prioritizing by size
         violations = []
@@ -499,7 +505,7 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptd
             flow_expr = sum(ptdf_row[i] * (
                 sum(sub[:pg][r, g, t] for g in 1:G if gen_bus_map[g] == i; init=0.0)
                 - data["bus"]["$i"]["load"]["$r"][t]
-                + sub[:ue][r, i, t] - sub[:ch][r, i, t]
+                + sub[:ue][r, i, t] - sub[:ch][r, i, t] + sub[:dis][r, i, t]
             ) for i in 1:N)
         
             # Add both constraints

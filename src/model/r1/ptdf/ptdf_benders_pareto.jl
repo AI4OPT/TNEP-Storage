@@ -7,45 +7,39 @@ function compute_eval_core_points(master, data, iter)
     s_energy_eps = 0.0005 * data["param"]["max_energy_rating"]
     s_power_eps =  s_energy_eps * 1/4
 
-    if haskey(data["param"], "benders_technique") && data["param"]["benders_technique"] in ["pareto", "both"]
-        # descending lambda
-        stab_lambda = max(stabilization_lambda[3], stabilization_lambda[1] - iter * stabilization_lambda[2])
-        shift_phi = max(core_shift_phi[3], core_shift_phi[1] - iter * core_shift_phi[2])
+    # descending lambda
+    stab_lambda = max(stabilization_lambda[3], stabilization_lambda[1] - iter * stabilization_lambda[2])
+    shift_phi = max(core_shift_phi[3], core_shift_phi[1] - iter * core_shift_phi[2])
 
-        y_core = nothing
-        
-        if iter == 0
-            # Compute the core point
-            gamma_core, s_power_core, s_energy_core = get_rep_day_core_point(data["param"]["core_point_simdir"])
-            gamma_core = Float64.(gamma_core)
-        
-            gamma_core = max.(gamma_core, gamma_eps)
-            s_power_core = max.(s_power_core, s_power_eps)
-            s_energy_core = 4.0 * s_power_core
+    y_core = nothing
+    
+    if iter == 0
+        # Compute the core point
+        gamma_core, s_power_core, s_energy_core = get_rep_day_core_point(data["param"]["core_point_simdir"])
+        gamma_core = Float64.(gamma_core)
+    
+        gamma_core = max.(gamma_core, gamma_eps)
+        s_power_core = max.(s_power_core, s_power_eps)
+        s_energy_core = 4.0 * s_power_core
 
-            y_core = [gamma_core, s_power_core, s_energy_core]
-            push!(master.ext[:y_core], y_core)
-
-        else
-            y_core_old = master.ext[:y_core][iter]
-            y_eval_old = master.ext[:y_eval][iter]
-
-            # Compute new shifted core point (convex combo of old core with old eval point)
-            y_core = shift_phi * y_eval_old + (1 - shift_phi) * y_core_old
-            push!(master.ext[:y_core], y_core)
-        end
-
-        # Compute the eval point (convex combo of raw with the core point)
-        y_raw = master.ext[:y_raw][iter + 1]
-        y_eval = stab_lambda * y_core + (1 - stab_lambda) * y_raw
-        push!(master.ext[:y_eval], y_eval)
-
-        return y_eval, y_core
+        y_core = [gamma_core, s_power_core, s_energy_core]
+        push!(master.ext[:y_core], y_core)
 
     else
-        y_raw = master.ext[:y_raw][iter + 1]
-        return y_raw, nothing
+        y_core_old = master.ext[:y_core][iter]
+        y_eval_old = master.ext[:y_eval][iter]
+
+        # Compute new shifted core point (convex combo of old core with old eval point)
+        y_core = shift_phi * y_eval_old + (1 - shift_phi) * y_core_old
+        push!(master.ext[:y_core], y_core)
     end
+
+    # Compute the eval point (convex combo of raw with the core point)
+    y_raw = master.ext[:y_raw][iter + 1]
+    y_eval = stab_lambda * y_core + (1 - stab_lambda) * y_raw
+    push!(master.ext[:y_eval], y_eval)
+
+    return y_eval, y_core
 end
 
 
