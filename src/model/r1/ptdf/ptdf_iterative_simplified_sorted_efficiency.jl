@@ -106,7 +106,7 @@ function create_model_r1_ptdf_iterative_simplified_sorted_efficiency(simdir, dat
                 model.ext[:tracked_constraints][(a,r,t)] = true
             end
             
-            println("Progress: Cumulatively added $total_constraints constraints")
+            # println("Progress: Cumulatively added $total_constraints constraints")
         end
         
         println("Warm-started with $total_constraints constraints")
@@ -403,14 +403,10 @@ function create_base_model(data::Dict{String, Any}, optimizer;
     end
     
     # OPTIONAL: CANDIDATE STORAGE LOCATIONS ONLY
-    if haskey(data["param"], "candidate_no_upgrades_dir")
-        no_upgrades_dir = data["param"]["candidate_no_upgrades_dir"]
-        candidates = intersect_storage_candidates(data, no_upgrades_dir)
-
-        # OPTIONAL OPTIONAL ADDITIONAL CAND STORAGE LOCATIONS
-        if haskey(data["param"], "additional_cand")
-            candidates = union!(candidates, string.(data["param"]["additional_cand"]))
-        end
+    cand_file = joinpath(simdir, "cand.json")
+    if isfile(cand_file)
+        cand_dict = JSON.parsefile(cand_file)
+        candidates = Set(string.(cand_dict["candidates"]))
 
         all_busses = Set(keys(data["bus"]))
         non_candidates = setdiff(all_busses, union(candidates, nonzero_storage_nodes))

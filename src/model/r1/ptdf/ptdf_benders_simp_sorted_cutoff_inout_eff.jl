@@ -99,129 +99,40 @@ function define_master_ptdf(data::Dict{String, Any})
     #
     #   III. Objective
     #
-    JuMP.@objective(master, Min,
-    sum(s_power[i] * data["param"]["bess_power_cost"] + s_energy[i] * data["param"]["bess_energy_cost"] for i in 1:N) + 
-    sum(data["param"]["cap_upgrade_cost"] * data["param"]["cap_upgrade_increment"] * data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
-    theta
-    )
-
-    # if embed transport_flow, then solve the transport flow model in the master problem
-    if master.ext[:transport]
-        # --- ADDITIONAL VARIABLES ---
-
-        # Generator active dispatch
-        nonrenewable_generators = filter(g -> lowercase(data["gen"][g]["gen_type"]) ∉ data["param"]["renewable_types"], keys(data["gen"]))
-        JuMP.@variable(master, pg[r in 1:R, g in 1:G, t in 1:T])
-
-        for g in 1:G
-            gen = data["gen"]["$g"]
-            is_renewable = gen["gen_type"] ∈ data["param"]["renewable_types"]
-            is_foreign = gen["gen_type"] ∈ ["foreign"]
-            if is_renewable
-                set_lower_bound.(pg[:, g, :], 0.0)
-                for r in 1:R, t in 1:T
-                    set_upper_bound(pg[r, g, t], max(0, gen["profile"]["$r"][t]))
-                end
-            elseif is_foreign
-                for r in 1:R, t in 1:T
-                    fix(pg[r, g, t], gen["profile"]["$r"][t])
-                end
-            else
-                set_lower_bound.(pg[:, g, :], gen["pmin"])
-                set_upper_bound.(pg[:, g, :], gen["pmax"])
-            end
-        end
-
-        # Under-served energy
-        @variable(master, ue[r=1:R, i=1:N, t=1:T] >= 0)
-        
-        # Storage operation
-        @variable(master, ch[r=1:R, i=1:N, t=1:T] >= 0)  # Charging/discharging
-        @variable(master, dis[r=1:R, i=1:N, t=1:T] >= 0) 
-        @variable(master, soc[r=1:R, i=1:N, t=1:T] >= 0)  # State of charge
-
-        # Power flow variables (transport model)
-        @variable(master, flow[r=1:R, a=1:E, t=1:T])
-
-        # --- ADDITIONAL CONSTRAINTS ---
-
-        # Node power balance using incidence matrix
-        @constraint(master,
-            network_flow[r=1:R, i=1:N, t=1:T],
-            sum(incidence_matrix[i,a] * flow[r,a,t] for a=1:E) == 
-            sum(pg[r,g,t] for g=1:G if gen_bus_map[g] == i; init=0.0) - 
-            data["bus"]["$i"]["load"]["$r"][t] + 
-            ue[r,i,t] - 
-            ch[r,i,t] +
-            dis[r,i,t]
-        )
-
-        # Line capacity constraints
-        @constraint(master,
-            line_capacity_ub[r=1:R, a=1:E, t=1:T],
-            flow[r,a,t] <= data["branch"]["$a"]["rate_a"] + gamma[a] * get_capacity_increment(data, a)
-        )
-
-        @constraint(master,
-            line_capacity_lb[r=1:R, a=1:E, t=1:T],
-            flow[r,a,t] >= -(data["branch"]["$a"]["rate_a"] + gamma[a] * get_capacity_increment(data, a))
-        )
-
-        # Storage constraints
-
-        # SOC evolution
-        @constraint(master, 
-            soc_over_time[r=1:R, i=1:N, t=2:T],
-            soc[r,i,t] == soc[r,i,t-1] + ch[r,i,t] * data["param"]["bess_efficiency"] - dis[r,i,t] / data["param"]["bess_efficiency"]
-        )
-
-        # Initial and final SOC
-        @constraint(master,
-            soc_start[r=1:R, i=1:N],
-            soc[r,i,1] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy[i] + ch[r,i,1] * data["param"]["bess_efficiency"] - dis[r,i,1] / data["param"]["bess_efficiency"]
-        )
-        @constraint(master,
-            soc_end[r=1:R, i=1:N],
-            soc[r,i,T] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy[i]
-        )
-
-        # SOC limits
-        @constraint(master, 
-            soc_energy_ub[r=1:R, i=1:N, t=1:T],
-            soc[r,i,t] <= s_energy[i]
-        )
-
-        # Charging/discharging limits
-        @constraint(master,
-            charge_discharge_lb[r=1:R, i=1:N, t=1:T],
-            dis[r,i,t] <= s_power[i] 
-        )
-        @constraint(master,
-            charge_discharge_ub[r=1:R, i=1:N, t=1:T],
-            ch[r,i,t] <= s_power[i]
-        )
-
-        # TRANSPORT FLOW OBJECTIVE CONSTRAINT
-        operational_weight = get(data["param"], "operational_weight", 1)
-
-        @constraint(master,
-            transport_flow_relaxation_objective,
-            theta >= sum(
-                data["param"]["representative_prob"][r] *
-                (
-                    sum(
-                        sum(compute_gen_cost(pg[r, g, t], data["gen"]["$g"]) for g=1:G) +
-                        sum(data["param"]["under_served_penalty"] * ue[r, i, t] for i=1:N)
-                    for t=1:T)
-                )
-            for r=1:R) * operational_weight
-        )
-    end
-
+    # Is set in the Bender's loop
     y = gamma, s_power, s_energy
 
     return master, y, theta
 
+end
+
+function update_master_objective!(master, data, y, theta, iter)
+    # Initialize sets
+    R = data["param"]["num_representatives"]
+    N = length(data["bus"])
+    E = length(data["branch"])
+    T = data["param"]["num_hours"]
+    G = length(data["gen"])
+    K = data["param"]["num_cap_upgrades_max"]
+
+    #
+    #   III. Objective
+    #
+    gamma, s_power, s_energy = y
+
+    # Start with the base objective terms
+    obj_expr = sum(s_power[i] * data["param"]["bess_power_cost"] + s_energy[i] * data["param"]["bess_energy_cost"] for i in 1:N) + 
+            sum(data["param"]["cap_upgrade_cost"] * data["param"]["cap_upgrade_increment"] * data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
+            theta
+
+    # L2 (quadratic) regularization
+    if haskey(data["param"], "reg_penalty")
+        gamma_reg, s_power_reg, s_energy_reg = compute_regularization_point(master, data, iter)
+        obj_expr += data["param"]["reg_penalty"] * sum((s_power[i] - s_power_reg[i])^2 for i in 1:N)
+    end
+
+    # Update the objective    
+    JuMP.@objective(master, Min, obj_expr)
 end
 
 function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptdf_iterations=256, max_ptdf_per_iteration=32, ptdf_tol=1e-6, logging=nothing)
@@ -582,9 +493,7 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
     while !converged && iter < max_iterations
         # Solve master problem
         println("[DEBUG] Solving master problem: iteration $iter")
-        if iter > 10
-            master.ext[:transport] = false
-        end
+        update_master_objective!(master, data, y, theta, iter)
         optimize!(master)
         
         if termination_status(master) != MOI.OPTIMAL
@@ -598,6 +507,7 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
         theta_val = value(theta)
         y_raw = [gamma_val, s_power_val, s_energy_val]
         push!(master.ext[:y_raw], y_raw)
+        export_investments_csv(data, gamma_val, s_power_val, s_energy_val, output_dir=joinpath(simdir,"benders_output"), file_suffix="$iter")
 
         y_eval, y_core = compute_eval_core_points(master, data, iter)
 
@@ -607,16 +517,13 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
         # Solve subproblem with fixed investments
         sub_model, phi_val, duals, eval_tracked_constraints = solve_subproblem_ptdf(simdir, y_eval, data, core_tracked_constraints, logging="Eval Point iter $iter")
 
-        # Solve transport model to collect data
-        subrel_model, phirel_val = solve_subrel_transport(simdir, y_eval, data)
-
         # Update tracked constraints
         tracked_constraints = eval_tracked_constraints
 
         # Save progress to CSV
         filename = joinpath(simdir, "output", "benders_progress.csv")
         # The benders log will show the perturbed / stabilized point
-        benders_ptdf_write_to_csv(filename, objective_value(master), theta_val, phi_val, y_eval, phirel_val)
+        benders_ptdf_write_to_csv(filename, objective_value(master), theta_val, phi_val, y_eval)
 
         # Check convergence
         gap = abs(theta_val - phi_val) / (1e-10 + abs(phi_val))
@@ -624,7 +531,10 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
 
         # if gap < tolerance
         if false
-            println("[DEBUG] Convergence detected with stabilized solution. Performing final cut check at discrete solution...")
+            # println("[DEBUG] Convergence detected with stabilized solution. Performing final cut check at discrete solution...")
+            println("[DEBUG] Convergence detected...")
+
+            """
             # Add new Benders cut to master problem
             add_appropriate_cut(master, sub_model, data, theta, y, y_eval, y_core, duals, phi_val)
             optimize!(master)
@@ -638,14 +548,14 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
             # Final subproblem solve at discrete solution
             y_final = [gamma_val, s_power_val, s_energy_val]
             _, final_phi_val, final_duals, final_tracked_constraints = solve_subproblem_ptdf(simdir, y_final, data, tracked_constraints)
-            final_subrel_model, final_phirel_val = solve_subrel_transport(simdir, y_final, data)
             tracked_constraints = final_tracked_constraints
         
             # Save progress to CSV
             filename = joinpath(simdir, "output", "benders_progress.csv")
-            benders_ptdf_write_to_csv(filename, objective_value(master), theta_val, final_phi_val, y_final, final_phirel_val)
+            benders_ptdf_write_to_csv(filename, objective_value(master), theta_val, final_phi_val, y_final)
         
-            final_gap = abs(theta_val - final_phi_val) / (1e-10 + abs(final_phi_val))
+            final_gap = abs(theta_val - final_phi_val) / (1e-10 + abs(final_phi_val))"""
+            final_gap = gap
         
             if final_gap < tolerance
                 println("[DEBUG] Final gap at discrete solution = $(final_gap) < $(tolerance). Converged after $(iter+1) iterations.")

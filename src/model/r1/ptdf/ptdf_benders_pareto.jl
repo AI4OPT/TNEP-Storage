@@ -1,3 +1,16 @@
+function compute_regularization_point(master, data, iter)
+    # Compute the reg point
+    gamma_reg, s_power_reg, s_energy_reg = get_rep_day_core_point(data["param"]["core_point_simdir"])
+
+    if iter > 0
+        # Get the old eval point
+        y_eval_old = master.ext[:y_eval][iter]
+        gamma_reg, s_power_reg, s_energy_reg = y_eval_old
+    end
+
+    return gamma_reg, s_power_reg, s_energy_reg
+end
+
 function compute_eval_core_points(master, data, iter)
     # Get parameters
     stabilization_lambda = get(data["param"], "stabilization_lambda", [0.0, 0.0, 0.0])
