@@ -253,13 +253,14 @@ function create_base_model(data::Dict{String, Any}, optimizer;
     end
 
     # Conditional variable declaration based on whether relaxed model is used
-    if haskey(data["param"], "relaxed") && data["param"]["relaxed"] == true
+    if haskey(data["param"], "relaxed_first_stage") && data["param"]["relaxed_first_stage"] == true
         # Use continuous variables for relaxed model
         JuMP.@variable(model, 0 <= gamma[a=1:E] <= K)
     else
         # Use integer variables for standard model
         JuMP.@variable(model, 0 <= gamma[a=1:E] <= K, Int) # investment level of capacity upgrade
     end
+    
     JuMP.@variable(model, ue[r=1:R, i=1:N, t=1:T] >= 0) # under-served energy at bus
     # JuMP.@variable(model, pf[r=1:R, a=1:E, t=1:T]) # branch flows
     JuMP.@variable(model, s_power[i=1:N] >= 0) # power rating of storage

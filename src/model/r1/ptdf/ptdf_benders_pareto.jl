@@ -21,7 +21,12 @@ function compute_eval_core_points(master, data, iter)
     s_power_eps =  s_energy_eps * 1/4
 
     # descending lambda
-    stab_lambda = max(stabilization_lambda[3], stabilization_lambda[1] - iter * stabilization_lambda[2])
+    stab_lambda = nothing
+    if length(stabilization_lambda) == 2
+        stab_lambda = stabilization_lambda[1] * (stabilization_lambda[2] ^ iter)
+    else
+        stab_lambda = max(stabilization_lambda[3], stabilization_lambda[1] - iter * stabilization_lambda[2])
+    end
     shift_phi = max(core_shift_phi[3], core_shift_phi[1] - iter * core_shift_phi[2])
 
     y_core = nothing

@@ -54,7 +54,11 @@ function define_master_ptdf(data::Dict{String, Any})
     #
 
     # investment level of capacity upgrade
-    JuMP.@variable(master, 0 <= gamma[a=1:E] <= K, Int)
+    if haskey(data["param"], "relaxed_first_stage") && data["param"]["relaxed_first_stage"] == true
+        JuMP.@variable(master, 0 <= gamma[a=1:E] <= K)
+    else
+        JuMP.@variable(master, 0 <= gamma[a=1:E] <= K, Int)
+    end
 
     # binary variable for installation of storage
     # JuMP.@variable(master, sigma[i=1:N], Bin)
@@ -129,6 +133,9 @@ function update_master_objective!(master, data, y, theta, iter)
     if haskey(data["param"], "reg_penalty")
         gamma_reg, s_power_reg, s_energy_reg = compute_regularization_point(master, data, iter)
         obj_expr += data["param"]["reg_penalty"] * sum((s_power[i] - s_power_reg[i])^2 for i in 1:N)
+        if haskey(data["param"], "trans_reg_penalty")
+            obj_expr += data["param"]["trans_reg_penalty"] * sum((gamma[a] - gamma_reg[a])^2 for a in 1:E)
+        end
     end
 
     # Update the objective    
