@@ -44,7 +44,7 @@ function create_model_r1_ptdf_iterative_simplified_sorted_efficiency(simdir, dat
     end
     
     # Track which branches already have constraints
-    model.ext[:tracked_constraints] = Dict{Tuple{Int,Int,Int}, Bool}()
+    model.ext[:tracked_constraints] = Dict{Tuple{Int,Int,Int,Bool}, Bool}()
 
     # Initialize rate_a lookup
     rate_a_zero, rate_a_nonzero = get_rate_a_zero(data)
@@ -77,13 +77,13 @@ function create_model_r1_ptdf_iterative_simplified_sorted_efficiency(simdir, dat
             total_constraints += batch_size
             
             # Extract all the (r,t) pairs for this arc
-            rep_time_pairs = [(cons.rep, cons.time) for cons in constraints_batch]
+            rep_time_pairs = [(cons.rep, cons.time, cons.ub) for cons in constraints_batch]
             
             # Pre-compute the line limits for all constraints in this group
             line_limit = line_limit_base + model[:gamma][a] * cap_increment
             
             # Create a matrix expression for faster constraint generation
-            for (idx, (r, t)) in enumerate(rep_time_pairs)
+            for (idx, (r, t, ub)) in enumerate(rep_time_pairs)
                 # Build the net injection vector for this (r,t) pair
                 # We can create this once and reuse it for both upper and lower bounds
                 # This is the vectorized equivalent of inner sum:
@@ -98,12 +98,15 @@ function create_model_r1_ptdf_iterative_simplified_sorted_efficiency(simdir, dat
                     model[:dis][r,i,t]
                 ) for i in 1:N)
                 
-                # Add both constraints at once
-                model[:ptdf_flow]["$(a)_$(r)_$(t)_ub"] = @constraint(model, flow_expr <= line_limit)
-                model[:ptdf_flow]["$(a)_$(r)_$(t)_lb"] = @constraint(model, flow_expr >= -line_limit)
+                # Add constraint that should be added depending on ub (upper bound)
+                if ub
+                    model[:ptdf_flow]["$(a)_$(r)_$(t)_ub"] = @constraint(model, flow_expr <= line_limit)
+                else
+                    model[:ptdf_flow]["$(a)_$(r)_$(t)_lb"] = @constraint(model, flow_expr >= -line_limit)
+                end
                 
                 # Track the constraint
-                model.ext[:tracked_constraints][(a,r,t)] = true
+                model.ext[:tracked_constraints][(a,r,t,ub)] = true
             end
             
             # println("Progress: Cumulatively added $total_constraints constraints")
@@ -149,26 +152,27 @@ function create_model_r1_ptdf_iterative_simplified_sorted_efficiency(simdir, dat
             line_limit_fixed = line_limit_base + gamma_values[a] * cap_increment
             
             for r in 1:R, t in 1:T
-                if get(model.ext[:tracked_constraints], (a, r, t), false)
+                flow_val = flows[a, r, t]
+                violation_amount = abs(flow_val) - line_limit_fixed
+                ub = (flow_val >= 0)
+
+                if get(model.ext[:tracked_constraints], (a, r, t, ub), false)
                     continue
                 end
         
-                flow_val = flows[a, r, t]
-                violation_amount = abs(flow_val) - line_limit_fixed
-        
                 if violation_amount > model.ext[:solve_metadata][:ptdf_tol]
-                    push!(violations, (a, r, t, violation_amount))
+                    push!(violations, (a, r, t, ub, violation_amount))
                 end
             end
         end
 
-        sorted_violations = sort(violations, by = x -> -x[4])
+        sorted_violations = sort(violations, by = x -> -x[5])
         n_violated = length(sorted_violations)
         n_added = 0
 
         # Add up to the limit
         max_to_add = model.ext[:solve_metadata][:max_ptdf_per_iteration]
-        for (a, r, t, _) in Iterators.take(sorted_violations, max_to_add)
+        for (a, r, t, ub, _) in Iterators.take(sorted_violations, max_to_add)
 
             ptdf_row = model.ext[:PTDF][a,:]
             cap_increment = get_capacity_increment(data, a)
@@ -183,10 +187,13 @@ function create_model_r1_ptdf_iterative_simplified_sorted_efficiency(simdir, dat
             ) for i in 1:N)
         
             # Add both constraints
-            model[:ptdf_flow]["$(a)_$(r)_$(t)_ub"] = @constraint(model, flow_expr <= line_limit_expr)
-            model[:ptdf_flow]["$(a)_$(r)_$(t)_lb"] = @constraint(model, flow_expr >= -line_limit_expr)
+            if ub
+                model[:ptdf_flow]["$(a)_$(r)_$(t)_ub"] = @constraint(model, flow_expr <= line_limit_expr)
+            else
+                model[:ptdf_flow]["$(a)_$(r)_$(t)_lb"] = @constraint(model, flow_expr >= -line_limit_expr)
+            end
         
-            model.ext[:tracked_constraints][(a, r, t)] = true
+            model.ext[:tracked_constraints][(a, r, t, ub)] = true
             n_added += 1
         end
 

@@ -313,7 +313,8 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptd
         arc_list = [k[1] for k in keys(tracked_constraints)]
         rep_list = [k[2] for k in keys(tracked_constraints)]
         time_list = [k[3] for k in keys(tracked_constraints)]
-        tracked_df = DataFrame(arc=arc_list, rep=rep_list, time=time_list)
+        ub_list = [k[4] for k in keys(tracked_constraints)]
+        tracked_df = DataFrame(arc=arc_list, rep=rep_list, time=time_list, ub=ub_list)
         
         # Group by arc for efficient processing
         arc_groups = groupby(tracked_df, :arc)
@@ -330,13 +331,13 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptd
             total_constraints += batch_size
             
             # Get all (r,t) pairs for this arc
-            rep_time_pairs = [(row.rep, row.time) for row in constraints_batch]
+            rep_time_pairs = [(row.rep, row.time, row.ub) for row in constraints_batch]
 
             # Pre-compute the line limits for all constraints in this group
             line_limit = line_limit_base + sub[:gamma][a] * cap_increment
             
             # Generate constraints efficiently
-            for (r, t) in rep_time_pairs
+            for (r, t, ub) in rep_time_pairs
                 # Create flow expression once and reuse
                 flow_expr = sum(ptdf_row[i] * (
                     sum(sub[:pg][r,g,t] for g in 1:G if gen_bus_map[g] == i; init=0.0) -
@@ -346,9 +347,12 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptd
                     sub[:dis][r,i,t]
                 ) for i in 1:N)
                 
-                # Add both constraints
-                sub[:ptdf_flow]["$(a)_$(r)_$(t)_ub"] = @constraint(sub, flow_expr <= line_limit)
-                sub[:ptdf_flow]["$(a)_$(r)_$(t)_lb"] = @constraint(sub, flow_expr >= -line_limit)
+                # Add constraint that should be added depending on ub (upper bound)
+                if ub
+                    sub[:ptdf_flow]["$(a)_$(r)_$(t)_ub"] = @constraint(sub, flow_expr <= line_limit)
+                else
+                    sub[:ptdf_flow]["$(a)_$(r)_$(t)_lb"] = @constraint(sub, flow_expr >= -line_limit)
+                end
             end
         end
         
@@ -393,26 +397,27 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptd
             line_limit_fixed = line_limit_base + gamma_values[a] * cap_increment
             
             for r in 1:R, t in 1:T
-                if get(sub.ext[:tracked_constraints], (a, r, t), false)
+                flow_val = flows[a, r, t]
+                violation_amount = abs(flow_val) - line_limit_fixed
+                ub = (flow_val >= 0)
+
+                if get(sub.ext[:tracked_constraints], (a, r, t, ub), false)
                     continue
                 end
         
-                flow_val = flows[a, r, t]
-                violation_amount = abs(flow_val) - line_limit_fixed
-        
                 if violation_amount > sub.ext[:solve_metadata][:ptdf_tol]
-                    push!(violations, (a, r, t, violation_amount))
+                    push!(violations, (a, r, t, ub, violation_amount))
                 end
             end
         end
 
-        sorted_violations = sort(violations, by = x -> -x[4])
+        sorted_violations = sort(violations, by = x -> -x[5])
         n_violated = length(sorted_violations)
         n_added = 0
 
         # Add up to the limit
         max_to_add = sub.ext[:solve_metadata][:max_ptdf_per_iteration]
-        for (a, r, t, _) in Iterators.take(sorted_violations, max_to_add)
+        for (a, r, t, ub, _) in Iterators.take(sorted_violations, max_to_add)
 
             ptdf_row = sub.ext[:PTDF][a,:]
             cap_increment = get_capacity_increment(data, a)
@@ -427,10 +432,13 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptd
             ) for i in 1:N)
         
             # Add both constraints
-            sub[:ptdf_flow]["$(a)_$(r)_$(t)_ub"] = @constraint(sub, flow_expr <= line_limit_expr)
-            sub[:ptdf_flow]["$(a)_$(r)_$(t)_lb"] = @constraint(sub, flow_expr >= -line_limit_expr)
+            if ub
+                sub[:ptdf_flow]["$(a)_$(r)_$(t)_ub"] = @constraint(sub, flow_expr <= line_limit_expr)
+            else
+                sub[:ptdf_flow]["$(a)_$(r)_$(t)_lb"] = @constraint(sub, flow_expr >= -line_limit_expr)
+            end
         
-            sub.ext[:tracked_constraints][(a, r, t)] = true
+            sub.ext[:tracked_constraints][(a, r, t, ub)] = true
             n_added += 1
         end
 
@@ -483,7 +491,7 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
     gamma, s_power, s_energy = y
 
     # Initialize tracked constraints dictionary to store across iterations
-    tracked_constraints = Dict{Tuple{Int,Int,Int}, Bool}()
+    tracked_constraints = Dict{Tuple{Int,Int,Int,Bool}, Bool}()
 
     # Load previous constraints if available
     if isfile(joinpath(simdir, "tracked_constraints.csv"))
@@ -492,7 +500,7 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
         
         for row in eachrow(tracked_df)
             if row.tracked
-                tracked_constraints[(row.arc, row.rep, row.time)] = true
+                tracked_constraints[(row.arc, row.rep, row.time, row.ub)] = true
             end
         end
     end
