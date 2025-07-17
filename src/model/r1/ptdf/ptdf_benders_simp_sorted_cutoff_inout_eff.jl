@@ -16,7 +16,10 @@ function define_master_ptdf(data::Dict{String, Any})
     # Initialize model
     optimizer = Gurobi.Optimizer
     master = JuMP.Model(optimizer)
-    set_optimizer_attribute(master, "MIPGap", data["param"]["mip_gap"])
+    
+    if !get(data["param"], "relaxed_first_stage", false)
+        set_optimizer_attribute(master, "MIPGap", data["param"]["mip_gap"])
+    end
 
     # Initialize sets
     R = data["param"]["num_representatives"]
@@ -31,8 +34,9 @@ function define_master_ptdf(data::Dict{String, Any})
     master.ext[:y_eval] = Vector{Vector{Vector{Float64}}}()
     master.ext[:y_core] = Vector{Vector{Vector{Float64}}}()
 
-    # Create extension for tracking whether transport flow should be embedded
-    master.ext[:transport] = haskey(data["param"], "embed_transport_flow") && data["param"]["embed_transport_flow"] == true
+    master.ext[:gap] = Vector{Float64}()
+    master.ext[:stabilization_lambda] = Vector{Float64}()
+    master.ext[:stabilization_lambda_decr] = Vector{Float64}()
 
     # Get incidence matrix from extension
     incidence_matrix = master.ext[:INCIDENCE] = do_all_incidence(data)
@@ -99,7 +103,6 @@ function define_master_ptdf(data::Dict{String, Any})
         short_duration[i in 1:N],
         s_energy[i] == 4.0 * s_power[i]
     )
-
     #
     #   III. Objective
     #
@@ -107,7 +110,6 @@ function define_master_ptdf(data::Dict{String, Any})
     y = gamma, s_power, s_energy
 
     return master, y, theta
-
 end
 
 function update_master_objective!(master, data, y, theta, iter)
@@ -511,8 +513,8 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
         update_master_objective!(master, data, y, theta, iter)
         optimize!(master)
         
-        if termination_status(master) != MOI.OPTIMAL
-            error("Master problem failed to solve optimally: $(termination_status(master))")
+        if !has_values(master)
+            error("Master problem has no solution: $(termination_status(master))")
         end
         
         # Get master solution
@@ -528,9 +530,9 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
 
 
         # Solve core point subproblem to find the PTDF constraints
-        core_model, core_phi_val, core_duals, core_tracked_constraints = solve_subproblem_ptdf(simdir, y_core, data, tracked_constraints, logging="Core Point iter $iter")
+        # core_model, core_phi_val, core_duals, core_tracked_constraints = solve_subproblem_ptdf(simdir, y_core, data, tracked_constraints, logging="Core Point iter $iter")
         # Solve subproblem with fixed investments
-        sub_model, phi_val, duals, eval_tracked_constraints = solve_subproblem_ptdf(simdir, y_eval, data, core_tracked_constraints, logging="Eval Point iter $iter")
+        sub_model, phi_val, duals, eval_tracked_constraints = solve_subproblem_ptdf(simdir, y_eval, data, tracked_constraints, logging="Eval Point iter $iter")
 
         # Update tracked constraints
         tracked_constraints = eval_tracked_constraints
@@ -538,10 +540,12 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
         # Save progress to CSV
         filename = joinpath(simdir, "output", "benders_progress.csv")
         # The benders log will show the perturbed / stabilized point
-        benders_ptdf_write_to_csv(filename, objective_value(master), theta_val, phi_val, y_eval)
+        lambda_val = master.ext[:stabilization_lambda][end]
+        benders_ptdf_write_to_csv(filename, objective_value(master), theta_val, phi_val, y_eval, lambda_val=lambda_val)
 
         # Check convergence
-        gap = abs(theta_val - phi_val) / (1e-10 + abs(phi_val))
+        gap = abs(theta_val - phi_val) / (1e-10 + abs(theta_val))
+        push!(master.ext[:gap], gap)
         println("[DEBUG] Benders iteration $(iter+1): Master objective = $(objective_value(master)), theta = $(theta_val), phi = $(phi_val), gap = $(gap)")
 
         # if gap < tolerance
@@ -647,7 +651,7 @@ function save_investment_results(simdir, gamma_val, s_power_val, s_energy_val)
     CSV.write(joinpath(simdir, "output", "storage_investments.csv"), storage_df)
 end
 
-function benders_ptdf_write_to_csv(filename, master_obj, theta_val, phi_val, y_val, phirel_val=nothing)
+function benders_ptdf_write_to_csv(filename, master_obj, theta_val, phi_val, y_val; phirel_val=nothing, lambda_val=nothing)
     # Decompose y_val
     gamma_val, s_power_val, s_energy_val = y_val
 
@@ -666,6 +670,11 @@ function benders_ptdf_write_to_csv(filename, master_obj, theta_val, phi_val, y_v
     if phirel_val !== nothing
         data_dict["phirel_val"] = phirel_val
     end
+
+    # Add lambda if provided
+    if lambda_val !== nothing
+        data_dict["lambda"] = lambda_val
+    end
     
     # Create DataFrame from dictionary
     df = DataFrame([data_dict])
@@ -681,6 +690,11 @@ function benders_ptdf_write_to_csv(filename, master_obj, theta_val, phi_val, y_v
         if "phirel_val" in existing_headers && !("phirel_val" in keys(data_dict))
             # Add empty phirel_val to maintain column structure
             df.phirel_val = [missing]
+        end
+         # Check if lambda column exists in the file but not in our data
+        if "lambda" in existing_headers && !("lambda" in keys(data_dict))
+            # Add empty lambda to maintain column structure
+            df.lambda = [missing]
         end
         
         # Write to CSV, appending to it

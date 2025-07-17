@@ -71,9 +71,14 @@ function get_rep_day_core_point(simdir)
     config = TOML.parsefile(config_file)
     rep_date = config["dates"][1]
 
-    output_dir = joinpath(simdir, "output")
-    line_file = joinpath(output_dir, "line_investments.csv")
-    storage_file = joinpath(output_dir, "storage_investments.csv")
+    if isfile(joinpath(simdir, "line_investments.csv")) && isfile(joinpath(simdir, "storage_investments.csv"))
+        line_file = joinpath(simdir, "line_investments.csv")
+        storage_file = joinpath(simdir, "storage_investments.csv")
+    else
+        output_dir = joinpath(simdir, "output")
+        line_file = joinpath(output_dir, "line_investments.csv")
+        storage_file = joinpath(output_dir, "storage_investments.csv")
+    end
 
     line_inv = CSV.read(line_file, DataFrame)
     storage_inv = CSV.read(storage_file, DataFrame)
@@ -83,8 +88,8 @@ function get_rep_day_core_point(simdir)
     s_energy_val = storage_inv[:, :Storage_Energy]
 
     # You can round gamma if it's binary or discrete
-    gamma_val_rounded = round.(Int, gamma_val)
+    # gamma_val = round.(Int, gamma_val)
 
     # Return the core point
-    return gamma_val_rounded, s_power_val, s_energy_val
+    return gamma_val, s_power_val, s_energy_val
 end

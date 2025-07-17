@@ -11,26 +11,71 @@ function compute_regularization_point(master, data, iter)
     return gamma_reg, s_power_reg, s_energy_reg
 end
 
-function compute_eval_core_points(master, data, iter)
-    # Get parameters
+function get_stabilization_shift(master, data, iter)
+    # Get lambda parameters
     stabilization_lambda = get(data["param"], "stabilization_lambda", [0.0, 0.0, 0.0])
-    core_shift_phi = get(data["param"], "core_shift_phi", [0.0, 0.0, 0.0])
+    starter_lambda = stabilization_lambda[1]
+    decrement = stabilization_lambda[2]
+    min_lambda = stabilization_lambda[3]
+    lambda = nothing
+    decr = nothing
+    # Get core shift phi parameters
+    core_shift_phi = get(data["param"], "core_shift_phi", [0.0, 0.0])
+    main_phi = core_shift_phi[1]
+    low_phi = core_shift_phi[2]
+    phi = nothing
 
+    if isempty(master.ext[:gap]) # i.e. iter == 0
+        push!(master.ext[:stabilization_lambda], starter_lambda)
+        push!(master.ext[:stabilization_lambda_decr], decrement)
+        return starter_lambda, low_phi
+    else
+        if haskey(data["param"], "dynamic_lambda")
+            # Handle dynamic lambda
+            gap = master.ext[:gap][end]
+            threshold, EXTREME_GAP = data["param"]["dynamic_lambda"]
+            old_lambda = master.ext[:stabilization_lambda][end]
+            old_decr = master.ext[:stabilization_lambda_decr][end]
+
+            if length(master.ext[:gap]) > 5 && all(master.ext[:gap][end-4:end] .> threshold * 0.5)
+                lambda = old_lambda + decrement / 4
+                decr = decrement / 8
+                phi = low_phi 
+            elseif gap > threshold
+                # increment lambda back (retreat into stabilized region)
+                lambda = min(1.0, old_lambda + old_decr / 2)
+                # reduce the size of the decrementor
+                decr = old_decr / 4
+                phi = low_phi
+            else
+                # decrease lambda (explore new areas more)
+                lambda = max(0.0, old_lambda - old_decr)
+                # increase the size of the decrementor
+                decr = old_decr * 2
+                phi = main_phi
+            end
+        else
+            # Handle linear lambda decrease
+            lambda = max(min_lambda, starter_lambda - iter * decrement)
+            phi = main_phi
+        end
+    end
+
+    push!(master.ext[:stabilization_lambda], lambda)
+    push!(master.ext[:stabilization_lambda_decr], decr)
+    return lambda, phi
+end
+
+function compute_eval_core_points(master, data, iter)
+    # Compute stabilization lambda
+    stab_lambda, shift_phi = get_stabilization_shift(master, data, iter)
+
+    # core point perturbations
     gamma_eps = 0.005 * data["param"]["num_cap_upgrades_max"]
     s_energy_eps = 0.0005 * data["param"]["max_energy_rating"]
     s_power_eps =  s_energy_eps * 1/4
 
-    # descending lambda
-    stab_lambda = nothing
-    if length(stabilization_lambda) == 2
-        stab_lambda = stabilization_lambda[1] * (stabilization_lambda[2] ^ iter)
-    else
-        stab_lambda = max(stabilization_lambda[3], stabilization_lambda[1] - iter * stabilization_lambda[2])
-    end
-    shift_phi = max(core_shift_phi[3], core_shift_phi[1] - iter * core_shift_phi[2])
-
     y_core = nothing
-    
     if iter == 0
         # Compute the core point
         gamma_core, s_power_core, s_energy_core = get_rep_day_core_point(data["param"]["core_point_simdir"])
