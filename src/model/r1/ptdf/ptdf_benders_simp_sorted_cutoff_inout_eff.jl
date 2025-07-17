@@ -11,6 +11,7 @@ include("ptdf_save_data.jl")
 include("ptdf_benders_transport_flow_subproblem.jl")
 include("ptdf_core_point.jl")
 include("ptdf_benders_pareto.jl")
+include("ptdf_benders_save_load_master.jl")
 
 function define_master_ptdf(data::Dict{String, Any})
     # Initialize model
@@ -37,6 +38,7 @@ function define_master_ptdf(data::Dict{String, Any})
     master.ext[:gap] = Vector{Float64}()
     master.ext[:stabilization_lambda] = Vector{Float64}()
     master.ext[:stabilization_lambda_decr] = Vector{Float64}()
+    master.ext[:iter] = 0
 
     # Get incidence matrix from extension
     incidence_matrix = master.ext[:INCIDENCE] = do_all_incidence(data)
@@ -112,7 +114,7 @@ function define_master_ptdf(data::Dict{String, Any})
     return master, y, theta
 end
 
-function update_master_objective!(master, data, y, theta, iter)
+function update_master_objective!(master, data, y, theta)
     # Initialize sets
     R = data["param"]["num_representatives"]
     N = length(data["bus"])
@@ -133,7 +135,7 @@ function update_master_objective!(master, data, y, theta, iter)
 
     # L2 (quadratic) regularization
     if haskey(data["param"], "reg_penalty")
-        gamma_reg, s_power_reg, s_energy_reg = compute_regularization_point(master, data, iter)
+        gamma_reg, s_power_reg, s_energy_reg = compute_regularization_point(master, data)
         obj_expr += data["param"]["reg_penalty"] * sum((s_power[i] - s_power_reg[i])^2 for i in 1:N)
         if haskey(data["param"], "trans_reg_penalty")
             obj_expr += data["param"]["trans_reg_penalty"] * sum((gamma[a] - gamma_reg[a])^2 for a in 1:E)
@@ -487,7 +489,7 @@ end
 
 function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1000, tolerance=0.01)
     converged = false
-    iter = 0
+    iter = master.ext[:iter]
     
     # Unpack y variables
     gamma, s_power, s_energy = y
@@ -510,7 +512,7 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
     while !converged && iter < max_iterations
         # Solve master problem
         println("[DEBUG] Solving master problem: iteration $iter")
-        update_master_objective!(master, data, y, theta, iter)
+        update_master_objective!(master, data, y, theta)
         optimize!(master)
         
         if !has_values(master)
@@ -526,7 +528,7 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
         push!(master.ext[:y_raw], y_raw)
         export_investments_csv(data, gamma_val, s_power_val, s_energy_val, output_dir=joinpath(simdir,"benders_output"), file_suffix="$iter")
 
-        y_eval, y_core = compute_eval_core_points(master, data, iter)
+        y_eval, y_core = compute_eval_core_points(master, data)
 
 
         # Solve core point subproblem to find the PTDF constraints
@@ -588,7 +590,10 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
             add_appropriate_cut(master, sub_model, data, theta, y, y_eval, y_core, duals, phi_val)
         end
         
-        iter += 1
+        # Update iter count and save master problem with metadata/extensions
+        master.ext[:iter] += 1
+        iter = master.ext[:iter]
+        save_master_problem(master, simdir)
     end
 
     if !converged
@@ -626,8 +631,8 @@ function benders_ptdf_solve(simdir)
     setup_simdir(simdir)
 
     data = set_up_data(simdir)
-    # Create master problem
-    master, y, theta = define_master_ptdf(data)
+    # Create master problem (or load if it exists)
+    master, y, theta = load_master_problem(simdir, data)
     
     # Get optimal solution through Benders iterations
     gamma_val, s_power_val, s_energy_val = benders_iteration_ptdf(simdir, master, y, theta, data)

@@ -1,4 +1,6 @@
-function compute_regularization_point(master, data, iter)
+function compute_regularization_point(master, data)
+    iter = master.ext[:iter]
+
     # Compute the reg point
     gamma_reg, s_power_reg, s_energy_reg = get_rep_day_core_point(data["param"]["core_point_simdir"])
 
@@ -11,7 +13,9 @@ function compute_regularization_point(master, data, iter)
     return gamma_reg, s_power_reg, s_energy_reg
 end
 
-function get_stabilization_shift(master, data, iter)
+function get_stabilization_shift(master, data)
+    iter = master.ext[:iter]
+
     # Get lambda parameters
     stabilization_lambda = get(data["param"], "stabilization_lambda", [0.0, 0.0, 0.0])
     starter_lambda = stabilization_lambda[1]
@@ -66,9 +70,11 @@ function get_stabilization_shift(master, data, iter)
     return lambda, phi
 end
 
-function compute_eval_core_points(master, data, iter)
+function compute_eval_core_points(master, data)
+    iter = master.ext[:iter]
+
     # Compute stabilization lambda
-    stab_lambda, shift_phi = get_stabilization_shift(master, data, iter)
+    stab_lambda, shift_phi = get_stabilization_shift(master, data)
 
     # core point perturbations
     gamma_eps = 0.005 * data["param"]["num_cap_upgrades_max"]
