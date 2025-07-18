@@ -70,15 +70,18 @@ function get_stabilization_shift(master, data)
     return lambda, phi
 end
 
-function compute_eval_core_points(master, data)
+function compute_eval_core_points(master, data; trans_ratio=0.005, er_ratio=0.0005)
     iter = master.ext[:iter]
+
+    trans_ratio = get(data["param"], "trans_perturb_ratio", trans_ratio)
+    er_ratio = get(data["param"], "er_perturb_ratio", er_ratio)
 
     # Compute stabilization lambda
     stab_lambda, shift_phi = get_stabilization_shift(master, data)
 
     # core point perturbations
-    gamma_eps = 0.005 * data["param"]["num_cap_upgrades_max"]
-    s_energy_eps = 0.0005 * data["param"]["max_energy_rating"]
+    gamma_eps = trans_ratio * data["param"]["num_cap_upgrades_max"]
+    s_energy_eps = er_ratio * data["param"]["max_energy_rating"]
     s_power_eps =  s_energy_eps * 1/4
 
     y_core = nothing

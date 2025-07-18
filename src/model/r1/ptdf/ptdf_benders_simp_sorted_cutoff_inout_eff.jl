@@ -8,7 +8,7 @@ include("../../../helpers/compute_gen_cost.jl")
 include("../rate_a_zero.jl")
 include("base_ptdf.jl")
 include("ptdf_save_data.jl")
-include("ptdf_benders_transport_flow_subproblem.jl")
+# include("ptdf_benders_transport_flow_subproblem.jl")
 include("ptdf_core_point.jl")
 include("ptdf_benders_pareto.jl")
 include("ptdf_benders_save_load_master.jl")
@@ -477,7 +477,7 @@ function add_benders_cut_ptdf(master, theta, duals, y, y_val, phi_val)
     # Unpack y variables and duals
     gamma, s_power, s_energy = y
     dual_gamma, dual_power = duals
-    gamma_val, s_power_val, s_energy_Val = y_val
+    gamma_val, s_power_val, s_energy_val = y_val
 
     # Add Benders cut
     @constraint(master, 
@@ -487,7 +487,7 @@ function add_benders_cut_ptdf(master, theta, duals, y, y_val, phi_val)
     )
 end
 
-function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1000, tolerance=0.01)
+function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=100000, tolerance=0.01)
     converged = false
     iter = master.ext[:iter]
     
