@@ -46,8 +46,8 @@ function set_up_directories(superdir)
         end
 
         # Warm-start subproblem with tracked constraints
-        tracked_file = joinpath(initial_optima_dir, a_date, "output", "tracked_constraints.csv")
-        cp(tracked_file, joinpath(simdir, "tracked_constraints.csv"), force=true)
+        # tracked_file = joinpath(initial_optima_dir, a_date, "output", "tracked_constraints.csv")
+        # cp(tracked_file, joinpath(simdir, "tracked_constraints.csv"), force=true)
 
         # Create subproblem data
         set_up_data(simdir)
@@ -81,7 +81,11 @@ function parallelized_ptdf_benders(superdir)
     # Create master problem
     master, y, theta = load_or_make_master_problem(superdir, master_data, date_weights)
 
-    master_benders_loop(superdir, master, y, theta, master_data)
+    # Main benders loop
+    gamma_val, s_power_val, s_energy_val = master_benders_loop(superdir, master, y, theta, master_data)
+
+    # Save final investments
+    export_investments_csv(master_data, gamma_val, s_power_val, s_energy_val, output_dir=joinpath(superdir,"final_output"))
 
 end
 
@@ -111,6 +115,7 @@ function master_benders_loop(superdir, master, y, theta, master_data, max_iterat
     
     # Unpack y variables
     gamma, s_power, s_energy = y
+    gamma_val, s_power_val, s_energy_val = nothing, nothing, nothing
 
     while !converged && iter < max_iterations
         # Solve master problem
@@ -149,7 +154,7 @@ function master_benders_loop(superdir, master, y, theta, master_data, max_iterat
             
             try
                 simdir = joinpath(superdir, a_date)
-                sub_model, phi_val, duals = solve_subproblem_ptdf(simdir, y_eval, logging="Eval Point iter $iter for $a_date")
+                _, phi_val, duals = solve_subproblem_ptdf(simdir, y_eval, logging="Eval Point iter $iter for $a_date")
                 
                 solve_time = time() - start_time
                 println("Thread $thread_id: Completed $a_date in $(round(solve_time, digits=2)) seconds")
@@ -182,15 +187,22 @@ function master_benders_loop(superdir, master, y, theta, master_data, max_iterat
         total_phi_val = sum(subproblem_results[r][3] * date_weights[r][2] for r in 1:R)
         benders_ptdf_write_to_csv(superdir, master_obj_val, total_theta_val, total_phi_val, y_eval, lambda_val=lambda_val)
 
+        # Clear references
+        subproblem_results = nothing
+        GC.gc()
+
         # Check convergence
         gap = abs(total_theta_val - total_phi_val) / (1e-10 + abs(total_theta_val))
         push!(master.ext[:gap], gap)
         println("[DEBUG] Benders iteration $(iter): Master objective = $(master_obj_val), theta = $(total_theta_val), phi = $(total_phi_val), gap = $(gap)")
 
-        # TODO: if gap < tolerance
-            # println("[DEBUG] Final gap at discrete solution = $(gap) < $(tolerance). Converged after $(iter) iterations.")
-            # converged = true
-        # end
+        # If converged, exit benders loop
+        lambda = master.ext[:stabilization_lambda][end]
+        if gap < 0.01 && lambda < 1e-10
+            println("[DEBUG] Final gap at discrete solution = $(gap) < $(tolerance). Converged after $(iter) iterations.")
+            println("[DEBUG] Stabilization lambda was $(lambda).")
+            converged = true
+        end
         
         # Update iter count and save master problem with metadata/extensions
         master.ext[:iter] += 1

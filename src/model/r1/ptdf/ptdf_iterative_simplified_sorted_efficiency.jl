@@ -7,8 +7,6 @@ include("base_ptdf.jl")
 include("ptdf_save_data.jl")
 
 function create_model_r1_ptdf_iterative_simplified_sorted_efficiency(simdir, data::Dict{String, Any}, optimizer; 
-    line_investments=nothing, 
-    storage_investments=nothing,
     max_ptdf_iterations::Int=256,
     max_ptdf_per_iteration::Int=32,
     ptdf_tol::Float64=1e-6)
@@ -22,7 +20,7 @@ function create_model_r1_ptdf_iterative_simplified_sorted_efficiency(simdir, dat
     K = data["param"]["num_cap_upgrades_max"]
 
     # Initialize model and basic components
-    model = create_base_model(data, optimizer, line_investments=line_investments, storage_investments=storage_investments)
+    model = create_base_model(data, optimizer)
     # Set up model extensions for metadata
     model.ext[:solve_metadata] = Dict(
         :max_ptdf_iterations => max_ptdf_iterations,
@@ -216,9 +214,7 @@ function create_model_r1_ptdf_iterative_simplified_sorted_efficiency(simdir, dat
     return model
 end
 
-function create_base_model(data::Dict{String, Any}, optimizer; 
-    line_investments=nothing, 
-    storage_investments=nothing)
+function create_base_model(data::Dict{String, Any}, optimizer)
 
     # Initialize sets
     R = data["param"]["num_representatives"]
@@ -289,50 +285,10 @@ function create_base_model(data::Dict{String, Any}, optimizer;
         == 0
     )
 
-    # Previous investment constraints if applicable
-    nonzero_storage_nodes = Set()
-    if haskey(data["param"], "prev_simdir")
-        prev_simdir = data["param"]["prev_simdir"]
-        line_inv = CSV.read(joinpath(prev_simdir, "output", "line_investments.csv"), DataFrame)
-        storage_inv = CSV.read(joinpath(prev_simdir, "output", "storage_investments.csv"), DataFrame)
-        for i in 1:N
-            if storage_inv[i, :Storage_Power] != 0 || storage_inv[i, :Storage_Energy] != 0
-                push!(nonzero_storage_nodes, "$i")
-            end
-        end
-        
-        @constraint(model,
-            old_gamma[a in 1:E],
-            gamma[a] >= line_inv[a, :Upgrade_Lvl]
-        )
-        @constraint(model,
-            old_s_power[i in 1:N],
-            s_power[i] >= storage_inv[i, :Storage_Power]
-        )
-        @constraint(model,
-            old_s_energy[i in 1:N],
-            s_energy[i] >= storage_inv[i, :Storage_Energy]
-        )
-    end
-
-    # Investment test constraints if applicable
-    if line_investments !== nothing
-        inv = CSV.read(line_investments, DataFrame)
-        @constraint(model,
-            inv_gamma[a in 1:E],
-            gamma[a] == inv[a, :Upgrade_Lvl]
-        )
-    end
-    if storage_investments !== nothing
-        inv = CSV.read(storage_investments, DataFrame)
-        @constraint(model,
-            inv_s_power[i in 1:N],
-            s_power[i] == inv[i, :Storage_Power]
-        )
-        @constraint(model,
-            inv_s_energy[i in 1:N],
-            s_energy[i] == inv[i, :Storage_Energy]
-        )
+    # Check if previous investments exist
+    if haskey(data["param"], "previous_investment_dir")
+        prev_dir = data["param"]["previous_investment_dir"]
+        add_prev_upgrades(model, data, gamma, s_energy, prev_dir)
     end
 
     # if rate a is zero (unlimited), then don't allow upgrades
@@ -364,12 +320,10 @@ function create_base_model(data::Dict{String, Any}, optimizer;
     )
 
     # ensure that all storage is short-duration, i.e. can only store 4-hours worth of discharge
-    if storage_investments == nothing 
-        JuMP.@constraint(model, 
-            short_duration[i in 1:N],
-            s_energy[i] == 4.0 * s_power[i]
-        )
-    end
+    JuMP.@constraint(model, 
+        short_duration[i in 1:N],
+        s_energy[i] == 4.0 * s_power[i]
+    )
 
     # energy rating only if storage installed
     JuMP.@constraint(model, 
@@ -473,4 +427,24 @@ function compute_flows!(flows, pg_values, ue_values, ch_values, dis_values, data
         # Compute flows for all branches at once using PTDF
         flows[:,r,t] = PTDF * net_injections
     end
+end
+
+function add_prev_upgrades(model, data, gamma, s_energy, prev_dir; tolerance=1e-5)
+    E = length(data["branch"])
+    N = length(data["bus"])
+
+    trans_file = joinpath(prev_dir, "line_investments.csv")
+    storage_file = joinpath(prev_dir, "storage_investments.csv")
+
+    trans_df = CSV.read(trans_file, DataFrame)
+    storage_df = CSV.read(storage_file, DataFrame)
+
+    @constraint(model,
+        old_gamma[a in 1:E, trans_df[a, :Upgrade_Lvl] > tolerance],
+        gamma[a] >= trans_df[a, :Upgrade_Lvl]
+    )
+    @constraint(model,
+        old_s_energy[i in 1:N, storage_df[i, :Storage_Energy] > tolerance],
+        s_energy[i] >= storage_df[i, :Storage_Energy]
+    )
 end

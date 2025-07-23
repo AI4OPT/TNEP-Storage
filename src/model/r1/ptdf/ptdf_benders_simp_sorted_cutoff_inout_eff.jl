@@ -665,10 +665,10 @@ function benders_ptdf_write_to_csv(filename, master_obj, theta_val, phi_val, y_v
         "master_objective" => master_obj,
         "theta_val" => theta_val,
         "phi_val" => phi_val,
-        "total_line_upgrades" => count(x -> x > 0, gamma_val),
+        "total_line_upgrades" => count(x -> x >=0.015, gamma_val),
         "total_storage_power" => sum(s_power_val),
         "total_storage_energy" => sum(s_energy_val),
-        "total_storage_count" => count(x -> x != 0, s_power_val)
+        "total_storage_count" => count(x -> x >=0.015, s_power_val)
     )
     
     # Add phirel_val if provided

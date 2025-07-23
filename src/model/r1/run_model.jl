@@ -11,8 +11,6 @@ include("create_model_storage_linearized.jl")
 include("../n2/decarbonization.jl")
 include("create_summary.jl")
 include("ptdf/create_model_ptdf.jl")
-include("ptdf/ptdf_iterative.jl")
-include("ptdf/ptdf_iterative_simplified.jl")
 include("ptdf/ptdf_iterative_simplified_sorted.jl")
 include("ptdf/ptdf_iterative_simplified_sorted_efficiency.jl")
 
@@ -34,10 +32,6 @@ function run_model(simdir; timeout=84600)
     setup_simdir(simdir)
     data = set_up_data(simdir)
 
-    # check if there are prior investments file
-    line_investments = isfile(joinpath(simdir, "line_investments.csv")) ? joinpath(simdir, "line_investments.csv") : nothing
-    storage_investments = isfile(joinpath(simdir, "storage_investments.csv")) ? joinpath(simdir, "storage_investments.csv") : nothing
-
     # create the model
     # optimizer = CPLEX.Optimizer
     optimizer = Gurobi.Optimizer
@@ -45,34 +39,15 @@ function run_model(simdir; timeout=84600)
     model = nothing
     if !haskey(data["param"], "storage_linearized") || data["param"]["storage_linearized"] == false
         println("create_model_r1")
-        model = create_model_r1(data, optimizer,  
-            line_investments=line_investments, 
-            storage_investments=storage_investments)
-    elseif data["param"]["storage_linearized"] == "ptdf"
-        println("create_model_r1_ptdf_iterative")
-        model = create_model_r1_ptdf_iterative(simdir, data, optimizer,  
-            line_investments=line_investments, 
-            storage_investments=storage_investments)
-    elseif data["param"]["storage_linearized"] == "ptdf_simplified"
-        println("create_model_r1_ptdf_iterative_simplified")
-        model = create_model_r1_ptdf_iterative_simplified(simdir, data, optimizer,  
-            line_investments=line_investments, 
-            storage_investments=storage_investments)
+        model = create_model_r1(data, optimizer)
     elseif data["param"]["storage_linearized"] == "ptdf_simplified_sorted" && haskey(data["param"], "bess_efficiency") && data["param"]["bess_efficiency"] < 1.0
         println("create_model_r1_ptdf_iterative_simplified_sorted_efficiency")
-        model = create_model_r1_ptdf_iterative_simplified_sorted_efficiency(simdir, data, optimizer,  
-            line_investments=line_investments, 
-            storage_investments=storage_investments)
+        model = create_model_r1_ptdf_iterative_simplified_sorted_efficiency(simdir, data, optimizer)
     elseif data["param"]["storage_linearized"] == "ptdf_simplified_sorted"
         println("create_model_r1_ptdf_iterative_simplified_sorted")
-        model = create_model_r1_ptdf_iterative_simplified_sorted(simdir, data, optimizer,  
-            line_investments=line_investments, 
-            storage_investments=storage_investments)
+        model = create_model_r1_ptdf_iterative_simplified_sorted(simdir, data, optimizer)
     else
-        println("create_model_r1_sl")
-        model = create_model_r1_sl(data, optimizer,  
-            line_investments=line_investments, 
-            storage_investments=storage_investments)
+        model = nothing
     end
 
     # set Gurobi log location

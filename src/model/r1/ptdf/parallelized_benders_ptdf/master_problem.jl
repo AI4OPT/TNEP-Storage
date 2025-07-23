@@ -169,7 +169,13 @@ function define_master_ptdf(data::Dict{String, Any}, date_weights::Dict{Int, Tup
 
     #
     #   II. Constraints
-    #    
+    #
+    
+    # Check if previous investments exist
+    if haskey(data["param"], "previous_investment_dir")
+        prev_dir = data["param"]["previous_investment_dir"]
+        add_prev_upgrades(master, data, gamma, s_energy, prev_dir)
+    end
 
     # if rate a is zero (unlimited), then don't allow upgrades
     JuMP.@constraint(master, 
@@ -249,3 +255,24 @@ function add_benders_cut_ptdf(master, theta, duals, y, y_val, phi_val)
         sum(dual_power[i] * (s_power[i] - s_power_val[i]) for i=1:length(s_power))
     )
 end
+
+function add_prev_upgrades(master, data, gamma, s_energy, prev_dir; tolerance=1e-5)
+    E = length(data["branch"])
+    N = length(data["bus"])
+
+    trans_file = joinpath(prev_dir, "line_investments.csv")
+    storage_file = joinpath(prev_dir, "storage_investments.csv")
+
+    trans_df = CSV.read(trans_file, DataFrame)
+    storage_df = CSV.read(storage_file, DataFrame)
+
+    @constraint(master,
+        old_gamma[a in 1:E, trans_df[a, :Upgrade_Lvl] > tolerance],
+        gamma[a] >= trans_df[a, :Upgrade_Lvl]
+    )
+    @constraint(master,
+        old_s_energy[i in 1:N, storage_df[i, :Storage_Energy] > tolerance],
+        s_energy[i] >= storage_df[i, :Storage_Energy]
+    )
+end
+

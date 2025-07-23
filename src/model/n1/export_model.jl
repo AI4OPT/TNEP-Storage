@@ -179,9 +179,7 @@ function export_investments_csv(data, gammas, s_powers, s_energys;
     file_suffix="")
 
     # Create the output directory if it doesn't exist
-    if !isdir(output_dir)
     mkpath(output_dir)
-    end
 
     # Construct filenames with optional suffix
     lines_filename = isempty(file_suffix) ? "line_investments.csv" : "line_investments_$(file_suffix).csv"

@@ -78,9 +78,15 @@ function get_stabilization_shift(master, data)
             else
                 # decrease lambda (explore new areas more)
                 lambda = max(0.0, old_lambda - old_decr)
-                # increase the size of the decrementor
-                decr = old_decr * 2
-                phi = main_phi
+                if lambda == 0 # if lambda would reach 0, just divide by 2 and converge to 0 instead
+                    lambda = old_lambda / 2
+                    decr = old_lambda / 2
+                    phi = main_phi
+                else
+                    # increase the size of the decrementor
+                    decr = old_decr * 2
+                    phi = main_phi
+                end
             end
         else
             # Handle linear lambda decrease
