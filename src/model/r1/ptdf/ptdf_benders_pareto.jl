@@ -1,13 +1,22 @@
 function compute_regularization_point(master, data)
     iter = master.ext[:iter]
+    params = get(data["param"], "dynamic_lambda", [0.1, 1.0])
+    threshold, EXTREME_GAP = params
 
     # Compute the reg point
     gamma_reg, s_power_reg, s_energy_reg = get_rep_day_core_point(data["param"]["core_point_simdir"])
 
-    if iter > 0
-        # Get the old eval point
-        y_eval_old = master.ext[:y_eval][iter]
-        gamma_reg, s_power_reg, s_energy_reg = y_eval_old
+    if !isempty(master.ext[:gap]) # i.e. iter > 0
+        @assert length(master.ext[:y_eval]) == length(master.ext[:gap])
+        
+        # Find the most recent eval point with gap < threshold
+        for i in iter:-1:1  # Start from current iteration and go backwards
+            if master.ext[:gap][i] < threshold
+                y_eval_selected = master.ext[:y_eval][i]
+                gamma_reg, s_power_reg, s_energy_reg = y_eval_selected
+                break
+            end
+        end
     end
 
     return gamma_reg, s_power_reg, s_energy_reg
@@ -42,14 +51,19 @@ function get_stabilization_shift(master, data)
             old_decr = master.ext[:stabilization_lambda_decr][end]
 
             if length(master.ext[:gap]) > 5 && all(master.ext[:gap][end-4:end] .> threshold * 0.5)
-                lambda = old_lambda + decrement / 4
+                lambda = min(1.0, old_lambda + decrement / 4)
                 decr = decrement / 8
                 phi = low_phi 
-            elseif gap > threshold
+            elseif gap > 1.0
                 # increment lambda back (retreat into stabilized region)
                 lambda = min(1.0, old_lambda + old_decr / 2)
                 # reduce the size of the decrementor
                 decr = old_decr / 4
+                phi = low_phi
+            elseif gap > 0.02
+                # keep lambda the same, explore and improve this region
+                lambda = old_lambda
+                decr = old_decr
                 phi = low_phi
             else
                 # decrease lambda (explore new areas more)

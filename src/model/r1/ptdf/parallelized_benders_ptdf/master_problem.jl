@@ -170,11 +170,20 @@ function define_master_ptdf(data::Dict{String, Any}, date_weights::Dict{Int, Tup
     #
     #   II. Constraints
     #
+    candidate_branches = get_candidate_branches(data)
     
     # Check if previous investments exist
     if haskey(data["param"], "previous_investment_dir")
         prev_dir = data["param"]["previous_investment_dir"]
-        add_prev_upgrades(master, data, gamma, s_energy, prev_dir)
+        add_prev_upgrades(master, data, gamma, s_energy, prev_dir, candidate_branches)
+    end
+
+    # Separately, force non-candidates to zero
+    if candidate_branches !== nothing
+        @constraint(master, 
+            force_zero[a in rate_a_nonzero; !(a in candidate_branches)],
+            gamma[a] == 0
+        )
     end
 
     # if rate a is zero (unlimited), then don't allow upgrades
@@ -256,18 +265,24 @@ function add_benders_cut_ptdf(master, theta, duals, y, y_val, phi_val)
     )
 end
 
-function add_prev_upgrades(master, data, gamma, s_energy, prev_dir; tolerance=1e-5)
+function add_prev_upgrades(master, data, gamma, s_energy, prev_dir, candidate_branches=nothing; tolerance=1e-5)
     E = length(data["branch"])
     N = length(data["bus"])
 
     trans_file = joinpath(prev_dir, "line_investments.csv")
     storage_file = joinpath(prev_dir, "storage_investments.csv")
-
     trans_df = CSV.read(trans_file, DataFrame)
     storage_df = CSV.read(storage_file, DataFrame)
 
+    if candidate_branches !== nothing
+        valid_branches = [a for a in 1:E if (a in candidate_branches) && (trans_df[a, :Upgrade_Lvl] > tolerance)]
+    else
+        # Original behavior if no candidate set provided
+        valid_branches = [a for a in 1:E if trans_df[a, :Upgrade_Lvl] > tolerance]
+    end
+
     @constraint(master,
-        old_gamma[a in 1:E, trans_df[a, :Upgrade_Lvl] > tolerance],
+        old_gamma[a in valid_branches],
         gamma[a] >= trans_df[a, :Upgrade_Lvl]
     )
     @constraint(master,
@@ -275,4 +290,33 @@ function add_prev_upgrades(master, data, gamma, s_energy, prev_dir; tolerance=1e
         s_energy[i] >= storage_df[i, :Storage_Energy]
     )
 end
+
+function get_candidate_branches(data, tolerance=1e-5)
+    if !get(data["param"], "line_candidates", false)
+        return nothing
+    end
+    
+    dates = data["param"]["dates"] # Read data params
+    initial_optima_dir = data["param"]["initial_optima_dir"]
+    
+    branch_rep_upgrades = Dict{Int, Vector{Float64}}() # Initialize storage for all branch data
+    
+    for branch_idx in 1:length(data["branch"]) # Initialize with empty vectors for each branch
+        branch_rep_upgrades[branch_idx] = Float64[]
+    end
+    
+    for a_date in dates # Collect rep day data
+        rep_file = joinpath(initial_optima_dir, a_date, "output", "line_investments.csv")
+        rep = CSV.read(rep_file, DataFrame)
+        
+        for row in eachrow(rep) # Add each branch's upgrade level to its collection
+            push!(branch_rep_upgrades[row.Branch_Index], row.Upgrade_Lvl)
+        end
+    end
+
+    filtered_dict = Dict(k => v for (k, v) in branch_rep_upgrades if any(abs(val) > tolerance for val in v))
+    return collect(keys(filtered_dict))
+end
+
+
 

@@ -133,13 +133,13 @@ function master_benders_loop(superdir, master, y, theta, master_data, max_iterat
         s_energy_val = value.(s_energy)
         theta_val = value.(theta)
         y_raw = [gamma_val, s_power_val, s_energy_val]
-        push!(master.ext[:y_raw], y_raw)
+        push!(master.ext[:y_raw], y_raw) # y_raw list is updated
 
         # Save raw solution
         export_investments_csv(master_data, gamma_val, s_power_val, s_energy_val, output_dir=joinpath(superdir,"benders_output"), file_suffix="$iter")
 
         # Compute the evaluation point where Bender's cuts will be made
-        y_eval, y_core = compute_eval_core_points(superdir, master, master_data)
+        y_eval, y_core = compute_eval_core_points(superdir, master, master_data) # y_eval and y_core are updated
         lambda_val = master.ext[:stabilization_lambda][end]
 
         # This is thread SAFE - pre-allocate and use indexed assignment
