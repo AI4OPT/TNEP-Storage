@@ -77,7 +77,7 @@ function get_stabilization_shift(master, data)
                 lambda = min(1.0, old_lambda + decrement / 4)
                 decr = decrement / 8
                 phi = low_phi 
-            elseif gap > 2.0
+            elseif gap > 1.0
                 # increment lambda back (retreat into stabilized region)
                 lambda = min(1.0, old_lambda + old_decr / 2)
                 # reduce the size of the decrementor

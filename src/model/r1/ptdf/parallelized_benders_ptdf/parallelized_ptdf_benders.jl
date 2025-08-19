@@ -46,8 +46,8 @@ function set_up_directories(superdir)
         end
 
         # Warm-start subproblem with tracked constraints
-        # tracked_file = joinpath(initial_optima_dir, a_date, "output", "tracked_constraints.csv")
-        # cp(tracked_file, joinpath(simdir, "tracked_constraints.csv"), force=true)
+        tracked_file = joinpath(initial_optima_dir, a_date, "output", "tracked_constraints.csv")
+        cp(tracked_file, joinpath(simdir, "tracked_constraints.csv"), force=true)
 
         # Create subproblem data
         set_up_data(simdir)
@@ -79,7 +79,7 @@ function parallelized_ptdf_benders(superdir)
     println("[DEBUG] Finished setting up directories and files for $superdir")
 
     # Create master problem
-    master, y, theta = load_or_make_master_problem(superdir, master_data, date_weights)
+    master, y, theta = define_master_ptdf(superdir, master_data, date_weights)
 
     # Main benders loop
     gamma_val, s_power_val, s_energy_val = master_benders_loop(superdir, master, y, theta, master_data)
@@ -112,6 +112,9 @@ function master_benders_loop(superdir, master, y, theta, master_data, max_iterat
     converged = false
     iter = master.ext[:iter]
     date_weights = master.ext[:date_weights]
+    embed_date = master_data["param"]["embed_date"]
+    embed_dir = joinpath(superdir, embed_date)
+    embed_data = JSON.parsefile(joinpath(embed_dir, "data.json"))
     
     # Unpack y variables
     gamma, s_power, s_energy = y
@@ -120,8 +123,7 @@ function master_benders_loop(superdir, master, y, theta, master_data, max_iterat
     while !converged && iter < max_iterations
         # Solve master problem
         println("[DEBUG] Solving master problem: iteration $iter")
-        update_master_objective!(superdir, master, master_data, y, theta)
-        optimize!(master)
+        solve_ptdf_iteratively!(embed_dir, master, embed_data)
         
         if !has_values(master)
             error("Master problem has no solution: $(termination_status(master))")
@@ -207,7 +209,6 @@ function master_benders_loop(superdir, master, y, theta, master_data, max_iterat
         # Update iter count and save master problem with metadata/extensions
         master.ext[:iter] += 1
         iter = master.ext[:iter]
-        save_master_problem(master, superdir)
     end
 
     if !converged

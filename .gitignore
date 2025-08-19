@@ -4,3 +4,9 @@
 /EIA
 /PACE
 /exp
+/.vscode
+
+*.json
+*.txt
+*.png
+*.csv

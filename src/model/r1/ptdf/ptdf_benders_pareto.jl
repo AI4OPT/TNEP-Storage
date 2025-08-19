@@ -60,7 +60,7 @@ function get_stabilization_shift(master, data)
                 # reduce the size of the decrementor
                 decr = old_decr / 4
                 phi = low_phi
-            elseif gap > 0.02
+            elseif gap > 0.03
                 # keep lambda the same, explore and improve this region
                 lambda = old_lambda
                 decr = old_decr

@@ -11,6 +11,19 @@ function create_model_r1_ptdf_iterative_simplified_sorted_efficiency(simdir, dat
     max_ptdf_per_iteration::Int=32,
     ptdf_tol::Float64=1e-6)
 
+    # Initialize model and setup
+    model = setup_ptdf_model(simdir, data, optimizer, max_ptdf_iterations, max_ptdf_per_iteration, ptdf_tol)
+    
+    # Perform warm-start if available
+    warm_start_ptdf_constraints!(simdir, model, data)
+    
+    # Perform lazy PTDF solving
+    model = solve_ptdf_iteratively!(simdir, model, data)
+    
+    return model
+end
+
+function setup_ptdf_model(simdir, data::Dict{String, Any}, optimizer, max_ptdf_iterations::Int, max_ptdf_per_iteration::Int, ptdf_tol::Float64)
     # Initialize sets
     R = data["param"]["num_representatives"]
     N = length(data["bus"])
@@ -20,13 +33,15 @@ function create_model_r1_ptdf_iterative_simplified_sorted_efficiency(simdir, dat
     K = data["param"]["num_cap_upgrades_max"]
 
     # Initialize model and basic components
-    model = create_base_model(data, optimizer)
+    model = create_base_model(simdir, data, optimizer)
+    
     # Set up model extensions for metadata
     model.ext[:solve_metadata] = Dict(
         :max_ptdf_iterations => max_ptdf_iterations,
         :max_ptdf_per_iteration => max_ptdf_per_iteration,
         :ptdf_tol => ptdf_tol
     )
+    
     logfile = joinpath(simdir, "gurobi_logfile.log")
     set_optimizer_attribute(model, "LogFile", logfile)
     set_optimizer_attribute(model, "MIPGap", data["param"]["mip_gap"])
@@ -50,9 +65,17 @@ function create_model_r1_ptdf_iterative_simplified_sorted_efficiency(simdir, dat
     
     # Add container for flow constraints
     model[:ptdf_flow] = Dict{String, ConstraintRef}()
+    
+    return model
+end
 
+function warm_start_ptdf_constraints!(simdir, model, data)
     # Pre-compute useful mappings that don't change during the solution process
     gen_bus_map = Dict(parse(Int, g) => data["gen"]["$g"]["gen_bus"] for g in keys(data["gen"]))
+    R = data["param"]["num_representatives"]
+    N = length(data["bus"])
+    T = data["param"]["num_hours"]
+    G = length(data["gen"])
 
     # Optimized warm-start for PTDF with matrix operations
     if isfile(joinpath(simdir, "tracked_constraints.csv"))
@@ -107,11 +130,21 @@ function create_model_r1_ptdf_iterative_simplified_sorted_efficiency(simdir, dat
                 model.ext[:tracked_constraints][(a,r,t,ub)] = true
             end
             
-            # println("Progress: Cumulatively added $total_constraints constraints")
+            println("Progress: Cumulatively added $total_constraints constraints")
         end
         
         println("Warm-started with $total_constraints constraints")
     end
+end
+
+function solve_ptdf_iteratively!(simdir, model, data)
+    R = data["param"]["num_representatives"]
+    N = length(data["bus"])
+    T = data["param"]["num_hours"]
+    G = length(data["gen"])
+    
+    # Pre-compute useful mappings that don't change during the solution process
+    gen_bus_map = Dict(parse(Int, g) => data["gen"]["$g"]["gen_bus"] for g in keys(data["gen"]))
 
     # Begin lazy PTDF loop
     solved = false
@@ -137,63 +170,8 @@ function create_model_r1_ptdf_iterative_simplified_sorted_efficiency(simdir, dat
         flows = zeros(length(model.ext[:rate_a_nonzero]), R, T)
         compute_flows!(flows, pg_values, ue_values, ch_values, dis_values, data, model.ext[:PTDF])
 
-        # Add violations prioritizing by size
-        violations = []
-        
-        # Keep track of all tracked combinations for this branch to avoid lookups
-        for a in model.ext[:rate_a_nonzero]
-            
-            # Pre-compute for this branch
-            ptdf_row = model.ext[:PTDF][a,:]
-            cap_increment = get_capacity_increment(data, a)
-            line_limit_base = data["branch"]["$a"]["rate_a"]
-            line_limit_fixed = line_limit_base + gamma_values[a] * cap_increment
-            
-            for r in 1:R, t in 1:T
-                flow_val = flows[a, r, t]
-                violation_amount = abs(flow_val) - line_limit_fixed
-                ub = (flow_val >= 0)
-
-                if get(model.ext[:tracked_constraints], (a, r, t, ub), false)
-                    continue
-                end
-        
-                if violation_amount > model.ext[:solve_metadata][:ptdf_tol]
-                    push!(violations, (a, r, t, ub, violation_amount))
-                end
-            end
-        end
-
-        sorted_violations = sort(violations, by = x -> -x[5])
-        n_violated = length(sorted_violations)
-        n_added = 0
-
-        # Add up to the limit
-        max_to_add = model.ext[:solve_metadata][:max_ptdf_per_iteration]
-        for (a, r, t, ub, _) in Iterators.take(sorted_violations, max_to_add)
-
-            ptdf_row = model.ext[:PTDF][a,:]
-            cap_increment = get_capacity_increment(data, a)
-            line_limit_base = data["branch"]["$a"]["rate_a"]
-            line_limit_expr = line_limit_base + model[:gamma][a] * cap_increment
-        
-            # Define the flow expression only once
-            flow_expr = sum(ptdf_row[i] * (
-                sum(model[:pg][r, g, t] for g in 1:G if gen_bus_map[g] == i; init=0.0)
-                - data["bus"]["$i"]["load"]["$r"][t]
-                + model[:ue][r, i, t] - model[:ch][r, i, t] + model[:dis][r, i, t]
-            ) for i in 1:N)
-        
-            # Add both constraints
-            if ub
-                model[:ptdf_flow]["$(a)_$(r)_$(t)_ub"] = @constraint(model, flow_expr <= line_limit_expr)
-            else
-                model[:ptdf_flow]["$(a)_$(r)_$(t)_lb"] = @constraint(model, flow_expr >= -line_limit_expr)
-            end
-        
-            model.ext[:tracked_constraints][(a, r, t, ub)] = true
-            n_added += 1
-        end
+        # Find violations and add constraints
+        n_violated, n_added = add_ptdf_violations!(model, flows, gamma_values, data, gen_bus_map)
 
         if n_added > 0
             save_tracked_constraints(simdir, model, n_violated)
@@ -201,20 +179,85 @@ function create_model_r1_ptdf_iterative_simplified_sorted_efficiency(simdir, dat
         
         solved = (n_violated == 0)
         niter += 1
-        # println("approx. progress $(checked_count / E)")
         println("Iteration $niter: Found $n_violated violations, added $n_added constraints")
     end
 
-    # Record solve time
+    # Record solve time and save results
     solve_time = time() - t0
     model.ext[:solve_metadata][:solve_time] = solve_time
 
     save_solve_time(simdir, solve_time)
     save_power_injections(simdir, model, data)
+    
     return model
 end
 
-function create_base_model(data::Dict{String, Any}, optimizer)
+function add_ptdf_violations!(model, flows, gamma_values, data, gen_bus_map)
+    R = data["param"]["num_representatives"]
+    N = length(data["bus"])
+    T = data["param"]["num_hours"]
+    G = length(data["gen"])
+    
+    # Add violations prioritizing by size
+    violations = []
+    
+    # Keep track of all tracked combinations for this branch to avoid lookups
+    for a in model.ext[:rate_a_nonzero]
+        # Pre-compute for this branch
+        ptdf_row = model.ext[:PTDF][a,:]
+        cap_increment = get_capacity_increment(data, a)
+        line_limit_base = data["branch"]["$a"]["rate_a"]
+        line_limit_fixed = line_limit_base + gamma_values[a] * cap_increment
+        
+        for r in 1:R, t in 1:T
+            flow_val = flows[a, r, t]
+            violation_amount = abs(flow_val) - line_limit_fixed
+            ub = (flow_val >= 0)
+
+            if get(model.ext[:tracked_constraints], (a, r, t, ub), false)
+                continue
+            end
+    
+            if violation_amount > model.ext[:solve_metadata][:ptdf_tol]
+                push!(violations, (a, r, t, ub, violation_amount))
+            end
+        end
+    end
+
+    sorted_violations = sort(violations, by = x -> -x[5])
+    n_violated = length(sorted_violations)
+    n_added = 0
+
+    # Add up to the limit
+    max_to_add = model.ext[:solve_metadata][:max_ptdf_per_iteration]
+    for (a, r, t, ub, _) in Iterators.take(sorted_violations, max_to_add)
+        ptdf_row = model.ext[:PTDF][a,:]
+        cap_increment = get_capacity_increment(data, a)
+        line_limit_base = data["branch"]["$a"]["rate_a"]
+        line_limit_expr = line_limit_base + model[:gamma][a] * cap_increment
+    
+        # Define the flow expression only once
+        flow_expr = sum(ptdf_row[i] * (
+            sum(model[:pg][r, g, t] for g in 1:G if gen_bus_map[g] == i; init=0.0)
+            - data["bus"]["$i"]["load"]["$r"][t]
+            + model[:ue][r, i, t] - model[:ch][r, i, t] + model[:dis][r, i, t]
+        ) for i in 1:N)
+    
+        # Add both constraints
+        if ub
+            model[:ptdf_flow]["$(a)_$(r)_$(t)_ub"] = @constraint(model, flow_expr <= line_limit_expr)
+        else
+            model[:ptdf_flow]["$(a)_$(r)_$(t)_lb"] = @constraint(model, flow_expr >= -line_limit_expr)
+        end
+    
+        model.ext[:tracked_constraints][(a, r, t, ub)] = true
+        n_added += 1
+    end
+    
+    return n_violated, n_added
+end
+
+function create_base_model(simdir, data::Dict{String, Any}, optimizer)
 
     # Initialize sets
     R = data["param"]["num_representatives"]
