@@ -265,13 +265,11 @@ function create_base_model(data::Dict{String, Any}, optimizer)
     end
     
     JuMP.@variable(model, ue[r=1:R, i=1:N, t=1:T] >= 0) # under-served energy at bus
-    # JuMP.@variable(model, pf[r=1:R, a=1:E, t=1:T]) # branch flows
     JuMP.@variable(model, s_power[i=1:N] >= 0) # power rating of storage
     JuMP.@variable(model, s_energy[i=1:N] >= 0) # energy rating of storage
     JuMP.@variable(model, soc[r=1:R, i=1:N, t=1:T] >= 0) # state of charge of storage
     JuMP.@variable(model, ch[r=1:R, i=1:N, t=1:T] >= 0) # charging of storage
     JuMP.@variable(model, dis[r=1:R, i=1:N, t=1:T] >= 0) # discharging of storage
-    # JuMP.@variable(model, sigma[i=1:N], Bin) # binary variable for installation of storage
 
     # Add all non-PTDF constraints
     # Global power balance

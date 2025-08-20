@@ -46,8 +46,8 @@ function set_up_directories(superdir)
         end
 
         # Warm-start subproblem with tracked constraints
-        # tracked_file = joinpath(initial_optima_dir, a_date, "output", "tracked_constraints.csv")
-        # cp(tracked_file, joinpath(simdir, "tracked_constraints.csv"), force=true)
+        tracked_file = joinpath(initial_optima_dir, a_date, "output", "tracked_constraints.csv")
+        cp(tracked_file, joinpath(simdir, "tracked_constraints.csv"), force=true)
 
         # Create subproblem data
         set_up_data(simdir)
@@ -79,7 +79,7 @@ function parallelized_ptdf_benders(superdir)
     println("[DEBUG] Finished setting up directories and files for $superdir")
 
     # Create master problem
-    master, y, theta = load_or_make_master_problem(superdir, master_data, date_weights)
+    master, y, theta = define_master_ptdf(superdir, master_data, date_weights)
 
     # Main benders loop
     gamma_val, s_power_val, s_energy_val = master_benders_loop(superdir, master, y, theta, master_data)
@@ -109,6 +109,8 @@ function compute_superset_core_point(superdir)
 end
 
 function master_benders_loop(superdir, master, y, theta, master_data, max_iterations=100000, tolerance=0.01)
+    max_iterations=100000
+    tolerance=0.01
     converged = false
     iter = master.ext[:iter]
     date_weights = master.ext[:date_weights]
@@ -117,11 +119,14 @@ function master_benders_loop(superdir, master, y, theta, master_data, max_iterat
     gamma, s_power, s_energy = y
     gamma_val, s_power_val, s_energy_val = nothing, nothing, nothing
 
+    embed_date = master_data["param"]["embed_date"]
+    simdir = joinpath(superdir, embed_date)
+    data = JSON.parsefile(joinpath(simdir, "data.json"))
+
     while !converged && iter < max_iterations
         # Solve master problem
         println("[DEBUG] Solving master problem: iteration $iter")
-        update_master_objective!(superdir, master, master_data, y, theta)
-        optimize!(master)
+        solve_master!(master, simdir, data)
         
         if !has_values(master)
             error("Master problem has no solution: $(termination_status(master))")
@@ -143,11 +148,10 @@ function master_benders_loop(superdir, master, y, theta, master_data, max_iterat
         lambda_val = master.ext[:stabilization_lambda][end]
 
         # This is thread SAFE - pre-allocate and use indexed assignment
-        date_weights_vec = sort(collect(date_weights), by=first) 
+        date_weights_vec = collect(date_weights)
         subproblem_results = Vector{Tuple}(undef, length(date_weights_vec))
         @threads for i in 1:length(date_weights_vec)
             rep_index, (a_date, prob) = date_weights_vec[i]
-            @assert rep_index == i  # Verify our assumption
             thread_id = threadid()
             println("Thread $thread_id: Starting subproblem for $a_date (rep_index $rep_index)")
             start_time = time()
@@ -159,7 +163,7 @@ function master_benders_loop(superdir, master, y, theta, master_data, max_iterat
                 solve_time = time() - start_time
                 println("Thread $thread_id: Completed $a_date in $(round(solve_time, digits=2)) seconds")
                 
-                subproblem_results[i] = (a_date, simdir, phi_val, duals)
+                subproblem_results[rep_index] = (a_date, simdir, phi_val, duals)
                 
             catch e
                 solve_time = time() - start_time
@@ -177,8 +181,10 @@ function master_benders_loop(superdir, master, y, theta, master_data, max_iterat
             # Individual subproblem Bender's log
             benders_ptdf_write_to_csv(simdir, master_obj_val, theta_val[rep_index], phi_val, y_eval, lambda_val=lambda_val)
 
-            # Add the cut to the master problem
-            add_benders_cut_ptdf(master, theta[rep_index], duals, y, y_eval, phi_val)
+            # Add the cut to the master problem (skip for embedded subproblem since it's already in master)
+            if a_date != embed_date
+                add_benders_cut_ptdf(master, theta[rep_index], duals, y, y_eval, phi_val)
+            end
         end
 
         # Master problem Bender's log
@@ -198,7 +204,7 @@ function master_benders_loop(superdir, master, y, theta, master_data, max_iterat
 
         # If converged, exit benders loop
         lambda = master.ext[:stabilization_lambda][end]
-        if gap < 0.01 && lambda < 1e-10
+        if gap < 0.01 && lambda < 1e-5
             println("[DEBUG] Final gap at discrete solution = $(gap) < $(tolerance). Converged after $(iter) iterations.")
             println("[DEBUG] Stabilization lambda was $(lambda).")
             converged = true
@@ -207,7 +213,6 @@ function master_benders_loop(superdir, master, y, theta, master_data, max_iterat
         # Update iter count and save master problem with metadata/extensions
         master.ext[:iter] += 1
         iter = master.ext[:iter]
-        save_master_problem(master, superdir)
     end
 
     if !converged

@@ -2,121 +2,22 @@ using JuMP
 using Gurobi
 using Serialization
 
-function save_master_problem(master, simdir; filename="master_problem.mps")
-    """
-    Save the master problem model to file for warm-starting
-    """
-    master_path = joinpath(simdir, "master_models")
-    mkpath(master_path)
-    
-    # Save the MPS file
-    mps_file = joinpath(master_path, filename)
-    write_to_file(master, mps_file)
-    
-    # Save extension data (iterations tracking, etc.)
-    extension_file = joinpath(master_path, replace(filename, ".mps" => "_extensions.jls"))
-    extension_data = Dict(
-        "y_raw" => master.ext[:y_raw],
-        "y_eval" => master.ext[:y_eval],
-        "y_core" => master.ext[:y_core],
-        "iter" => master.ext[:iter],
-        "gap" => master.ext[:gap],
-        "stabilization_lambda" => master.ext[:stabilization_lambda],
-        "stabilization_lambda_decr" => master.ext[:stabilization_lambda_decr],
-        "date_weights" => master.ext[:date_weights]
-    )
-    
-    serialize(extension_file, extension_data)
-    
-    println("[DEBUG] Master problem saved to $mps_file")
-    println("[DEBUG] Extensions saved to $extension_file")
-end
-
-function load_or_make_master_problem(simdir, data, date_weights; filename="master_problem.mps")
-    """
-    Load a previously saved master problem for warm-starting
-    """
-    master_path = joinpath(simdir, "master_models")
-    mps_file = joinpath(master_path, filename)
-    extension_file = joinpath(master_path, replace(filename, ".mps" => "_extensions.jls"))
-    
-    if !isfile(mps_file)
-        println("[DEBUG] No saved master problem found at $mps_file")
-        master, y, theta = define_master_ptdf(data, date_weights)
-        return master, y, theta
-    end
-    
-    # Read the model from file (this creates a new model)
-    optimizer = Gurobi.Optimizer
-    master = read_from_file(mps_file)
-    set_optimizer(master, optimizer)
-    
-    if !get(data["param"], "relaxed_first_stage", false)
-        set_optimizer_attribute(master, "MIPGap", data["param"]["mip_gap"])
-    end
-    
-    # Restore extension data
-    if isfile(extension_file)
-        extension_data = deserialize(extension_file)
-        master.ext[:y_raw] = extension_data["y_raw"]
-        master.ext[:y_eval] = extension_data["y_eval"]
-        master.ext[:y_core] = extension_data["y_core"]
-        master.ext[:iter] = extension_data["iter"]
-        master.ext[:gap] = extension_data["gap"]
-        master.ext[:stabilization_lambda] = extension_data["stabilization_lambda"]
-        master.ext[:stabilization_lambda_decr] = extension_data["stabilization_lambda_decr"]
-        master.ext[:date_weights] = extension_data["date_weights"]
-        println("[DEBUG] Restored extension data with $(length(extension_data["y_raw"])) previous iterations")
-    else
-        error("Loaded master JuMP model but missing master extension files")
-    end
-    
-    # Reconstruct variable references based on the loaded model
-    # This assumes the variable ordering is preserved
-    E = length(data["branch"])
-    N = length(data["bus"])
-    
-    # Get variable references from the loaded model
-    all_vars = all_variables(master)
-    
-    # Reconstruct gamma variables (first E variables)
-    gamma_vars = all_vars[1:E]
-    master[:gamma] = gamma_vars
-    
-    # Reconstruct s_power variables (next N variables)
-    s_power_vars = all_vars[E+1:E+N]
-    master[:s_power] = s_power_vars
-    
-    # Reconstruct s_energy variables (next N variables)
-    s_energy_vars = all_vars[E+N+1:E+2*N]
-    master[:s_energy] = s_energy_vars
-    
-    # Reconstruct theta variable (last variable)
-    theta_vars = all_vars[E+2*N+1:end]
-    master[:theta] = theta_vars
-    
-    y = (master[:gamma], master[:s_power], master[:s_energy])
-    
-    println("[DEBUG] Successfully loaded master problem from $mps_file")
-    return master, y, master[:theta]
-end
-
-function define_master_ptdf(data::Dict{String, Any}, date_weights::Dict{Int, Tuple{String, Float64}})
+function define_master_ptdf(superdir, master_data::Dict{String, Any}, date_weights::Dict{Int, Tuple{String, Float64}})
     # Initialize model
     optimizer = Gurobi.Optimizer
     master = JuMP.Model(optimizer)
     
-    if !get(data["param"], "relaxed_first_stage", false)
-        set_optimizer_attribute(master, "MIPGap", data["param"]["mip_gap"])
+    if !get(master_data["param"], "relaxed_first_stage", false)
+        set_optimizer_attribute(master, "MIPGap", master_data["param"]["mip_gap"])
     end
 
     # Initialize sets
-    R = data["param"]["num_representatives"]
-    N = length(data["bus"])
-    E = length(data["branch"])
-    T = data["param"]["num_hours"]
-    G = length(data["gen"])
-    K = data["param"]["num_cap_upgrades_max"]
+    RR = master_data["param"]["num_representatives"]
+    N = length(master_data["bus"])
+    E = length(master_data["branch"])
+    T = master_data["param"]["num_hours"]
+    G = length(master_data["gen"])
+    K = master_data["param"]["num_cap_upgrades_max"]
 
     # Create extension for tracking iterations of y_raw, y_eval, and y_core
     master.ext[:y_raw] = Vector{Vector{Vector{Float64}}}()
@@ -133,23 +34,19 @@ function define_master_ptdf(data::Dict{String, Any}, date_weights::Dict{Int, Tup
     master.ext[:date_weights] = date_weights
 
     # Get sets of branches with/without thermal limits
-    rate_a_zero, rate_a_nonzero = get_rate_a_zero(data)
+    rate_a_zero, rate_a_nonzero = get_rate_a_zero(master_data)
     rate_a_zero = Set(parse(Int, x) for x in rate_a_zero)
     rate_a_nonzero = Set(parse(Int, x) for x in rate_a_nonzero)
 
     # Pre-compute useful mappings that don't change during the solution process
-    gen_bus_map = Dict(parse(Int, g) => data["gen"]["$g"]["gen_bus"] for g in keys(data["gen"]))
-    
-    # Branch metadata
-    from_bus = Dict(parse(Int, a) => data["branch"]["$a"]["f_bus"] for a in keys(data["branch"]))
-    to_bus = Dict(parse(Int, a) => data["branch"]["$a"]["t_bus"] for a in keys(data["branch"]))
+    gen_bus_map = Dict(parse(Int, g) => master_data["gen"]["$g"]["gen_bus"] for g in keys(master_data["gen"]))
 
     #
     #   I. Variables
     #
 
     # investment level of capacity upgrade
-    if haskey(data["param"], "relaxed_first_stage") && data["param"]["relaxed_first_stage"] == true
+    if haskey(master_data["param"], "relaxed_first_stage") && master_data["param"]["relaxed_first_stage"] == true
         JuMP.@variable(master, 0 <= gamma[a=1:E] <= K)
     else
         JuMP.@variable(master, 0 <= gamma[a=1:E] <= K, Int)
@@ -165,17 +62,17 @@ function define_master_ptdf(data::Dict{String, Any}, date_weights::Dict{Int, Tup
     JuMP.@variable(master, s_energy[i=1:N] >= 0)
 
     # subproblem objective(s)
-    JuMP.@variable(master, theta[r=1:R] >= 0)
+    JuMP.@variable(master, theta[r=1:RR] >= 0)
 
     #
     #   II. Constraints
     #
-    candidate_branches = get_candidate_branches(data)
+    candidate_branches = get_candidate_branches(master_data)
     
     # Check if previous investments exist
-    if haskey(data["param"], "previous_investment_dir")
-        prev_dir = data["param"]["previous_investment_dir"]
-        add_prev_upgrades(master, data, gamma, s_energy, prev_dir, candidate_branches)
+    if haskey(master_data["param"], "previous_investment_dir")
+        prev_dir = master_data["param"]["previous_investment_dir"]
+        add_prev_upgrades(master, master_data, gamma, s_energy, prev_dir, candidate_branches)
     end
 
     # Separately, force non-candidates to zero
@@ -195,13 +92,13 @@ function define_master_ptdf(data::Dict{String, Any}, date_weights::Dict{Int, Tup
     # max energy rating
     JuMP.@constraint(master, 
         installed_energy_ub[i in 1:N],
-        s_energy[i] <= data["param"]["max_energy_rating"]
+        s_energy[i] <= master_data["param"]["max_energy_rating"]
     )
 
     # max power rating
     JuMP.@constraint(master, 
         installed_power_ub[i in 1:N],
-        s_power[i] <= data["param"]["max_power_rating"]
+        s_power[i] <= master_data["param"]["max_power_rating"]
     )
 
     # ensure that all storage is short-duration, i.e. can only store 4-hours worth of discharge
@@ -209,13 +106,341 @@ function define_master_ptdf(data::Dict{String, Any}, date_weights::Dict{Int, Tup
         short_duration[i in 1:N],
         s_energy[i] == 4.0 * s_power[i]
     )
+
+    embed_date = master_data["param"]["embed_date"]
+    simdir = joinpath(superdir, embed_date)
+
+    data, embed_obj_expr = embed_subproblem(master, simdir)
+    initialize_master_ptdf_tracked(master, simdir, data)
+
     #
     #   III. Objective
     #
-    # Is set in the Bender's loop
-    y = gamma, s_power, s_energy
+    obj_expr = (sum(s_power[i] * data["param"]["bess_power_cost"] + s_energy[i] * data["param"]["bess_energy_cost"] for i in 1:N) + 
+            sum(data["param"]["cap_upgrade_cost"] * data["param"]["cap_upgrade_increment"] * data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
+            sum(theta[r] * date_weights[r][2] for r in 1:RR))
 
+    embed_date_index = findfirst(r -> date_weights[r][1] == embed_date, 1:RR)
+    JuMP.@constraint(master, theta[embed_date_index] == embed_obj_expr)
+
+    JuMP.@objective(master, Min, obj_expr)
+    
+    y = gamma, s_power, s_energy
     return master, y, theta
+end
+
+function solve_master!(model, simdir, data)
+
+    # Initialize sets
+    R = data["param"]["num_representatives"]
+    N = length(data["bus"])
+    E = length(data["branch"])
+    T = data["param"]["num_hours"]
+    G = length(data["gen"])
+    K = data["param"]["num_cap_upgrades_max"]
+    gen_bus_map = Dict(parse(Int, g) => data["gen"]["$g"]["gen_bus"] for g in keys(data["gen"]))
+
+    
+    # Begin lazy PTDF loop
+    solved = false
+    niter = 0
+    t0 = time()
+
+    while !solved && niter < model.ext[:solve_metadata][:max_ptdf_iterations]
+        # Solve model
+        optimize!(model)
+        
+        # Exit if not solved optimally
+        st = termination_status(model)
+        st ∈ (MOI.OPTIMAL, MOI.LOCALLY_SOLVED) || break
+
+        # Get current solution values
+        pg_values = value.(model[:pg])
+        ue_values = value.(model[:ue])
+        ch_values = value.(model[:ch])
+        dis_values = value.(model[:dis])
+        gamma_values = value.(model[:gamma])
+        
+        # Compute all flows at once
+        flows = zeros(length(model.ext[:rate_a_nonzero]), R, T)
+        compute_flows!(flows, pg_values, ue_values, ch_values, dis_values, data, model.ext[:PTDF])
+
+        # Add violations prioritizing by size
+        violations = []
+        
+        # Keep track of all tracked combinations for this branch to avoid lookups
+        for a in model.ext[:rate_a_nonzero]
+            
+            # Pre-compute for this branch
+            ptdf_row = model.ext[:PTDF][a,:]
+            cap_increment = get_capacity_increment(data, a)
+            line_limit_base = data["branch"]["$a"]["rate_a"]
+            line_limit_fixed = line_limit_base + gamma_values[a] * cap_increment
+            
+            for r in 1:R, t in 1:T
+                flow_val = flows[a, r, t]
+                violation_amount = abs(flow_val) - line_limit_fixed
+                ub = (flow_val >= 0)
+
+                if get(model.ext[:tracked_constraints], (a, r, t, ub), false)
+                    continue
+                end
+        
+                if violation_amount > model.ext[:solve_metadata][:ptdf_tol]
+                    push!(violations, (a, r, t, ub, violation_amount))
+                end
+            end
+        end
+
+        sorted_violations = sort(violations, by = x -> -x[5])
+        n_violated = length(sorted_violations)
+        n_added = 0
+
+        # Add up to the limit
+        max_to_add = model.ext[:solve_metadata][:max_ptdf_per_iteration]
+        for (a, r, t, ub, _) in Iterators.take(sorted_violations, max_to_add)
+
+            ptdf_row = model.ext[:PTDF][a,:]
+            cap_increment = get_capacity_increment(data, a)
+            line_limit_base = data["branch"]["$a"]["rate_a"]
+            line_limit_expr = line_limit_base + model[:gamma][a] * cap_increment
+        
+            # Define the flow expression only once
+            flow_expr = sum(ptdf_row[i] * (
+                sum(model[:pg][r, g, t] for g in 1:G if gen_bus_map[g] == i; init=0.0)
+                - data["bus"]["$i"]["load"]["$r"][t]
+                + model[:ue][r, i, t] - model[:ch][r, i, t] + model[:dis][r, i, t]
+            ) for i in 1:N)
+        
+            # Add both constraints
+            if ub
+                model[:ptdf_flow]["$(a)_$(r)_$(t)_ub"] = @constraint(model, flow_expr <= line_limit_expr)
+            else
+                model[:ptdf_flow]["$(a)_$(r)_$(t)_lb"] = @constraint(model, flow_expr >= -line_limit_expr)
+            end
+        
+            model.ext[:tracked_constraints][(a, r, t, ub)] = true
+            n_added += 1
+        end
+
+        if n_added > 0
+            save_tracked_constraints(simdir, model, n_violated)
+        end
+        
+        solved = (n_violated == 0)
+        niter += 1
+        # println("approx. progress $(checked_count / E)")
+        println("Iteration $niter: Found $n_violated violations, added $n_added constraints")
+    end
+
+    # Record solve time
+    solve_time = time() - t0
+    model.ext[:solve_metadata][:solve_time] = solve_time
+
+    save_solve_time(simdir, solve_time)
+    save_power_injections(simdir, model, data)
+end
+
+function initialize_master_ptdf_tracked(model, simdir, data)
+    # Initialize sets
+    R = data["param"]["num_representatives"]
+    N = length(data["bus"])
+    E = length(data["branch"])
+    T = data["param"]["num_hours"]
+    G = length(data["gen"])
+    K = data["param"]["num_cap_upgrades_max"]
+    rate_a_zero, rate_a_nonzero = get_rate_a_zero(data)
+    gen_bus_map = Dict(parse(Int, g) => data["gen"]["$g"]["gen_bus"] for g in keys(data["gen"]))
+
+    # Set up model extensions for metadata
+    model.ext[:solve_metadata] = Dict(
+        :max_ptdf_iterations => 256,
+        :max_ptdf_per_iteration => 32,
+        :ptdf_tol => 1e-6
+    )
+    # Store PTDF matrix in model extension
+    model.ext[:PTDF] = do_all_ptdf(data)
+
+    if haskey(data["param"], "ptdf_cutoff") && data["param"]["ptdf_cutoff"] != false
+        ptdf_matrix = model.ext[:PTDF]
+        ptdf_sparse = map(abs, ptdf_matrix) .>= data["param"]["ptdf_cutoff"]  # retain only significant entries
+        ptdf_trimmed = ptdf_matrix .* ptdf_sparse  # zero out small ones
+        model.ext[:PTDF] = ptdf_trimmed
+    end
+
+    # Track which branches already have constraints
+    model.ext[:tracked_constraints] = Dict{Tuple{Int,Int,Int,Bool}, Bool}()
+
+    # Add container for flow constraints
+    model.ext[:rate_a_nonzero] = Set(parse(Int, x) for x in rate_a_nonzero)
+    model[:ptdf_flow] = Dict{String, ConstraintRef}()
+
+    # Optimized warm-start for PTDF with matrix operations
+    filename = joinpath(simdir, "output", "tracked_constraints.csv")
+    if isfile(filename) || isfile(joinpath(simdir, "tracked_constraints.csv"))
+        if isfile(filename)
+            tracked_df = CSV.read(filename, DataFrame)
+        else
+            tracked_df = CSV.read(joinpath(simdir, "tracked_constraints.csv"), DataFrame)
+        end
+        println("Beginning optimized warm-start process")
+        
+        # Group the constraints by arc once
+        arc_groups = groupby(tracked_df, :arc)
+        total_constraints = 0
+        
+        for group in arc_groups
+            a = first(group).arc
+            line_limit_base = data["branch"]["$a"]["rate_a"]
+            cap_increment = get_capacity_increment(data, a)
+            ptdf_row = model.ext[:PTDF][a,:]
+            
+            # Process constraints for this arc in batches
+            constraints_batch = collect(eachrow(group))
+            batch_size = length(constraints_batch)
+            total_constraints += batch_size
+            
+            # Extract all the (r,t) pairs for this arc
+            rep_time_pairs = [(cons.rep, cons.time, cons.ub) for cons in constraints_batch]
+            
+            # Pre-compute the line limits for all constraints in this group
+            line_limit = line_limit_base + model[:gamma][a] * cap_increment
+            
+            # Create a matrix expression for faster constraint generation
+            for (idx, (r, t, ub)) in enumerate(rep_time_pairs)
+                # Build the net injection vector for this (r,t) pair
+                # We can create this once and reuse it for both upper and lower bounds
+                # This is the vectorized equivalent of inner sum:
+                # sum(row[i] * (net_injection at bus i) for i in 1:N)
+                
+                # Define the constraint expression using matrix operations
+                flow_expr = sum(ptdf_row[i] * (
+                    sum(model[:pg][r,g,t] for g in 1:G if gen_bus_map[g] == i; init=0.0) -
+                    data["bus"]["$i"]["load"]["$r"][t] +
+                    model[:ue][r,i,t] -
+                    model[:ch][r,i,t] +
+                    model[:dis][r,i,t]
+                ) for i in 1:N)
+                
+                # Add constraint that should be added depending on ub (upper bound)
+                if ub
+                    model[:ptdf_flow]["$(a)_$(r)_$(t)_ub"] = @constraint(model, flow_expr <= line_limit)
+                else
+                    model[:ptdf_flow]["$(a)_$(r)_$(t)_lb"] = @constraint(model, flow_expr >= -line_limit)
+                end
+                
+                # Track the constraint
+                model.ext[:tracked_constraints][(a,r,t,ub)] = true
+            end
+            
+            # println("Progress: Cumulatively added $total_constraints constraints")
+        end
+        
+        println("Warm-started with $total_constraints constraints")
+    end
+end
+
+function embed_subproblem(model, simdir)
+    data = JSON.parsefile(joinpath(simdir, "data.json"))
+
+    # Initialize sets
+    R = data["param"]["num_representatives"]
+    N = length(data["bus"])
+    E = length(data["branch"])
+    T = data["param"]["num_hours"]
+    G = length(data["gen"])
+    K = data["param"]["num_cap_upgrades_max"]
+    rate_a_zero, rate_a_nonzero = get_rate_a_zero(data)
+    gen_bus_map = Dict(parse(Int, g) => data["gen"]["$g"]["gen_bus"] for g in keys(data["gen"]))
+
+    #
+    #   I. Variables
+    #
+
+    s_energy = model[:s_energy]
+    s_power = model[:s_power]
+    
+    # generator active dispatch
+    nonrenewable_generators = filter(g -> lowercase(data["gen"][g]["gen_type"]) ∉ data["param"]["renewable_types"], keys(data["gen"]))
+    JuMP.@variable(model, pg[r in 1:R, g in 1:G, t in 1:T])
+
+    for g in 1:G
+        gen = data["gen"]["$g"]
+        is_renewable = gen["gen_type"] ∈ data["param"]["renewable_types"]
+        is_foreign = gen["gen_type"]  ∈ ["foreign"]
+        if is_renewable
+            set_lower_bound.(pg[:, g, :], 0.0)
+            for r in 1:R, t in 1:T
+                set_upper_bound(pg[r, g, t], max(0, gen["profile"]["$r"][t]))
+            end
+        elseif is_foreign
+            for r in 1:R, t in 1:T
+                fix(pg[r, g, t], gen["profile"]["$r"][t])
+            end
+        else
+            set_lower_bound.(pg[:, g, :], gen["pmin"])
+            set_upper_bound.(pg[:, g, :], gen["pmax"])
+        end
+    end
+
+    JuMP.@variable(model, ue[r=1:R, i=1:N, t=1:T] >= 0) # under-served energy at bus
+    JuMP.@variable(model, soc[r=1:R, i=1:N, t=1:T] >= 0) # state of charge of storage
+    JuMP.@variable(model, ch[r=1:R, i=1:N, t=1:T] >= 0) # charging of storage
+    JuMP.@variable(model, dis[r=1:R, i=1:N, t=1:T] >= 0) # discharging of storage
+
+    # Add all non-PTDF constraints
+    # Global power balance
+    @constraint(model, 
+        power_balance[r in 1:R, t in 1:T],
+        sum(pg[r,g,t] for g in 1:G)
+        - sum(data["bus"]["$i"]["load"]["$r"][t] for i in 1:N)
+        + sum(ue[r,i,t] for i in 1:N) 
+        - sum(ch[r,i,t] for i in 1:N)
+        + sum(dis[r,i,t] for i in 1:N) 
+        == 0
+    )
+
+    # soc over time constraint
+    JuMP.@constraint(model, 
+        soc_over_time[r in 1:R, i in 1:N, t in 2:T],
+        soc[r,i,t] == soc[r,i,t-1] + ch[r,i,t] * data["param"]["bess_efficiency"] - dis[r,i,t] / data["param"]["bess_efficiency"]
+    )
+
+    # OPTIONAL: soc init and end constraint
+    JuMP.@constraint(model,
+        soc_start[r in 1:R, i in 1:N],
+        soc[r,i,1] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy[i] + ch[r,i,1] * data["param"]["bess_efficiency"] - dis[r,i,1] / data["param"]["bess_efficiency"]
+    )
+    JuMP.@constraint(model,
+        soc_end[r in 1:R, i in 1:N],
+        soc[r,i,T] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy[i]
+    )
+
+    # soc energy rating constraint
+    JuMP.@constraint(model, 
+        soc_energy_ub[r in 1:R, i in 1:N, t in 1:T],
+        soc[r,i,t] <= s_energy[i]
+    )
+
+    # charge/discharge must be constrained by power rating
+    JuMP.@constraint(model,
+        charge_discharge_lb[r in 1:R, i in 1:N, t in 1:T],
+        dis[r,i,t] <= s_power[i]
+    )
+    JuMP.@constraint(model,
+        charge_discharge_ub[r in 1:R, i in 1:N, t in 1:T],
+        ch[r,i,t] <= s_power[i]
+    )
+
+    operational_weight = get(data["param"], "operational_weight", 1)
+    embed_obj_expr = sum(sum(
+                    sum(compute_gen_cost(pg[r, g, t], data["gen"]["$g"]) for g in 1:G) +
+                    sum(data["param"]["under_served_penalty"] * ue[r, i, t] for i in 1:N) +
+                    sum(get(data["param"], "storage_operation_cost", 0.0) * (ch[r,i,t] + dis[r,i,t]) for i=1:N)
+                for t in 1:T)
+        for r in 1:R) * operational_weight
+
+    return data, embed_obj_expr
 end
 
 function update_master_objective!(superdir, master, data, y, theta)
