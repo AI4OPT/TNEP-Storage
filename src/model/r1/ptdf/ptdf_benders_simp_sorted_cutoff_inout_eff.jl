@@ -530,11 +530,15 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
 
         y_eval, y_core = compute_eval_core_points(master, data)
 
+        gamma_eval, s_power_eval, s_energy_eval = y_eval
+        export_investments_csv(data, gamma_eval, s_power_eval, s_energy_eval, output_dir=joinpath(simdir,"benders_output"), file_suffix="eval_$iter")
 
         # Solve core point subproblem to find the PTDF constraints
         # core_model, core_phi_val, core_duals, core_tracked_constraints = solve_subproblem_ptdf(simdir, y_core, data, tracked_constraints, logging="Core Point iter $iter")
+        # Solve raw point subproblem to find the PTDF constraints
+        raw_model, raw_phi_val, raw_duals, raw_tracked_constraints = solve_subproblem_ptdf(simdir, y_raw, data, tracked_constraints, logging="Raw Point iter $iter")
         # Solve subproblem with fixed investments
-        sub_model, phi_val, duals, eval_tracked_constraints = solve_subproblem_ptdf(simdir, y_eval, data, tracked_constraints, logging="Eval Point iter $iter")
+        sub_model, phi_val, duals, eval_tracked_constraints = solve_subproblem_ptdf(simdir, y_eval, data, raw_tracked_constraints, logging="Eval Point iter $iter")
 
         # Update tracked constraints
         tracked_constraints = eval_tracked_constraints
@@ -587,6 +591,7 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
             end
         else
             # Add new Benders cut to master problem
+            add_appropriate_cut(master, raw_model, data, theta, y, y_raw, y_core, raw_duals, raw_phi_val)
             add_appropriate_cut(master, sub_model, data, theta, y, y_eval, y_core, duals, phi_val)
         end
         
