@@ -82,6 +82,12 @@ function define_master_ptdf(data::Dict{String, Any})
     #   II. Constraints
     #    
 
+    # Check if previous investments exist
+    if haskey(data["param"], "previous_investment_dir")
+        prev_dir = data["param"]["previous_investment_dir"]
+        add_prev_upgrades(master, data, gamma, s_energy, prev_dir, nothing)
+    end
+
     # if rate a is zero (unlimited), then don't allow upgrades
     JuMP.@constraint(master, 
         rate_a_zero_line_upgrade[a in rate_a_zero],
@@ -465,8 +471,10 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptd
     if termination_status(sub) ∈ (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
         dual_gamma = [dual(master_gamma[a]) for a=1:E]
         dual_power = [dual(master_power[i]) for i=1:N]
+        dual_energy = [dual(master_energy[i]) for i=1:N]
         
-        duals = (dual_gamma, dual_power)
+        duals = (dual_gamma, dual_power, dual_energy)
+
         return sub, objective_value(sub), duals, sub.ext[:tracked_constraints]
     else
         error("Subproblem failed to solve optimally: $(termination_status(sub))")
@@ -476,18 +484,20 @@ end
 function add_benders_cut_ptdf(master, theta, duals, y, y_val, phi_val)
     # Unpack y variables and duals
     gamma, s_power, s_energy = y
-    dual_gamma, dual_power = duals
+    dual_gamma, dual_power, dual_energy = duals
     gamma_val, s_power_val, s_energy_val = y_val
 
     # Add Benders cut
     @constraint(master, 
         theta >= phi_val + 
         sum(dual_gamma[a] * (gamma[a] - gamma_val[a]) for a=1:length(gamma)) +
-        sum(dual_power[i] * (s_power[i] - s_power_val[i]) for i=1:length(s_power))
+        sum(dual_energy[i] * (s_energy[i] - s_energy_val[i]) for i=1:length(s_energy))
     )
 end
 
 function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=100000, tolerance=0.01)
+    max_iterations=100000
+    tolerance=0.01
     converged = false
     iter = master.ext[:iter]
     
@@ -536,9 +546,14 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
         # Solve core point subproblem to find the PTDF constraints
         # core_model, core_phi_val, core_duals, core_tracked_constraints = solve_subproblem_ptdf(simdir, y_core, data, tracked_constraints, logging="Core Point iter $iter")
         # Solve raw point subproblem to find the PTDF constraints
-        raw_model, raw_phi_val, raw_duals, raw_tracked_constraints = solve_subproblem_ptdf(simdir, y_raw, data, tracked_constraints, logging="Raw Point iter $iter")
+        raw_model, raw_phi_val, raw_duals, raw_tracked_constraints = nothing, nothing, nothing, nothing
+        raw_tracked_constraints = tracked_constraints
+        if iter > 100000000
+            raw_model, raw_phi_val, raw_duals, raw_tracked_constraints = solve_subproblem_ptdf(simdir, y_raw, data, tracked_constraints, logging="Raw Point iter $iter")
+        end
         # Solve subproblem with fixed investments
         sub_model, phi_val, duals, eval_tracked_constraints = solve_subproblem_ptdf(simdir, y_eval, data, raw_tracked_constraints, logging="Eval Point iter $iter")
+        # export_duals_csv(duals, iter)
 
         # Update tracked constraints
         tracked_constraints = eval_tracked_constraints
@@ -591,7 +606,9 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
             end
         else
             # Add new Benders cut to master problem
-            add_appropriate_cut(master, raw_model, data, theta, y, y_raw, y_core, raw_duals, raw_phi_val)
+            if raw_model !== nothing
+                add_appropriate_cut(master, raw_model, data, theta, y, y_raw, y_core, raw_duals, raw_phi_val)
+            end
             add_appropriate_cut(master, sub_model, data, theta, y, y_eval, y_core, duals, phi_val)
         end
         
@@ -713,4 +730,30 @@ function benders_ptdf_write_to_csv(filename, master_obj, theta_val, phi_val, y_v
         # New file, write with headers
         CSV.write(filename, df)
     end
+end
+
+function add_prev_upgrades(master, data, gamma, s_energy, prev_dir, candidate_branches=nothing; tolerance=1e-5)
+    E = length(data["branch"])
+    N = length(data["bus"])
+
+    trans_file = joinpath(prev_dir, "line_investments.csv")
+    storage_file = joinpath(prev_dir, "storage_investments.csv")
+    trans_df = CSV.read(trans_file, DataFrame)
+    storage_df = CSV.read(storage_file, DataFrame)
+
+    if candidate_branches !== nothing
+        valid_branches = [a for a in 1:E if (a in candidate_branches) && (trans_df[a, :Upgrade_Lvl] > tolerance)]
+    else
+        # Original behavior if no candidate set provided
+        valid_branches = [a for a in 1:E if trans_df[a, :Upgrade_Lvl] > tolerance]
+    end
+
+    @constraint(master,
+        old_gamma[a in valid_branches],
+        gamma[a] >= trans_df[a, :Upgrade_Lvl]
+    )
+    @constraint(master,
+        old_s_energy[i in 1:N, storage_df[i, :Storage_Energy] > tolerance],
+        s_energy[i] >= storage_df[i, :Storage_Energy]
+    )
 end

@@ -12,8 +12,8 @@ function compute_regularization_point(master, data)
         # Find the most recent eval point with gap < threshold
         for i in iter:-1:1  # Start from current iteration and go backwards
             if master.ext[:gap][i] < threshold
-                y_eval_selected = master.ext[:y_eval][i]
-                gamma_reg, s_power_reg, s_energy_reg = y_eval_selected
+                y_raw_selected = master.ext[:y_raw][i]
+                gamma_reg, s_power_reg, s_energy_reg = y_raw_selected
                 break
             end
         end
