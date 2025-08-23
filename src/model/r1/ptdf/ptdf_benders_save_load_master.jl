@@ -39,7 +39,8 @@ function load_master_problem(simdir, data; filename="master_problem.mps")
     mps_file = joinpath(master_path, filename)
     extension_file = joinpath(master_path, replace(filename, ".mps" => "_extensions.jls"))
     
-    if !isfile(mps_file)
+    # if !isfile(mps_file)
+    if true
         println("[DEBUG] No saved master problem found at $mps_file")
         master, y, theta = define_master_ptdf(data)
         return master, y, theta

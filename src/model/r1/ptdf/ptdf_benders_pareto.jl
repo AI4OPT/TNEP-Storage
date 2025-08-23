@@ -4,7 +4,7 @@ function compute_regularization_point(master, data)
     threshold, EXTREME_GAP = params
 
     # Compute the reg point
-    gamma_reg, s_power_reg, s_energy_reg = get_rep_day_core_point(data["param"]["core_point_simdir"])
+    gamma_reg, s_energy_reg = get_rep_day_core_point(data["param"]["core_point_simdir"])
 
     if !isempty(master.ext[:gap]) # i.e. iter > 0
         @assert length(master.ext[:y_eval]) == length(master.ext[:gap])
@@ -13,13 +13,13 @@ function compute_regularization_point(master, data)
         for i in iter:-1:1  # Start from current iteration and go backwards
             if master.ext[:gap][i] < threshold
                 y_raw_selected = master.ext[:y_raw][i]
-                gamma_reg, s_power_reg, s_energy_reg = y_raw_selected
+                gamma_reg, s_energy_reg = y_raw_selected
                 break
             end
         end
     end
 
-    return gamma_reg, s_power_reg, s_energy_reg
+    return gamma_reg, s_energy_reg
 end
 
 function get_stabilization_shift(master, data)
@@ -102,19 +102,17 @@ function compute_eval_core_points(master, data; trans_ratio=0.005, er_ratio=0.00
     # core point perturbations
     gamma_eps = trans_ratio * data["param"]["num_cap_upgrades_max"]
     s_energy_eps = er_ratio * data["param"]["max_energy_rating"]
-    s_power_eps =  s_energy_eps * 1/4
 
     y_core = nothing
     if iter == 0
         # Compute the core point
-        gamma_core, s_power_core, s_energy_core = get_rep_day_core_point(data["param"]["core_point_simdir"])
+        gamma_core, s_energy_core = get_rep_day_core_point(data["param"]["core_point_simdir"])
         gamma_core = Float64.(gamma_core)
     
         gamma_core = max.(gamma_core, gamma_eps)
-        s_power_core = max.(s_power_core, s_power_eps)
-        s_energy_core = 4.0 * s_power_core
+        s_energy_core = max.(s_energy_core, s_energy_eps)
 
-        y_core = [gamma_core, s_power_core, s_energy_core]
+        y_core = [gamma_core, s_energy_core]
         push!(master.ext[:y_core], y_core)
 
     else
@@ -166,7 +164,7 @@ function make_dual_subproblem(sub_model, data, y_eval)
     end
 
     # Unpack investment decisions
-    gamma_eval, s_power_eval, s_energy_eval = y_eval
+    gamma_eval, s_energy_eval = y_eval
 
     #
     #   I. Variables
@@ -258,33 +256,33 @@ function make_dual_subproblem(sub_model, data, y_eval)
     #
     #   III. Objective
     #
-    @objective(dual_sub_model, Max, build_dual_obj_expr(dual_sub_model, sub_model, data, gamma_eval, s_power_eval, s_energy_eval))
+    @objective(dual_sub_model, Max, build_dual_obj_expr(dual_sub_model, sub_model, data, gamma_eval, s_energy_eval))
 
     return dual_sub_model
 end
 
 function solve_for_pareto(dual_sub_model, sub_model, data, optimal_obj, y_eval, y_core)
     # Unpack the points
-    gamma_eval, s_power_eval, s_energy_eval = y_eval
-    gamma_core, s_power_core, s_energy_core = y_core
+    gamma_eval, s_energy_eval = y_eval
+    gamma_core, s_energy_core = y_core
 
     # Modify dual subproblem, add cut tightness constraint
     if haskey(data["param"], "cut_tightness") && data["param"]["cut_tightness"] == true
         eps = 1e-4 * abs(optimal_obj)
         @constraint(dual_sub_model,
             cut_tightness,
-            build_dual_obj_expr(dual_sub_model, sub_model, data, gamma_eval, s_power_eval, s_energy_eval) >= optimal_obj - eps
+            build_dual_obj_expr(dual_sub_model, sub_model, data, gamma_eval, s_energy_eval) >= optimal_obj - eps
         )
     end
 
     # Modify dual objective, to maximize violation at core point
-    @objective(dual_sub_model, Max, build_dual_obj_expr(dual_sub_model, sub_model, data, gamma_core, s_power_core, s_energy_core))
+    @objective(dual_sub_model, Max, build_dual_obj_expr(dual_sub_model, sub_model, data, gamma_core, s_energy_core))
     optimize!(dual_sub_model)
 
     return dual_sub_model
 end
 
-function build_dual_obj_expr(dual_sub_model, sub_model, data, gamma_vals, s_power_vals, s_energy_vals)
+function build_dual_obj_expr(dual_sub_model, sub_model, data, gamma_vals, s_energy_vals)
     # Initialize sets
     R = data["param"]["num_representatives"]
     N = length(data["bus"])

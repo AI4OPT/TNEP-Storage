@@ -84,12 +84,11 @@ function get_rep_day_core_point(simdir)
     storage_inv = CSV.read(storage_file, DataFrame)
 
     gamma_val = line_inv[:, :Upgrade_Lvl]
-    s_power_val = storage_inv[:, :Storage_Power]
     s_energy_val = storage_inv[:, :Storage_Energy]
 
     # You can round gamma if it's binary or discrete
     # gamma_val = round.(Int, gamma_val)
 
     # Return the core point
-    return gamma_val, s_power_val, s_energy_val
+    return gamma_val, s_energy_val
 end
