@@ -30,10 +30,11 @@ function define_master_ptdf(data::Dict{String, Any})
     G = length(data["gen"])
     K = data["param"]["num_cap_upgrades_max"]
 
-    # Create extension for tracking iterations of y_raw, y_eval, and y_core
-    master.ext[:y_raw] = Vector{Vector{Vector{Float64}}}()
-    master.ext[:y_eval] = Vector{Vector{Vector{Float64}}}()
-    master.ext[:y_core] = Vector{Vector{Vector{Float64}}}()
+    # Create extension for tracking iterations of y_trust
+    master.ext[:y_trust] = Vector{Vector{Vector{Float64}}}()
+    master.ext[:trust_transmission] = Vector{Float64}()
+    master.ext[:trust_sizing] = Vector{Float64}()
+    master.ext[:trust_siting] = Vector{Float64}()
 
     master.ext[:gap] = Vector{Float64}()
     master.ext[:stabilization_lambda] = Vector{Float64}()
@@ -78,15 +79,26 @@ function define_master_ptdf(data::Dict{String, Any})
     # subproblem objective(s)
     JuMP.@variable(master, theta >= 0)
 
+    # siting abs diff
+    JuMP.@variable(master, abs_diff[1:N] >= 0)
+
+    # sizing abs diff
+    JuMP.@variable(master, sizing_abs_diff >= 0)
+
+    # transmission abs diff
+    JuMP.@variable(master, trans_abs_diff[a=1:E] >= 0)
+
     #
     #   II. Constraints
     #    
 
     # Check if previous investments exist
+    """
     if haskey(data["param"], "previous_investment_dir")
         prev_dir = data["param"]["previous_investment_dir"]
         add_prev_upgrades(master, data, gamma, s_energy, prev_dir, nothing)
     end
+    """
 
     # if rate a is zero (unlimited), then don't allow upgrades
     JuMP.@constraint(master, 
@@ -114,13 +126,57 @@ function define_master_ptdf(data::Dict{String, Any})
     #
     #   III. Objective
     #
-    # Is set in the Bender's loop
+    obj_expr = sum(s_power[i] * data["param"]["bess_power_cost"] + s_energy[i] * data["param"]["bess_energy_cost"] for i in 1:N) + 
+            sum(data["param"]["cap_upgrade_cost"] * data["param"]["cap_upgrade_increment"] * data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
+            theta
+
+    # Update the objective    
+    JuMP.@objective(master, Min, obj_expr)
+    
     y = gamma, s_power, s_energy
 
     return master, y, theta
 end
 
-function update_master_objective!(master, data, y, theta)
+function remove_trust_region!(master)
+    # Remove the L1 Manhattan distance constraints (array of constraints)
+    JuMP.delete(master, abs_diff_ub)
+    JuMP.delete(master, abs_diff_lb)
+
+    # Remove the siting trust region constraint
+    JuMP.delete(master, siting_trust_region)
+
+    # Remove the sizing trust region constraints
+    JuMP.delete(master, sizing_abs_diff_ub)
+    JuMP.delete(master, sizing_abs_diff_lb)
+    JuMP.delete(master, sizing_trust_region)
+end
+
+function add_trust_region!(master, data)
+    # If first iteration, get the starting point
+    if master.ext[:iter] == 0
+        trans_ratio = get(data["param"], "trans_perturb_ratio", 0.005)
+        er_ratio = get(data["param"], "er_perturb_ratio", 0.0005)
+
+        # core point perturbations
+        gamma_eps = trans_ratio * data["param"]["num_cap_upgrades_max"]
+        s_energy_eps = er_ratio * data["param"]["max_energy_rating"]
+        s_power_eps =  s_energy_eps * 1/4
+
+        gamma_core, s_power_core, s_energy_core = get_rep_day_core_point(data["param"]["core_point_simdir"])
+        gamma_core = Float64.(gamma_core)
+    
+        gamma_core = max.(gamma_core, gamma_eps)
+        s_power_core = max.(s_power_core, s_power_eps)
+        s_energy_core = 4.0 * s_power_core
+
+        y_core = [gamma_core, s_power_core, s_energy_core]
+        push!(master.ext[:y_trust], y_core)
+        push!(master.ext[:trust_siting], 0.0)
+        push!(master.ext[:trust_sizing], 0.0)
+        push!(master.ext[:trust_transmission], 0.0)
+    end
+
     # Initialize sets
     R = data["param"]["num_representatives"]
     N = length(data["bus"])
@@ -129,27 +185,41 @@ function update_master_objective!(master, data, y, theta)
     G = length(data["gen"])
     K = data["param"]["num_cap_upgrades_max"]
 
-    #
-    #   III. Objective
-    #
-    gamma, s_power, s_energy = y
+    y_trust = master.ext[:y_trust][end]
+    gamma_trust, s_power_trust, s_energy_trust = y_trust
 
-    # Start with the base objective terms
-    obj_expr = sum(s_power[i] * data["param"]["bess_power_cost"] + s_energy[i] * data["param"]["bess_energy_cost"] for i in 1:N) + 
-            sum(data["param"]["cap_upgrade_cost"] * data["param"]["cap_upgrade_increment"] * data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
-            theta
+    gamma, s_power, s_energy = master[:gamma], master[:s_power], master[:s_energy]
+    abs_diff = master[:abs_diff]
+    sizing_abs_diff = master[:sizing_abs_diff]
+    trans_abs_diff = master[:trans_abs_diff]
 
-    # L2 (quadratic) regularization
-    if haskey(data["param"], "reg_penalty")
-        gamma_reg, s_power_reg, s_energy_reg = compute_regularization_point(master, data)
-        obj_expr += data["param"]["reg_penalty"] * sum((s_power[i] - s_power_reg[i])^2 for i in 1:N)
-        if haskey(data["param"], "trans_reg_penalty")
-            obj_expr += data["param"]["trans_reg_penalty"] * sum((gamma[a] - gamma_reg[a])^2 for a in 1:E)
-        end
-    end
+    # transmission trust region
+    JuMP.@constraint(master, 
+        trans_abs_diff_ub[a in 1:E],
+        trans_abs_diff[a] >= gamma[a] - gamma_trust[a])
+    JuMP.@constraint(master, 
+        trans_abs_diff_lb[a in 1:E],
+        trans_abs_diff[a] >= gamma_trust[a] - gamma[a])
+    JuMP.@constraint(master, transmission_trust_region, sum(trans_abs_diff[a] for a in 1:E) <= master.ext[:trust_transmission][end])
 
-    # Update the objective    
-    JuMP.@objective(master, Min, obj_expr)
+    # sizing trust region
+    JuMP.@constraint(master, 
+        abs_diff_ub[i in 1:N],
+        abs_diff[i] >= s_energy[i] - s_energy_trust[i])
+    JuMP.@constraint(master, 
+        abs_diff_lb[i in 1:N],
+        abs_diff[i] >= s_energy_trust[i] - s_energy[i])
+    JuMP.@constraint(master, siting_trust_region, sum(abs_diff[i] for i in 1:N) <= master.ext[:trust_siting][end])
+
+    # siting trust region
+    JuMP.@constraint(master, 
+        sizing_abs_diff_ub,
+        sizing_abs_diff >= sum(s_energy[i] for i in 1:N) - sum(s_energy_trust[i] for i in 1:N))
+    JuMP.@constraint(master, 
+        sizing_abs_diff_lb,
+        sizing_abs_diff >= sum(s_energy[i] for i in 1:N) - sum(s_energy_trust[i] for i in 1:N))
+    JuMP.@constraint(master, sizing_trust_region, sizing_abs_diff <= master.ext[:trust_sizing][end])
+    
 end
 
 function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptdf_iterations=256, max_ptdf_per_iteration=32, ptdf_tol=1e-6, logging=nothing)
@@ -242,7 +312,6 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptd
 
     # Fix investment variables based on master problem decisions
     @variable(sub, gamma[a=1:E])
-    @variable(sub, s_power[i=1:N])
     @variable(sub, s_energy[i=1:N])
 
     #
@@ -251,7 +320,7 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptd
 
     # FIX INVESTMENT DECISIONS FROM MASTER PROBLEM (DUALS USED FOR CUTS)
     @constraint(sub, master_gamma[a=1:E], gamma[a] == gamma_val[a])
-    @constraint(sub, master_power[i=1:N], s_power[i] == s_power_val[i])
+    # @constraint(sub, master_power[i=1:N], s_power[i] == s_power_val[i])
     @constraint(sub, master_energy[i=1:N], s_energy[i] == s_energy_val[i])
 
     # Global power balance
@@ -292,11 +361,11 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptd
     # Charging/discharging limits
     @constraint(sub,
         charge_discharge_lb[r=1:R, i=1:N, t=1:T],
-        dis[r,i,t] <= s_power[i]
+        dis[r,i,t] <= s_energy[i] / 4
     )
     @constraint(sub,
         charge_discharge_ub[r=1:R, i=1:N, t=1:T],
-        ch[r,i,t] <= s_power[i]
+        ch[r,i,t] <= s_energy[i] / 4
     )
 
     # Objective function
@@ -470,10 +539,10 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptd
     # Note: Ensure the model is solved to optimality before extracting duals
     if termination_status(sub) ∈ (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
         dual_gamma = [dual(master_gamma[a]) for a=1:E]
-        dual_power = [dual(master_power[i]) for i=1:N]
+        # dual_power = [dual(master_power[i]) for i=1:N]
         dual_energy = [dual(master_energy[i]) for i=1:N]
         
-        duals = (dual_gamma, dual_power, dual_energy)
+        duals = (dual_gamma, dual_energy)
 
         return sub, objective_value(sub), duals, sub.ext[:tracked_constraints]
     else
@@ -484,7 +553,7 @@ end
 function add_benders_cut_ptdf(master, theta, duals, y, y_val, phi_val)
     # Unpack y variables and duals
     gamma, s_power, s_energy = y
-    dual_gamma, dual_power, dual_energy = duals
+    dual_gamma, dual_energy = duals
     gamma_val, s_power_val, s_energy_val = y_val
 
     # Add Benders cut
@@ -522,44 +591,35 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
     while !converged && iter < max_iterations
         # Solve master problem
         println("[DEBUG] Solving master problem: iteration $iter")
-        update_master_objective!(master, data, y, theta)
-        optimize!(master)
-        
-        if !has_values(master)
-            error("Master problem has no solution: $(termination_status(master))")
+        if iter > 0
+            remove_trust_region!(master)
         end
-        
+        optimize!(master)
+        master_obj_lb = objective_value(master) 
+
+        add_trust_region!(master, data)
+        optimize!(master)
+
         # Get master solution
         gamma_val = value.(gamma)
         s_power_val = value.(s_power)
         s_energy_val = value.(s_energy)
         theta_val = value(theta)
-        y_raw = [gamma_val, s_power_val, s_energy_val]
-        push!(master.ext[:y_raw], y_raw)
+        y_val = [gamma_val, s_power_val, s_energy_val]
         export_investments_csv(data, gamma_val, s_power_val, s_energy_val, output_dir=joinpath(simdir,"benders_output"), file_suffix="$iter")
 
-        y_eval, y_core = compute_eval_core_points(master, data)
-
-        gamma_eval, s_power_eval, s_energy_eval = y_eval
-        export_investments_csv(data, gamma_eval, s_power_eval, s_energy_eval, output_dir=joinpath(simdir,"benders_output"), file_suffix="eval_$iter")
-
-        # Solve core point subproblem to find the PTDF constraints
-        # core_model, core_phi_val, core_duals, core_tracked_constraints = solve_subproblem_ptdf(simdir, y_core, data, tracked_constraints, logging="Core Point iter $iter")
-        # Solve raw point subproblem to find the PTDF constraints
-        raw_model, raw_phi_val, raw_duals, raw_tracked_constraints = nothing, nothing, nothing, nothing
-        raw_tracked_constraints = tracked_constraints
-        if iter > 100000000
-            raw_model, raw_phi_val, raw_duals, raw_tracked_constraints = solve_subproblem_ptdf(simdir, y_raw, data, tracked_constraints, logging="Raw Point iter $iter")
-        end
         # Solve subproblem with fixed investments
-        sub_model, phi_val, duals, eval_tracked_constraints = solve_subproblem_ptdf(simdir, y_eval, data, raw_tracked_constraints, logging="Eval Point iter $iter")
+        sub_model, phi_val, duals, new_tracked_constraints = solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints, logging="Eval Point iter $iter")
         # export_duals_csv(duals, iter)
 
         # Update tracked constraints
-        tracked_constraints = eval_tracked_constraints
+        tracked_constraints = new_tracked_constraints
 
         # Save progress to CSV
         filename = joinpath(simdir, "output", "benders_progress.csv")
+
+        # TODO: update the logging, define the trust region expansion behavior
+
         # The benders log will show the perturbed / stabilized point
         lambda_val = master.ext[:stabilization_lambda][end]
         benders_ptdf_write_to_csv(filename, objective_value(master), theta_val, phi_val, y_eval, lambda_val=lambda_val)
@@ -756,4 +816,8 @@ function add_prev_upgrades(master, data, gamma, s_energy, prev_dir, candidate_br
         old_s_energy[i in 1:N, storage_df[i, :Storage_Energy] > tolerance],
         s_energy[i] >= storage_df[i, :Storage_Energy]
     )
+end
+
+function export_duals_csv(duals, iter)
+    return
 end
