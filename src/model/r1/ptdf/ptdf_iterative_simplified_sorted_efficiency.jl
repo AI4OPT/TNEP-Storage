@@ -266,7 +266,7 @@ function create_base_model(data::Dict{String, Any}, optimizer)
     
     JuMP.@variable(model, ue[r=1:R, i=1:N, t=1:T] >= 0) # under-served energy at bus
     # JuMP.@variable(model, pf[r=1:R, a=1:E, t=1:T]) # branch flows
-    JuMP.@variable(model, s_power[i=1:N] >= 0) # power rating of storage
+    # JuMP.@variable(model, s_power[i=1:N] >= 0) # power rating of storage
     JuMP.@variable(model, s_energy[i=1:N] >= 0) # energy rating of storage
     JuMP.@variable(model, soc[r=1:R, i=1:N, t=1:T] >= 0) # state of charge of storage
     JuMP.@variable(model, ch[r=1:R, i=1:N, t=1:T] >= 0) # charging of storage
@@ -319,32 +319,20 @@ function create_base_model(data::Dict{String, Any}, optimizer)
         soc[r,i,t] <= s_energy[i]
     )
 
-    # ensure that all storage is short-duration, i.e. can only store 4-hours worth of discharge
-    JuMP.@constraint(model, 
-        short_duration[i in 1:N],
-        s_energy[i] == 4.0 * s_power[i]
-    )
-
     # energy rating only if storage installed
     JuMP.@constraint(model, 
         installed_energy_ub[i in 1:N],
         s_energy[i] <= data["param"]["max_energy_rating"]
     )
 
-    # power rating only if storage installed
-    JuMP.@constraint(model, 
-        installed_power_ub[i in 1:N],
-        s_power[i] <= data["param"]["max_power_rating"]
-    )
-
     # charge/discharge must be constrained by power rating
     JuMP.@constraint(model,
         charge_discharge_lb[r in 1:R, i in 1:N, t in 1:T],
-        dis[r,i,t] <= s_power[i]
+        dis[r,i,t] <= s_energy[i] / 4
     )
     JuMP.@constraint(model,
         charge_discharge_ub[r in 1:R, i in 1:N, t in 1:T],
-        ch[r,i,t] <= s_power[i]
+        ch[r,i,t] <= s_energy[i] / 4
     )
 
     # OPTIONAL: precompute maximum nodal injections
@@ -384,7 +372,7 @@ function create_base_model(data::Dict{String, Any}, optimizer)
     # Objective
     operational_weight = get(data["param"], "operational_weight", 1)
     @objective(model, Min,
-        sum(s_power[i] * data["param"]["bess_power_cost"] + s_energy[i] * data["param"]["bess_energy_cost"] for i in 1:N) +
+        sum(s_energy[i] * data["param"]["bess_energy_cost"] for i in 1:N) +
         sum(data["param"]["cap_upgrade_cost"] * get_capacity_increment(data, a) * data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
         sum(
             data["param"]["representative_prob"][r] *

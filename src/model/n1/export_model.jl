@@ -174,40 +174,48 @@ function export_energy_csv(simdir, model, data, rep_index)
     CSV.write(joinpath(simdir, "output", datestring, "energy.csv"), df_energy)
 end
 
-function export_investments_csv(data, gammas, s_powers, s_energys; 
-    output_dir="output", 
+function export_investments_csv(data, gammas, s_energys;
+    s_powers=nothing,
+    output_dir="output",
     file_suffix="")
-
+    
     # Create the output directory if it doesn't exist
     mkpath(output_dir)
-
+    
     # Construct filenames with optional suffix
     lines_filename = isempty(file_suffix) ? "line_investments.csv" : "line_investments_$(file_suffix).csv"
     storage_filename = isempty(file_suffix) ? "storage_investments.csv" : "storage_investments_$(file_suffix).csv"
-
+    
     df_lines = DataFrame(
-    Branch_Index = ["$i" for i in 1:length(data["branch"])],
-    Lat1 = [data["bus"][string(data["branch"]["$i"]["f_bus"])]["lat"] for i in 1:length(data["branch"])],
-    Lon1 = [data["bus"][string(data["branch"]["$i"]["f_bus"])]["lon"] for i in 1:length(data["branch"])],
-    Lat2 = [data["bus"][string(data["branch"]["$i"]["t_bus"])]["lat"] for i in 1:length(data["branch"])],
-    Lon2 = [data["bus"][string(data["branch"]["$i"]["t_bus"])]["lon"] for i in 1:length(data["branch"])],
-    Rate_A = [data["branch"]["$i"]["rate_a"] for i in 1:length(data["branch"])],
-    Upgrade_Lvl = [gammas[i] for i in 1:length(data["branch"])]
+        Branch_Index = ["$i" for i in 1:length(data["branch"])],
+        Lat1 = [data["bus"][string(data["branch"]["$i"]["f_bus"])]["lat"] for i in 1:length(data["branch"])],
+        Lon1 = [data["bus"][string(data["branch"]["$i"]["f_bus"])]["lon"] for i in 1:length(data["branch"])],
+        Lat2 = [data["bus"][string(data["branch"]["$i"]["t_bus"])]["lat"] for i in 1:length(data["branch"])],
+        Lon2 = [data["bus"][string(data["branch"]["$i"]["t_bus"])]["lon"] for i in 1:length(data["branch"])],
+        Rate_A = [data["branch"]["$i"]["rate_a"] for i in 1:length(data["branch"])],
+        Upgrade_Lvl = [gammas[i] for i in 1:length(data["branch"])]
     )
-
+    
     # DON'T ROUND THE LINES ANYMORE
     # df_lines = round_df(df_lines)
     CSV.write(joinpath(output_dir, lines_filename), df_lines)
-
-    df_storage = DataFrame(
-    Node_Index = ["$i" for i in 1:length(data["bus"])],
-    Node_Name = [data["bus"]["$i"]["bus_name"] for i in 1:length(data["bus"])],
-    Lat = [data["bus"]["$i"]["lat"] for i in 1:length(data["bus"])],
-    Lon = [data["bus"]["$i"]["lon"] for i in 1:length(data["bus"])],
-    Storage_Power = [s_powers[i] for i in 1:length(data["bus"])],
-    Storage_Energy = [s_energys[i] for i in 1:length(data["bus"])]
+    
+    # Create storage DataFrame - only include Storage_Power column if s_powers is provided
+    df_storage_dict = Dict(
+        :Node_Index => ["$i" for i in 1:length(data["bus"])],
+        :Node_Name => [data["bus"]["$i"]["bus_name"] for i in 1:length(data["bus"])],
+        :Lat => [data["bus"]["$i"]["lat"] for i in 1:length(data["bus"])],
+        :Lon => [data["bus"]["$i"]["lon"] for i in 1:length(data["bus"])],
+        :Storage_Energy => [s_energys[i] for i in 1:length(data["bus"])]
     )
-
+    
+    # Add Storage_Power column only if s_powers is provided
+    if s_powers !== nothing
+        df_storage_dict[:Storage_Power] = [s_powers[i] for i in 1:length(data["bus"])]
+    end
+    
+    df_storage = DataFrame(df_storage_dict)
+    
     # DON'T ROUND THE STORAGE
     # df_storage = round_df(df_storage)
     CSV.write(joinpath(output_dir, storage_filename), df_storage)
@@ -278,8 +286,16 @@ function export_flow(simdir, model, data, rep_index)
 end
 
 function export_model(simdir, model, data)
-    export_investments_csv(data, value.(model[:gamma]), value.(model[:s_power]), value.(model[:s_energy]), output_dir=joinpath(simdir, "output"))
-
+    # Check if s_power exists in the model and call export_investments_csv accordingly
+    if haskey(model, :s_power)
+        export_investments_csv(data, value.(model[:gamma]), value.(model[:s_energy]), 
+                              s_powers=value.(model[:s_power]), 
+                              output_dir=joinpath(simdir, "output"))
+    else
+        export_investments_csv(data, value.(model[:gamma]), value.(model[:s_energy]), 
+                              output_dir=joinpath(simdir, "output"))
+    end
+    
     for rep_index in 1:length(data["param"]["dates"])
         export_energy_csv(simdir, model, data, rep_index)
         export_flow(simdir, model, data, rep_index)

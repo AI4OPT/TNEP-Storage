@@ -22,12 +22,10 @@ function write_summary_to_csv(simdir, model, data)
     line_investment_costs = sum(data["param"]["cap_upgrade_cost"] * data["param"]["cap_upgrade_increment"] * data["branch"]["$a"]["distance"] * col_data[a] for a in 1:E)
 
     # Get storage investment costs
-    power_data = df_storage_investments[!, :Storage_Power]
     energy_data = df_storage_investments[!, :Storage_Energy]
     N = length(energy_data)
     storage_investment_costs = (
-        sum(power_data[i] * data["param"]["bess_power_cost"] 
-        + energy_data[i] * data["param"]["bess_energy_cost"] for i in 1:N) 
+        sum(energy_data[i] * data["param"]["bess_energy_cost"] for i in 1:N) 
         + num_storage_investments * data["param"]["storage_fixed_cost"]
     )
 
