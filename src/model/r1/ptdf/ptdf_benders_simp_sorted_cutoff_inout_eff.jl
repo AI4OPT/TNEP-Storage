@@ -60,17 +60,13 @@ function define_master_ptdf(data::Dict{String, Any})
     #
 
     # investment level of capacity upgrade
-    if haskey(data["param"], "relaxed_first_stage") && data["param"]["relaxed_first_stage"] == true
-        JuMP.@variable(master, 0 <= gamma[a=1:E] <= K)
-    else
-        JuMP.@variable(master, 0 <= gamma[a=1:E] <= K, Int)
-    end
+    JuMP.@variable(master, 0 <= gamma[a=1:E] <= K, Int)
 
     # binary variable for installation of storage
     # JuMP.@variable(master, sigma[i=1:N], Bin)
 
     # energy rating of storage
-    JuMP.@variable(master, s_energy[i=1:N] >= 0)
+    JuMP.@variable(master, s_energy_int[i=1:N] >= 0, Int)
 
     # subproblem objective(s)
     JuMP.@variable(master, theta >= 0)
@@ -94,14 +90,14 @@ function define_master_ptdf(data::Dict{String, Any})
     # energy rating only if storage installed
     JuMP.@constraint(master, 
         installed_energy_ub[i in 1:N],
-        s_energy[i] <= data["param"]["max_energy_rating"]
+        s_energy_int[i] * data["param"]["storage_energy_size"] <= data["param"]["max_energy_rating"]
     )
 
     #
     #   III. Objective
     #
     # Is set in the Bender's loop
-    y = gamma, s_energy
+    y = gamma, s_energy_int
 
     return master, y, theta
 end
@@ -118,10 +114,10 @@ function update_master_objective!(master, data, y, theta)
     #
     #   III. Objective
     #
-    gamma, s_energy = y
+    gamma, s_energy_int = y
 
     # Start with the base objective terms
-    obj_expr = sum(s_energy[i] * data["param"]["bess_energy_cost"] for i in 1:N) + 
+    obj_expr = sum(s_energy_int[i] * data["param"]["storage_energy_size"] * data["param"]["bess_energy_cost"] for i in 1:N) + 
             sum(data["param"]["cap_upgrade_cost"] * data["param"]["cap_upgrade_increment"] * data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
             theta
 
@@ -136,7 +132,7 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptd
     end
 
     # unpack investment decisions
-    gamma_val, s_energy_val = y_val
+    gamma_val, s_energy_int_val = y_val
 
     # Initialize sets
     R = data["param"]["num_representatives"]
@@ -221,7 +217,7 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptd
 
     # Fix investment variables based on master problem decisions
     @variable(sub, gamma[a=1:E])
-    @variable(sub, s_energy[i=1:N])
+    @variable(sub, s_energy_int[i=1:N])
 
     #
     #   II. Constraints
@@ -229,7 +225,7 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptd
 
     # FIX INVESTMENT DECISIONS FROM MASTER PROBLEM (DUALS USED FOR CUTS)
     @constraint(sub, master_gamma[a=1:E], gamma[a] == gamma_val[a])
-    @constraint(sub, master_energy[i=1:N], s_energy[i] == s_energy_val[i])
+    @constraint(sub, master_energy[i=1:N], s_energy_int[i] == s_energy_int_val[i])
 
     # Global power balance
     @constraint(sub, 
@@ -253,27 +249,27 @@ function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptd
     # Initial and final SOC
     @constraint(sub,
         soc_start[r=1:R, i=1:N],
-        soc[r,i,1] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy[i] + ch[r,i,1] * data["param"]["bess_efficiency"] - dis[r,i,1] / data["param"]["bess_efficiency"]
+        soc[r,i,1] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy_int[i] * data["param"]["storage_energy_size"] + ch[r,i,1] * data["param"]["bess_efficiency"] - dis[r,i,1] / data["param"]["bess_efficiency"]
     )
     @constraint(sub,
         soc_end[r=1:R, i=1:N],
-        soc[r,i,T] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy[i]
+        soc[r,i,T] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy_int[i] * data["param"]["storage_energy_size"]
     )
 
     # SOC limits
     @constraint(sub, 
         soc_energy_ub[r=1:R, i=1:N, t=1:T],
-        soc[r,i,t] <= s_energy[i]
+        soc[r,i,t] <= s_energy_int[i] * data["param"]["storage_energy_size"]
     )
     
     # Charging/discharging limits
     @constraint(sub,
         charge_discharge_lb[r=1:R, i=1:N, t=1:T],
-        dis[r,i,t] <= s_energy[i] / 4
+        dis[r,i,t] <= s_energy_int[i] * data["param"]["storage_energy_size"] / 4
     )
     @constraint(sub,
         charge_discharge_ub[r=1:R, i=1:N, t=1:T],
-        ch[r,i,t] <= s_energy[i] / 4
+        ch[r,i,t] <= s_energy_int[i] * data["param"]["storage_energy_size"] / 4
     )
 
     # Objective function
@@ -459,15 +455,15 @@ end
 
 function add_benders_cut_ptdf(master, theta, duals, y, y_val, phi_val)
     # Unpack y variables and duals
-    gamma, s_energy = y
+    gamma, s_energy_int = y
     dual_gamma, dual_energy = duals
-    gamma_val, s_energy_val = y_val
+    gamma_val, s_energy_int_val = y_val
 
     # Add Benders cut
     @constraint(master, 
         theta >= phi_val + 
         sum(dual_gamma[a] * (gamma[a] - gamma_val[a]) for a=1:length(gamma)) +
-        sum(dual_energy[i] * (s_energy[i] - s_energy_val[i]) for i=1:length(s_energy))
+        sum(dual_energy[i] * (s_energy_int[i] - s_energy_int_val[i]) for i=1:length(s_energy_int))
     )
 end
 
@@ -478,7 +474,7 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
     iter = master.ext[:iter]
     
     # Unpack y variables
-    gamma, s_energy = y
+    gamma, s_energy_int = y
 
     # Initialize tracked constraints dictionary to store across iterations
     tracked_constraints = Dict{Tuple{Int,Int,Int,Bool}, Bool}()
@@ -507,16 +503,16 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
         
         # Get master solution
         gamma_val = value.(gamma)
-        s_energy_val = value.(s_energy)
+        s_energy_int_val = value.(s_energy_int)
         theta_val = value(theta)
-        y_raw = [gamma_val, s_energy_val]
+        y_raw = [gamma_val, s_energy_int_val]
         push!(master.ext[:y_raw], y_raw)
-        export_investments_csv(data, gamma_val, s_energy_val, output_dir=joinpath(simdir,"benders_output"), file_suffix="$iter")
+        export_investments_csv(data, gamma_val, s_energy_int_val, output_dir=joinpath(simdir,"benders_output"), file_suffix="$iter")
 
         y_eval, y_core = compute_eval_core_points(master, data)
 
-        gamma_eval, s_energy_eval = y_eval
-        export_investments_csv(data, gamma_eval, s_energy_eval, output_dir=joinpath(simdir,"benders_output"), file_suffix="eval_$iter")
+        gamma_eval, s_energy_int_eval = y_eval
+        export_investments_csv(data, gamma_eval, s_energy_int_eval, output_dir=joinpath(simdir,"benders_output"), file_suffix="eval_$iter")
 
         # Solve core point subproblem to find the PTDF constraints
         # core_model, core_phi_val, core_duals, core_tracked_constraints = solve_subproblem_ptdf(simdir, y_core, data, tracked_constraints, logging="Core Point iter $iter")
@@ -546,39 +542,7 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
 
         # if gap < tolerance
         if false
-            # println("[DEBUG] Convergence detected with stabilized solution. Performing final cut check at discrete solution...")
-            println("[DEBUG] Convergence detected...")
-
-            """
-            # Add new Benders cut to master problem
-            add_appropriate_cut(master, sub_model, data, theta, y, y_eval, y_core, duals, phi_val)
-            optimize!(master)
-        
-            # Get updated unstabilized master solution
-            gamma_val = value.(gamma)
-            s_power_val = value.(s_power)
-            s_energy_val = value.(s_energy)
-            theta_val = value(theta)
-        
-            # Final subproblem solve at discrete solution
-            y_final = [gamma_val, s_power_val, s_energy_val]
-            _, final_phi_val, final_duals, final_tracked_constraints = solve_subproblem_ptdf(simdir, y_final, data, tracked_constraints)
-            tracked_constraints = final_tracked_constraints
-        
-            # Save progress to CSV
-            filename = joinpath(simdir, "output", "benders_progress.csv")
-            benders_ptdf_write_to_csv(filename, objective_value(master), theta_val, final_phi_val, y_final)
-        
-            final_gap = abs(theta_val - final_phi_val) / (1e-10 + abs(final_phi_val))"""
-            final_gap = gap
-        
-            if final_gap < tolerance
-                println("[DEBUG] Final gap at discrete solution = $(final_gap) < $(tolerance). Converged after $(iter+1) iterations.")
-                converged = true
-            else
-                # If still not converged, add another cut and continue
-                add_appropriate_cut(master, sub_model, data, theta, y, y_eval, y_core, duals, phi_val)
-            end
+            return
         else
             # Add new Benders cut to master problem
             if raw_model !== nothing
@@ -598,7 +562,7 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
     end
     
     # Return final solution
-    return [gamma_val, s_energy_val]
+    return [gamma_val, s_energy_int_val]
 end
 
 # Helper function to add the appropriate cut
@@ -632,10 +596,10 @@ function benders_ptdf_solve(simdir)
     master, y, theta = load_master_problem(simdir, data)
     
     # Get optimal solution through Benders iterations
-    gamma_val, s_energy_val = benders_iteration_ptdf(simdir, master, y, theta, data)
+    gamma_val, s_energy_int_val = benders_iteration_ptdf(simdir, master, y, theta, data)
     
     # Save final solution
-    save_investment_results(simdir, gamma_val, s_energy_val)
+    save_investment_results(simdir, gamma_val, s_energy_val * data["param"]["storage_energy_size"])
     
     return objective_value(master)
 end
