@@ -30,10 +30,11 @@ function define_master_ptdf(data::Dict{String, Any})
     G = length(data["gen"])
     K = data["param"]["num_cap_upgrades_max"]
 
-    # Create extension for tracking iterations of y_raw, y_eval, and y_core
-    master.ext[:y_raw] = Vector{Vector{Vector{Float64}}}()
-    master.ext[:y_eval] = Vector{Vector{Vector{Float64}}}()
-    master.ext[:y_core] = Vector{Vector{Vector{Float64}}}()
+    # Create extension for tracking iterations of y_trust
+    master.ext[:y_trust] = Vector{Vector{Vector{Float64}}}()
+    master.ext[:trust_transmission] = Vector{Float64}()
+    master.ext[:trust_sizing] = Vector{Float64}()
+    master.ext[:trust_siting] = Vector{Float64}()
 
     master.ext[:gap] = Vector{Float64}()
     master.ext[:stabilization_lambda] = Vector{Float64}()
@@ -71,15 +72,26 @@ function define_master_ptdf(data::Dict{String, Any})
     # subproblem objective(s)
     JuMP.@variable(master, theta >= 0)
 
+    # siting abs diff
+    JuMP.@variable(master, abs_diff[1:N] >= 0)
+
+    # sizing abs diff
+    JuMP.@variable(master, sizing_abs_diff >= 0)
+
+    # transmission abs diff
+    JuMP.@variable(master, trans_abs_diff[a=1:E] >= 0)
+
     #
     #   II. Constraints
     #    
 
+    """
     # Check if previous investments exist
     if haskey(data["param"], "previous_investment_dir")
         prev_dir = data["param"]["previous_investment_dir"]
         add_prev_upgrades(master, data, gamma, s_energy, prev_dir, nothing)
     end
+    """
 
     # if rate a is zero (unlimited), then don't allow upgrades
     JuMP.@constraint(master, 
@@ -96,13 +108,63 @@ function define_master_ptdf(data::Dict{String, Any})
     #
     #   III. Objective
     #
-    # Is set in the Bender's loop
+    # Start with the base objective terms
+    obj_expr = sum(s_energy_int[i] * data["param"]["storage_energy_size"] * data["param"]["bess_energy_cost"] for i in 1:N) + 
+            sum(data["param"]["cap_upgrade_cost"] * data["param"]["cap_upgrade_increment"] * data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
+            theta
     y = gamma, s_energy_int
+
+    # Update the objective    
+    JuMP.@objective(master, Min, obj_expr)
 
     return master, y, theta
 end
 
-function update_master_objective!(master, data, y, theta)
+function remove_trust_region!(master)
+    constraint_names = [
+        :trans_abs_diff_ub, :trans_abs_diff_lb, :transmission_trust_region,
+        :abs_diff_ub, :abs_diff_lb, :siting_trust_region,
+        :sizing_abs_diff_ub, :sizing_abs_diff_lb, :sizing_trust_region
+    ]
+    
+    obj_dict = object_dictionary(master)
+    
+    for name in constraint_names
+        if haskey(obj_dict, name)
+            try
+                constraint_obj = obj_dict[name]
+                
+                # JuMP.delete works on both single constraints and arrays
+                JuMP.delete(master, constraint_obj)
+                JuMP.unregister(master, name)
+                println("Removed constraint: $name")
+                
+            catch e
+                println("Warning: Could not remove $name: $e")
+                # Force unregister
+                try
+                    JuMP.unregister(master, name)
+                catch
+                end
+            end
+        else
+            println("Constraint $name not found in model")
+        end
+    end
+end
+
+function add_trust_region!(master, data)
+    # If first iteration, get the starting point
+    if master.ext[:iter] == 0
+        # TODO: write new over-invested core function
+        gamma_core, s_energy_int_core = get_over_invested_point(data["param"]["core_point_simdir"], data)
+        y_core = [gamma_core, s_energy_int_core]
+        push!(master.ext[:y_trust], y_core)
+        push!(master.ext[:trust_siting], 0.0)
+        push!(master.ext[:trust_sizing], 0.0)
+        push!(master.ext[:trust_transmission], 0.0)
+    end
+    
     # Initialize sets
     R = data["param"]["num_representatives"]
     N = length(data["bus"])
@@ -110,19 +172,55 @@ function update_master_objective!(master, data, y, theta)
     T = data["param"]["num_hours"]
     G = length(data["gen"])
     K = data["param"]["num_cap_upgrades_max"]
-
-    #
-    #   III. Objective
-    #
-    gamma, s_energy_int = y
-
-    # Start with the base objective terms
-    obj_expr = sum(s_energy_int[i] * data["param"]["storage_energy_size"] * data["param"]["bess_energy_cost"] for i in 1:N) + 
-            sum(data["param"]["cap_upgrade_cost"] * data["param"]["cap_upgrade_increment"] * data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
-            theta
-
-    # Update the objective    
-    JuMP.@objective(master, Min, obj_expr)
+    
+    y_trust = master.ext[:y_trust][end]
+    gamma_trust, s_energy_int_trust = y_trust
+    gamma, s_energy_int = master[:gamma], master[:s_energy_int]
+    abs_diff = master[:abs_diff]
+    sizing_abs_diff = master[:sizing_abs_diff]
+    trans_abs_diff = master[:trans_abs_diff]
+    
+    # Transmission trust region
+    @constraint(master,
+        trans_abs_diff_ub[a in 1:E],
+        trans_abs_diff[a] >= gamma[a] - gamma_trust[a])
+    
+    @constraint(master,
+        trans_abs_diff_lb[a in 1:E],
+        trans_abs_diff[a] >= gamma_trust[a] - gamma[a])
+    
+    @constraint(master, 
+        transmission_trust_region, 
+        sum(trans_abs_diff[a] for a in 1:E) <= master.ext[:trust_transmission][end])
+    
+    # Sizing trust region (Note: your comment says "sizing" but constraints use "siting" variables)
+    @constraint(master,
+        abs_diff_ub[i in 1:N],
+        abs_diff[i] >= s_energy_int[i] - s_energy_int_trust[i])
+    
+    @constraint(master,
+        abs_diff_lb[i in 1:N],
+        abs_diff[i] >= s_energy_int_trust[i] - s_energy_int[i])
+    
+    @constraint(master, 
+        siting_trust_region, 
+        sum(abs_diff[i] for i in 1:N) <= master.ext[:trust_siting][end])
+    
+    # Siting trust region (Note: your comment says "siting" but uses sizing variables)
+    @constraint(master,
+        sizing_abs_diff_ub,
+        sizing_abs_diff >= sum(s_energy_int[i] for i in 1:N) - sum(s_energy_int_trust[i] for i in 1:N))
+    
+    @constraint(master,
+        sizing_abs_diff_lb,
+        sizing_abs_diff >= sum(s_energy_int_trust[i] for i in 1:N) - sum(s_energy_int[i] for i in 1:N))
+    
+    @constraint(master, 
+        sizing_trust_region, 
+        sizing_abs_diff <= master.ext[:trust_sizing][end])
+    
+    # Verify all constraints were added successfully
+    println("Trust region constraints added successfully for iteration ", master.ext[:iter])
 end
 
 function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptdf_iterations=256, max_ptdf_per_iteration=32, ptdf_tol=1e-6, logging=nothing)
@@ -472,9 +570,6 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
     tolerance=0.01
     converged = false
     iter = master.ext[:iter]
-    
-    # Unpack y variables
-    gamma, s_energy_int = y
 
     # Initialize tracked constraints dictionary to store across iterations
     tracked_constraints = Dict{Tuple{Int,Int,Int,Bool}, Bool}()
@@ -494,49 +589,43 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
     while !converged && iter < max_iterations
         # Solve master problem
         println("[DEBUG] Solving master problem: iteration $iter")
-        update_master_objective!(master, data, y, theta)
-        optimize!(master)
-        
-        if !has_values(master)
-            error("Master problem has no solution: $(termination_status(master))")
+        if iter > 0
+            remove_trust_region!(master)
         end
+        optimize!(master)
+        gamma_no_trust_val = value.(master[:gamma])
+        s_energy_int_no_trust_val = value.(master[:s_energy_int])
+        y_no_trust = [gamma_no_trust_val, s_energy_int_no_trust_val]
+        export_investments_csv(data, gamma_no_trust_val, s_energy_int_no_trust_val, output_dir=joinpath(simdir,"benders_output"), file_suffix="$iter")
+
+        # Save lower bound (no trust region)
+        master_obj_lb = objective_value(master) 
+
+        # Add trust region
+        add_trust_region!(master, data)
+        optimize!(master)
+        master_obj_trust = objective_value(master)
         
         # Get master solution
-        gamma_val = value.(gamma)
-        s_energy_int_val = value.(s_energy_int)
+        gamma_val = value.(master[:gamma])
+        s_energy_int_val = value.(master[:s_energy_int])
         theta_val = value(theta)
         y_raw = [gamma_val, s_energy_int_val]
-        push!(master.ext[:y_raw], y_raw)
-        export_investments_csv(data, gamma_val, s_energy_int_val, output_dir=joinpath(simdir,"benders_output"), file_suffix="$iter")
+        export_investments_csv(data, gamma_val, s_energy_int_val, output_dir=joinpath(simdir,"benders_output"), file_suffix="trust_$iter")
 
-        y_eval, y_core = compute_eval_core_points(master, data)
-
-        gamma_eval, s_energy_int_eval = y_eval
-        export_investments_csv(data, gamma_eval, s_energy_int_eval, output_dir=joinpath(simdir,"benders_output"), file_suffix="eval_$iter")
-
-        # Solve core point subproblem to find the PTDF constraints
-        # core_model, core_phi_val, core_duals, core_tracked_constraints = solve_subproblem_ptdf(simdir, y_core, data, tracked_constraints, logging="Core Point iter $iter")
-        # Solve raw point subproblem to find the PTDF constraints
-        raw_model, raw_phi_val, raw_duals, raw_tracked_constraints = nothing, nothing, nothing, nothing
-        raw_tracked_constraints = tracked_constraints
-        if iter > 100000000
-            raw_model, raw_phi_val, raw_duals, raw_tracked_constraints = solve_subproblem_ptdf(simdir, y_raw, data, tracked_constraints, logging="Raw Point iter $iter")
-        end
         # Solve subproblem with fixed investments
-        sub_model, phi_val, duals, eval_tracked_constraints = solve_subproblem_ptdf(simdir, y_eval, data, raw_tracked_constraints, logging="Eval Point iter $iter")
-        # export_duals_csv(duals, iter)
+        sub_model, phi_val, duals, raw_tracked_constraints = solve_subproblem_ptdf(simdir, y_raw, data, tracked_constraints, logging="Eval Point iter $iter")
+        # TODO: export_duals_csv(duals, iter)
 
         # Update tracked constraints
-        tracked_constraints = eval_tracked_constraints
+        tracked_constraints = raw_tracked_constraints
 
         # Save progress to CSV
         filename = joinpath(simdir, "output", "benders_progress.csv")
-        # The benders log will show the perturbed / stabilized point
-        lambda_val = master.ext[:stabilization_lambda][end]
-        benders_ptdf_write_to_csv(filename, objective_value(master), theta_val, phi_val, y_eval, lambda_val=lambda_val)
+        benders_ptdf_write_to_csv(filename, y_no_trust, y_raw, master_obj_lb, theta_val, phi_val, master_obj_trust + phi_val - theta_val)
 
         # Check convergence
-        gap = abs(theta_val - phi_val) / (1e-10 + abs(theta_val))
+        gap = abs(master_obj_trust + phi_val - theta_val - master_obj_lb) / (1e-10 + abs(master_obj_lb))
         push!(master.ext[:gap], gap)
         println("[DEBUG] Benders iteration $(iter+1): Master objective = $(objective_value(master)), theta = $(theta_val), phi = $(phi_val), gap = $(gap)")
 
@@ -548,13 +637,13 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
             if raw_model !== nothing
                 add_appropriate_cut(master, raw_model, data, theta, y, y_raw, y_core, raw_duals, raw_phi_val)
             end
-            add_appropriate_cut(master, sub_model, data, theta, y, y_eval, y_core, duals, phi_val)
+            add_appropriate_cut(master, sub_model, data, theta, y, y_raw, y_raw, duals, phi_val)
         end
         
         # Update iter count and save master problem with metadata/extensions
         master.ext[:iter] += 1
         iter = master.ext[:iter]
-        save_master_problem(master, simdir)
+        # save_master_problem(master, simdir)
     end
 
     if !converged
@@ -616,29 +705,27 @@ function save_investment_results(simdir, gamma_val, s_energy_val)
     CSV.write(joinpath(simdir, "output", "storage_investments.csv"), storage_df)
 end
 
-function benders_ptdf_write_to_csv(filename, master_obj, theta_val, phi_val, y_val; phirel_val=nothing, lambda_val=nothing)
+function benders_ptdf_write_to_csv(filename, y_og, y_val, master_obj_lb, theta_val, phi_val, master_obj_trust)
+    # benders_ptdf_write_to_csv(filename, master_obj_lb, theta_val, phi_val, master_obj_trust)
     # Decompose y_val
-    gamma_val, s_energy_val = y_val
+    gamma_og, s_energy_int_og = y_og
+    gamma_val, s_energy_int_val = y_val
 
     # Prepare the base data row
     data_dict = OrderedDict(
-        "master_objective" => master_obj,
+        "master_obj_lb" => master_obj_lb,
         "theta_val" => theta_val,
         "phi_val" => phi_val,
-        "total_line_upgrades" => count(x -> x >=0.015, gamma_val),
-        "total_storage_energy" => sum(s_energy_val),
-        "total_storage_count" => count(x -> x >=0.015, s_energy_val)
+        "master_obj_trust" => master_obj_trust,
+        "total_line_upgrades" => count(x -> x >=0.015, gamma_og),
+        "sum_line_upgrades" => sum(gamma_og),
+        "total_storage_energy" => sum(s_energy_int_og),
+        "total_storage_count" => count(x -> x >=0.015, s_energy_int_og),
+        "total_line_upgrades_trust" => count(x -> x >=0.015, gamma_val),
+        "sum_line_upgrades_trust" => sum(gamma_val),
+        "total_storage_energy_trust" => sum(s_energy_int_val),
+        "total_storage_count_trust" => count(x -> x >=0.015, s_energy_int_val)
     )
-    
-    # Add phirel_val if provided
-    if phirel_val !== nothing
-        data_dict["phirel_val"] = phirel_val
-    end
-
-    # Add lambda if provided
-    if lambda_val !== nothing
-        data_dict["lambda"] = lambda_val
-    end
     
     # Create DataFrame from dictionary
     df = DataFrame([data_dict])
@@ -649,17 +736,6 @@ function benders_ptdf_write_to_csv(filename, master_obj, theta_val, phi_val, y_v
     if file_exists
         # Read existing headers to ensure compatibility
         existing_headers = names(CSV.read(filename, DataFrame; limit=1))
-        
-        # Check if phirel_val column exists in the file but not in our data
-        if "phirel_val" in existing_headers && !("phirel_val" in keys(data_dict))
-            # Add empty phirel_val to maintain column structure
-            df.phirel_val = [missing]
-        end
-         # Check if lambda column exists in the file but not in our data
-        if "lambda" in existing_headers && !("lambda" in keys(data_dict))
-            # Add empty lambda to maintain column structure
-            df.lambda = [missing]
-        end
         
         # Write to CSV, appending to it
         CSV.write(filename, df; append=true, header=false)

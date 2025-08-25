@@ -66,6 +66,30 @@ function compute_core_point(data::Dict{String, Any}; transmission_eps=150, stora
     return (gamma_val_rounded, s_power_val, s_energy_val)
 end
 
+function get_over_invested_point(simdir, data)
+    config_file = joinpath(simdir, "config.toml")
+    config = TOML.parsefile(config_file)
+    rep_date = config["dates"][1]
+
+    if isfile(joinpath(simdir, "line_investments.csv")) && isfile(joinpath(simdir, "storage_investments.csv"))
+        line_file = joinpath(simdir, "line_investments.csv")
+        storage_file = joinpath(simdir, "storage_investments.csv")
+    else
+        output_dir = joinpath(simdir, "output")
+        line_file = joinpath(output_dir, "line_investments.csv")
+        storage_file = joinpath(output_dir, "storage_investments.csv")
+    end
+
+    line_inv = CSV.read(line_file, DataFrame)
+    storage_inv = CSV.read(storage_file, DataFrame)
+
+    gamma_val = line_inv[:, :Upgrade_Lvl]
+    s_energy_int_val = storage_inv[:, :Storage_Energy] * 1 / data["param"]["storage_energy_size"]
+
+
+    return ceil.(Int, gamma_val), ceil.(Int, s_energy_int_val)
+end
+
 function get_rep_day_core_point(simdir)
     config_file = joinpath(simdir, "config.toml")
     config = TOML.parsefile(config_file)
