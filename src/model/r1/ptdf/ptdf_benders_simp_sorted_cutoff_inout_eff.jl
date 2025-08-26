@@ -164,6 +164,12 @@ function add_trust_region!(master, data)
         push!(master.ext[:trust_sizing], 0.0)
         push!(master.ext[:trust_transmission], 0.0)
     end
+
+    if master.ext[:iter] == 2
+        push!(master.ext[:trust_siting], 2.0)
+        push!(master.ext[:trust_sizing], 1.0)
+        push!(master.ext[:trust_transmission], master.ext[:trust_transmission][end] + 100.0)
+    end
     
     # Initialize sets
     R = data["param"]["num_representatives"]
@@ -593,13 +599,15 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
             remove_trust_region!(master)
         end
         optimize!(master)
-        gamma_no_trust_val = value.(master[:gamma])
-        s_energy_int_no_trust_val = value.(master[:s_energy_int])
-        y_no_trust = [gamma_no_trust_val, s_energy_int_no_trust_val]
-        export_investments_csv(data, gamma_no_trust_val, s_energy_int_no_trust_val, output_dir=joinpath(simdir,"benders_output"), file_suffix="$iter")
+        gamma_val = value.(master[:gamma])
+        s_energy_int_val = value.(master[:s_energy_int])
+        theta_val = value.(master[:theta])
+
+        y_val = [gamma_val, s_energy_int_val]
+        export_investments_csv(data, gamma_val, s_energy_int_val, output_dir=joinpath(simdir,"benders_output"), file_suffix="$iter")
 
         # Save lower bound (no trust region)
-        master_obj_lb = objective_value(master) 
+        master_obj = objective_value(master) 
 
         # Add trust region
         add_trust_region!(master, data)
@@ -607,37 +615,35 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
         master_obj_trust = objective_value(master)
         
         # Get master solution
-        gamma_val = value.(master[:gamma])
-        s_energy_int_val = value.(master[:s_energy_int])
-        theta_val = value(theta)
-        y_raw = [gamma_val, s_energy_int_val]
-        export_investments_csv(data, gamma_val, s_energy_int_val, output_dir=joinpath(simdir,"benders_output"), file_suffix="trust_$iter")
+        gamma_trust_val = value.(master[:gamma])
+        s_energy_int_trust_val = value.(master[:s_energy_int])
+        theta_trust_val = value(theta)
+        y_trust_val = [gamma_trust_val, s_energy_int_trust_val]
+        push!(master.ext[:y_trust], y_trust_val)
+        export_investments_csv(data, gamma_trust_val, s_energy_int_trust_val, output_dir=joinpath(simdir,"benders_output"), file_suffix="trust_$iter")
 
         # Solve subproblem with fixed investments
-        sub_model, phi_val, duals, raw_tracked_constraints = solve_subproblem_ptdf(simdir, y_raw, data, tracked_constraints, logging="Eval Point iter $iter")
+        sub_model, phi_val, duals, trust_tracked_constraints = solve_subproblem_ptdf(simdir, y_trust_val, data, tracked_constraints, logging="Eval Point iter $iter")
         # TODO: export_duals_csv(duals, iter)
 
         # Update tracked constraints
-        tracked_constraints = raw_tracked_constraints
+        tracked_constraints = trust_tracked_constraints
 
         # Save progress to CSV
         filename = joinpath(simdir, "output", "benders_progress.csv")
-        benders_ptdf_write_to_csv(filename, y_no_trust, y_raw, master_obj_lb, theta_val, phi_val, master_obj_trust + phi_val - theta_val)
+        benders_ptdf_write_to_csv(filename, y_val, y_trust_val, master_obj, theta_val, master_obj_trust, theta_trust_val, phi_val)
 
         # Check convergence
-        gap = abs(master_obj_trust + phi_val - theta_val - master_obj_lb) / (1e-10 + abs(master_obj_lb))
+        gap = abs(master_obj + phi_val - theta_trust_val - master_obj) / (1e-10 + abs(master_obj))
         push!(master.ext[:gap], gap)
-        println("[DEBUG] Benders iteration $(iter+1): Master objective = $(objective_value(master)), theta = $(theta_val), phi = $(phi_val), gap = $(gap)")
+        println("[DEBUG] Benders iteration $(iter+1): Master objective = $(master_obj), theta = $(theta_val), phi = $(phi_val), gap = $(gap)")
 
         # if gap < tolerance
         if false
             return
         else
             # Add new Benders cut to master problem
-            if raw_model !== nothing
-                add_appropriate_cut(master, raw_model, data, theta, y, y_raw, y_core, raw_duals, raw_phi_val)
-            end
-            add_appropriate_cut(master, sub_model, data, theta, y, y_raw, y_raw, duals, phi_val)
+            add_appropriate_cut(master, sub_model, data, theta, y, y_trust_val, y_trust_val, duals, phi_val)
         end
         
         # Update iter count and save master problem with metadata/extensions
@@ -705,26 +711,28 @@ function save_investment_results(simdir, gamma_val, s_energy_val)
     CSV.write(joinpath(simdir, "output", "storage_investments.csv"), storage_df)
 end
 
-function benders_ptdf_write_to_csv(filename, y_og, y_val, master_obj_lb, theta_val, phi_val, master_obj_trust)
-    # benders_ptdf_write_to_csv(filename, master_obj_lb, theta_val, phi_val, master_obj_trust)
+function benders_ptdf_write_to_csv(filename, y_val, y_trust_val, master_obj, theta_val, master_obj_trust, theta_trust_val, phi_val)
+    # benders_ptdf_write_to_csv(filename, y_val, y_trust_val, master_obj, theta_val, master_obj_trust, theta_trust_val, phi_val)
     # Decompose y_val
-    gamma_og, s_energy_int_og = y_og
     gamma_val, s_energy_int_val = y_val
+    gamma_trust_val, s_energy_int_trust_val = y_trust_val
 
     # Prepare the base data row
     data_dict = OrderedDict(
-        "master_obj_lb" => master_obj_lb,
+        "master_obj_lb" => master_obj,
         "theta_val" => theta_val,
-        "phi_val" => phi_val,
         "master_obj_trust" => master_obj_trust,
-        "total_line_upgrades" => count(x -> x >=0.015, gamma_og),
-        "sum_line_upgrades" => sum(gamma_og),
-        "total_storage_energy" => sum(s_energy_int_og),
-        "total_storage_count" => count(x -> x >=0.015, s_energy_int_og),
-        "total_line_upgrades_trust" => count(x -> x >=0.015, gamma_val),
-        "sum_line_upgrades_trust" => sum(gamma_val),
-        "total_storage_energy_trust" => sum(s_energy_int_val),
-        "total_storage_count_trust" => count(x -> x >=0.015, s_energy_int_val)
+        "theta_trust_val" => theta_trust_val,
+        "phi_val" => phi_val,
+        "master_obj_ub" => master_obj_trust + phi_val - theta_trust_val,
+        "total_line_upgrades" => count(x -> x >=0.015, gamma_val),
+        "sum_line_upgrades" => sum(gamma_val),
+        "total_storage_energy" => sum(s_energy_int_val),
+        "total_storage_count" => count(x -> x >=0.015, s_energy_int_val),
+        "total_line_upgrades_trust" => count(x -> x >=0.015, gamma_trust_val),
+        "sum_line_upgrades_trust" => sum(gamma_trust_val),
+        "total_storage_energy_trust" => sum(s_energy_int_trust_val),
+        "total_storage_count_trust" => count(x -> x >=0.015, s_energy_int_trust_val)
     )
     
     # Create DataFrame from dictionary
