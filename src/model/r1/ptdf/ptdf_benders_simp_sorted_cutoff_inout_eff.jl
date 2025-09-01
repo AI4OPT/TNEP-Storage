@@ -40,6 +40,7 @@ function define_master_ptdf(data::Dict{String, Any})
     master.ext[:stabilization_lambda] = Vector{Float64}()
     master.ext[:stabilization_lambda_decr] = Vector{Float64}()
     master.ext[:iter] = 0
+    master.ext[:data] = data
 
     # Get incidence matrix from extension
     incidence_matrix = master.ext[:INCIDENCE] = do_all_incidence(data)
@@ -80,7 +81,7 @@ function define_master_ptdf(data::Dict{String, Any})
     #    
     JuMP.@constraint(master, 
         no_load_shed,
-        ue_sum == 0
+        ue_sum <= 0
     )
 
     """
@@ -97,11 +98,24 @@ function define_master_ptdf(data::Dict{String, Any})
         gamma[a] == 0
     )
 
-    # energy rating only if storage installed
+    # energy rating maximum
     JuMP.@constraint(master, 
         installed_energy_ub[i in 1:N],
         s_energy_int[i] * data["param"]["storage_energy_size"] <= data["param"]["max_energy_rating"]
     )
+
+    # storage candidates
+    """
+    cand_file = joinpath(data["param"]["core_point_simdir"], "output", "storage_investments.csv")
+    storage_df = CSV.read(cand_file, DataFrame)
+    storage_upgrades = storage_df[:, :Storage_Energy]
+    storage_non_indices = findall(x -> x < 1e-4, storage_upgrades)
+
+    JuMP.@constraint(master, 
+        energy_cand[i in storage_non_indices],
+        s_energy_int[i] == 0
+    )
+    """
 
     #
     #   III. Objective
@@ -118,18 +132,11 @@ function define_master_ptdf(data::Dict{String, Any})
     return master, y, theta
 end
 
-function create_subproblem_model(simdir, y_val, data, tracked_constraints; logging=nothing)
+function create_subproblem_model(simdir, data, tracked_constraints)
     """
     Creates the subproblem model with all variables and constraints except the objective function.
     Returns the model ready for objective setting and solving.
     """
-    
-    if !isnothing(logging)
-        println("[DEBUG] $logging: Creating subproblem model")
-    end
-
-    # unpack investment decisions
-    gamma_val, s_energy_int_val = y_val
 
     # Initialize sets
     R = data["param"]["num_representatives"]
@@ -150,7 +157,6 @@ function create_subproblem_model(simdir, y_val, data, tracked_constraints; loggi
     # Store additional data in model extensions
     sub.ext[:data] = data
     sub.ext[:simdir] = simdir
-    sub.ext[:y_val] = y_val
     
     # Compute PTDF matrix
     sub.ext[:PTDF] = do_all_ptdf(data)
@@ -220,8 +226,8 @@ function create_subproblem_model(simdir, y_val, data, tracked_constraints; loggi
     #
 
     # FIX INVESTMENT DECISIONS FROM MASTER PROBLEM (DUALS USED FOR CUTS)
-    @constraint(sub, master_gamma[a=1:E], gamma[a] == gamma_val[a])
-    @constraint(sub, master_energy[i=1:N], s_energy_int[i] == s_energy_int_val[i])
+    # @constraint(sub, master_gamma[a=1:E], gamma[a] == gamma_val[a])
+    # @constraint(sub, master_energy[i=1:N], s_energy_int[i] == s_energy_int_val[i])
 
     # Global power balance
     @constraint(sub, 
@@ -371,6 +377,32 @@ function set_underserved_objective!(sub)
     )
 end
 
+function set_sub_investments!(sub, y_val)
+    data = sub.ext[:data]
+    N = length(data["bus"])
+    E = length(data["branch"])
+
+    gamma = sub[:gamma]
+    s_energy_int = sub[:s_energy_int]
+
+    # Check and remove existing master_gamma constraints if they exist
+    if haskey(sub.obj_dict, :master_gamma)
+        delete(sub, sub[:master_gamma])
+        unregister(sub, :master_gamma)
+    end
+    
+    # Check and remove existing master_energy constraints if they exist
+    if haskey(sub.obj_dict, :master_energy)
+        delete(sub, sub[:master_energy])
+        unregister(sub, :master_energy)
+    end
+
+    # FIX INVESTMENT DECISIONS FROM MASTER PROBLEM (DUALS USED FOR CUTS)
+    gamma_val, s_energy_int_val = y_val
+    @constraint(sub, master_gamma[a=1:E], gamma[a] == gamma_val[a])
+    @constraint(sub, master_energy[i=1:N], s_energy_int[i] == s_energy_int_val[i])
+end
+
 function solve_subproblem_ptdf!(sub; max_ptdf_iterations=256, max_ptdf_per_iteration=32, ptdf_tol=1e-6, logging=nothing)
     """
     Solves the subproblem using lazy PTDF constraints.
@@ -515,28 +547,6 @@ function extract_subproblem_duals(sub)
     end
 end
 
-function solve_subproblem_ptdf(simdir, y_val, data, tracked_constraints; max_ptdf_iterations=256, max_ptdf_per_iteration=32, ptdf_tol=1e-6, logging=nothing)
-    """
-    Original function interface for backward compatibility.
-    Creates model, sets operational objective, solves, and returns results.
-    """
-    # Create the model
-    sub = create_subproblem_model(simdir, y_val, data, tracked_constraints; logging=logging)
-    
-    # Set operational objective
-    set_operational_objective!(sub)
-    
-    # Solve the model
-    solve_subproblem_ptdf!(sub; max_ptdf_iterations=max_ptdf_iterations, 
-                          max_ptdf_per_iteration=max_ptdf_per_iteration, 
-                          ptdf_tol=ptdf_tol, logging=logging)
-    
-    # Extract results
-    duals = extract_subproblem_duals(sub)
-    
-    return sub, objective_value(sub), duals, sub.ext[:tracked_constraints]
-end
-
 function add_benders_cut_ptdf(master, theta, duals, y, y_val, phi_val)
     # Unpack y variables and duals
     gamma, s_energy_int = y
@@ -573,9 +583,16 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
         end
     end
 
+    # initialize subproblem
+    sub = create_subproblem_model(simdir, data, tracked_constraints)
+
     while !converged && iter < max_iterations
         # Solve master problem
         println("[DEBUG] Solving master problem: iteration $iter")
+        add_box_step!(master, 1)
+        if iter == 1
+            add_storage_minimum!(master)
+        end
         optimize!(master)
         gamma_val = value.(master[:gamma])
         s_energy_int_val = value.(master[:s_energy_int])
@@ -593,10 +610,10 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
         export_investments_csv(data, gamma_val, s_energy_int_val, output_dir=joinpath(simdir,"benders_output"), file_suffix="$iter")
 
         # Solve subproblem with fixed investments
-        sub = create_subproblem_model(simdir, y_val, data, tracked_constraints; logging="Eval Point iter $iter")
+        set_sub_investments!(sub, y_val)
         # Phase 1: check feasibility of no load shed
         set_underserved_objective!(sub) 
-        solve_subproblem_ptdf!(sub; max_ptdf_iterations=256, max_ptdf_per_iteration=32, ptdf_tol=1e-6)
+        solve_subproblem_ptdf!(sub; max_ptdf_iterations=256, max_ptdf_per_iteration=32, ptdf_tol=1e-6, logging="Eval Point iter $iter")
         total_ue = objective_value(sub)
         duals = extract_subproblem_duals(sub)
 
@@ -834,4 +851,98 @@ function create_arcs_to(data)
     end
     
     return arcs_to
+end
+
+function add_storage_minimum!(master)
+    data = master.ext[:data]
+    storage_file = joinpath(data["param"]["core_point_simdir"], "output", "storage_investments.csv")
+    storage_inv = CSV.read(storage_file, DataFrame)
+    s_energy_cont_val = storage_inv[:, :Storage_Energy]    
+    total_s_energy_cont = sum(s_energy_cont_val)
+    total_s_energy_int = ceil.(total_s_energy_cont / data["param"]["storage_energy_size"])
+
+    s_energy_int = master[:s_energy_int]
+    N = length(data["bus"])
+
+    @constraint(master,
+        total_storage,
+        sum(s_energy_int[i] for i in 1:N) >= total_s_energy_int)
+end
+
+function add_box_step!(master, box_size)
+    data = master.ext[:data]
+    if master.ext[:iter] == 0
+        # TODO: write new over-invested core function
+        box_size = 0
+        gamma_core, s_energy_int_core = get_over_invested_point(data["param"]["core_point_simdir"], data)
+        y_core = [gamma_core, s_energy_int_core]
+        push!(master.ext[:y_trust], y_core)
+    else
+        remove_trust_region!(master)
+    end
+
+    # Initialize sets
+    R = data["param"]["num_representatives"]
+    N = length(data["bus"])
+    E = length(data["branch"])
+    T = data["param"]["num_hours"]
+    G = length(data["gen"])
+    K = data["param"]["num_cap_upgrades_max"]
+
+    y_trust = master.ext[:y_trust][end]
+    gamma_trust, s_energy_int_trust = y_trust
+    gamma, s_energy_int = master[:gamma], master[:s_energy_int]
+
+    @constraint(master,
+        trans_box_ub[a in 1:E],
+        gamma[a] - gamma_trust[a] <= box_size)
+
+    @constraint(master,
+        trans_box_lb[a in 1:E],
+        gamma_trust[a] - gamma[a] <= box_size)
+
+    @constraint(master,
+        stor_box_ub[i in 1:N],
+        s_energy_int[i] - s_energy_int_trust[i] <= box_size)
+
+    @constraint(master,
+        stor_box_lb[i in 1:N],
+        s_energy_int_trust[i] - s_energy_int[i] <= box_size)
+end
+
+function remove_trust_region!(master)
+    """constraint_names = [
+        :trans_abs_diff_ub, :trans_abs_diff_lb, :transmission_trust_region,
+        :abs_diff_ub, :abs_diff_lb, :siting_trust_region,
+        :sizing_abs_diff_ub, :sizing_abs_diff_lb, :sizing_trust_region
+    ]"""
+
+    constraint_names = [
+    :trans_box_ub, :trans_box_lb, :stor_box_lb, :stor_box_ub
+    ]
+
+    obj_dict = object_dictionary(master)
+
+    for name in constraint_names
+        if haskey(obj_dict, name)
+            try
+                constraint_obj = obj_dict[name]
+
+                # JuMP.delete works on both single constraints and arrays
+                JuMP.delete(master, constraint_obj)
+                JuMP.unregister(master, name)
+                println("Removed constraint: $name")
+
+            catch e
+                println("Warning: Could not remove $name: $e")
+                # Force unregister
+                try
+                    JuMP.unregister(master, name)
+                catch
+                end
+            end
+        else
+            println("Constraint $name not found in model")
+        end
+    end
 end
