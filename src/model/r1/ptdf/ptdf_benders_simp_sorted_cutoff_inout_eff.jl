@@ -681,8 +681,8 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
             end
         elseif master.ext[:stabilization] == "trust_region"
             if total_ue > 1e-2
-                new_l1_radius = minimum([1, master.ext[:l1_radius][end] / 2])
-                println("[DEBUG] Load shed $total_ue detected, shrinking l1_radius to $(new_l1_radius)")
+                new_l1_radius = master.ext[:l1_radius][end] * 2
+                println("[DEBUG] Load shed $total_ue detected, expanding transmission l1_radius to $(new_l1_radius)")
                 push!(master.ext[:l1_radius], new_l1_radius)
             else
                 current_total_obj = master_obj + phi_val - theta_val
@@ -690,11 +690,15 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
                     println("[DEBUG] Cheaper total objective $(current_total_obj) detected, taking serious step")
                     push!(master.ext[:y_trust], y_val)
                     push!(master.ext[:total_obj], current_total_obj)
-                end
 
-                new_l1_radius = master.ext[:l1_radius][end] * 2
-                println("[DEBUG] No load-shed, so expanding l1_radius to $(new_l1_radius)")
-                push!(master.ext[:l1_radius], new_l1_radius)
+                    new_l1_radius = maximum([1, master.ext[:l1_radius][end] / 2])
+                    println("[DEBUG] Serious step, so reducing l1_radius to $(new_l1_radius)")
+                    push!(master.ext[:l1_radius], new_l1_radius)
+                else
+                    new_l1_radius = master.ext[:l1_radius][end] * 2
+                    println("[DEBUG] No load shed or improvement in objective, expanding transmission l1_radius to $(new_l1_radius)")
+                    push!(master.ext[:l1_radius], new_l1_radius)
+                end
             end
         end
 
@@ -953,15 +957,20 @@ function add_trust_region!(master)
         @constraint(master,
             trans_abs_diff_lb[a in 1:E],
             trans_abs_diff[a] >= gamma_trust[a] - gamma[a])
+
         @constraint(master,
             abs_diff_ub[i in 1:N],
             abs_diff[i] >= s_energy_int[i] - s_energy_int_trust[i])
         @constraint(master,
             abs_diff_lb[i in 1:N],
             abs_diff[i] >= s_energy_int_trust[i] - s_energy_int[i])
+
+        @constraint(master,
+            trans_abs_diff_total,
+            sum(trans_abs_diff[a] for a in 1:E) == 0)
         @constraint(master,
             abs_diff_total,
-            sum(abs_diff[i] for i in 1:N) + sum(trans_abs_diff[a] for a in 1:E) == 0)
+            sum(abs_diff[i] for i in 1:N) == 0)
         return
     else
         remove_trust_region!(master)
@@ -984,9 +993,13 @@ function add_trust_region!(master)
     @constraint(master,
         abs_diff_lb[i in 1:N],
         abs_diff[i] >= s_energy_int_trust[i] - s_energy_int[i])
+
+    @constraint(master,
+            trans_abs_diff_total,
+            sum(trans_abs_diff[a] for a in 1:E) <= master.ext[:l1_radius][end])
     @constraint(master,
             abs_diff_total,
-            sum(abs_diff[i] for i in 1:N) + sum(trans_abs_diff[a] for a in 1:E) <= master.ext[:l1_radius][end])
+            sum(abs_diff[i] for i in 1:N) == 2)
 end
 
 function add_box_step!(master, box_size)
@@ -1042,7 +1055,7 @@ function remove_trust_region!(master)
 
     if stab_method == "trust_region"
         constraint_names = [
-            :trans_abs_diff_ub, :trans_abs_diff_lb, :abs_diff_ub, :abs_diff_lb, :abs_diff_total,
+            :trans_abs_diff_ub, :trans_abs_diff_lb, :abs_diff_ub, :abs_diff_lb, :abs_diff_total, :trans_abs_diff_total
         ]
     elseif stab_method == "boxstep"
         constraint_names = [
