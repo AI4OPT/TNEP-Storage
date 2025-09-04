@@ -41,6 +41,8 @@ function define_master_ptdf(data::Dict{String, Any})
     master.ext[:stabilization_lambda_decr] = Vector{Float64}()
     master.ext[:iter] = 0
     master.ext[:data] = data
+    master.ext[:total_ue] = [Inf]
+    master.ext[:total_obj] = [Inf]
 
     # Get incidence matrix from extension
     incidence_matrix = master.ext[:INCIDENCE] = do_all_incidence(data)
@@ -76,13 +78,23 @@ function define_master_ptdf(data::Dict{String, Any})
     # subproblem load shed
     JuMP.@variable(master, ue_sum >= 0)
 
+    master.ext[:warmstart] = get(data["param"], "warmstart", false)
+    master.ext[:stabilization] = get(data["param"], "stabilization", false)
+
+    if master.ext[:stabilization] == "trust_region"
+        JuMP.@variable(master, abs_diff[1:N] >= 0)
+        JuMP.@variable(master, trans_abs_diff[1:E] >= 0)
+    end
+
     #
     #   II. Constraints
     #    
+    """
     JuMP.@constraint(master, 
         no_load_shed,
         ue_sum <= 0
     )
+    """
 
     """
     # Check if previous investments exist
@@ -105,17 +117,30 @@ function define_master_ptdf(data::Dict{String, Any})
     )
 
     # storage candidates
-    """
-    cand_file = joinpath(data["param"]["core_point_simdir"], "output", "storage_investments.csv")
-    storage_df = CSV.read(cand_file, DataFrame)
-    storage_upgrades = storage_df[:, :Storage_Energy]
-    storage_non_indices = findall(x -> x < 1e-4, storage_upgrades)
+    if get(data["param"], "storage_cand", false)
+        cand_file = joinpath(data["param"]["core_point_simdir"], "output", "storage_investments.csv")
+        storage_df = CSV.read(cand_file, DataFrame)
+        storage_upgrades = storage_df[:, :Storage_Energy]
+        storage_non_indices = findall(x -> x == 0, storage_upgrades)
 
-    JuMP.@constraint(master, 
-        energy_cand[i in storage_non_indices],
-        s_energy_int[i] == 0
-    )
-    """
+        JuMP.@constraint(master, 
+            energy_cand[i in storage_non_indices],
+            s_energy_int[i] == 0
+        )
+    end
+
+    # line candidates
+    if get(data["param"], "line_cand", false)
+        cand_file = joinpath(data["param"]["core_point_simdir"], "output", "line_investments.csv")
+        line_df = CSV.read(cand_file, DataFrame)
+        line_upgrades = line_df[:, :Upgrade_Lvl]
+        line_non_indices = findall(x -> x == 0, line_upgrades)
+
+        JuMP.@constraint(master, 
+            line_cand[a in line_non_indices],
+            gamma[a] == 0
+        )
+    end
 
     #
     #   III. Objective
@@ -123,7 +148,7 @@ function define_master_ptdf(data::Dict{String, Any})
     # Start with the base objective terms
     obj_expr = sum(s_energy_int[i] * data["param"]["storage_energy_size"] * data["param"]["bess_energy_cost"] for i in 1:N) + 
             sum(data["param"]["cap_upgrade_cost"] * data["param"]["cap_upgrade_increment"] * data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
-            theta
+            theta + ue_sum * 365 * data["param"]["under_served_penalty"]
     y = gamma, s_energy_int
 
     # Update the objective    
@@ -590,9 +615,7 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
         # Solve master problem
         println("[DEBUG] Solving master problem: iteration $iter")
         add_box_step!(master, 1)
-        if iter == 1
-            add_storage_minimum!(master)
-        end
+        add_trust_region!(master)
         optimize!(master)
         gamma_val = value.(master[:gamma])
         s_energy_int_val = value.(master[:s_energy_int])
@@ -641,14 +664,40 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
             benders_ptdf_write_to_csv(filename, y_val, master_obj, theta_val, phi_val, total_ue)
             add_benders_cut_ptdf(master, theta, duals, y, y_val, phi_val)
 
+            # Update serious step (move trust region)
+            push!(master.ext[:y_trust], y_val)
+
             # Check convergence
             gap = abs(master_obj + phi_val - theta_val - master_obj) / (1e-10 + abs(master_obj))
             push!(master.ext[:gap], gap)
             println("[DEBUG] Benders iteration $(iter+1): Master objective = $(master_obj), theta = $(theta_val), phi = $(phi_val), gap = $(gap)")
         end
 
-        # Update tracked constraints
-        tracked_constraints = sub.ext[:tracked_constraints]
+        # Update with serious step of the trust/anchor point if satisfy conditions
+        if master.ext[:stabilization] == "boxstep"
+            if total_ue <= 1e-2 || total_ue < master.ext[:total_ue][end]
+                push!(master.ext[:y_trust], y_val)
+                push!(master.ext[:total_ue], total_ue)
+            end
+        elseif master.ext[:stabilization] == "trust_region"
+            if total_ue > 1e-2
+                new_l1_radius = minimum([1, master.ext[:l1_radius][end] / 2])
+                println("[DEBUG] Load shed $total_ue detected, shrinking l1_radius to $(new_l1_radius)")
+                push!(master.ext[:l1_radius], new_l1_radius)
+            else
+                current_total_obj = master_obj + phi_val - theta_val
+                if (current_total_obj < master.ext[:total_obj][end])
+                    println("[DEBUG] Cheaper total objective $(current_total_obj) detected, taking serious step")
+                    push!(master.ext[:y_trust], y_val)
+                    push!(master.ext[:total_obj], current_total_obj)
+                end
+
+                new_l1_radius = master.ext[:l1_radius][end] * 2
+                println("[DEBUG] No load-shed, so expanding l1_radius to $(new_l1_radius)")
+                push!(master.ext[:l1_radius], new_l1_radius)
+            end
+        end
+
         # Update iter count and save master problem with metadata/extensions
         master.ext[:iter] += 1
         iter = master.ext[:iter]
@@ -869,18 +918,12 @@ function add_storage_minimum!(master)
         sum(s_energy_int[i] for i in 1:N) >= total_s_energy_int)
 end
 
-function add_box_step!(master, box_size)
-    data = master.ext[:data]
-    if master.ext[:iter] == 0
-        # TODO: write new over-invested core function
-        box_size = 0
-        gamma_core, s_energy_int_core = get_over_invested_point(data["param"]["core_point_simdir"], data)
-        y_core = [gamma_core, s_energy_int_core]
-        push!(master.ext[:y_trust], y_core)
-    else
-        remove_trust_region!(master)
+function add_trust_region!(master)
+    if master.ext[:stabilization] != "trust_region"
+        return
     end
 
+    data = master.ext[:data]
     # Initialize sets
     R = data["param"]["num_representatives"]
     N = length(data["bus"])
@@ -888,6 +931,90 @@ function add_box_step!(master, box_size)
     T = data["param"]["num_hours"]
     G = length(data["gen"])
     K = data["param"]["num_cap_upgrades_max"]
+    gamma, s_energy_int = master[:gamma], master[:s_energy_int]
+    abs_diff, trans_abs_diff = master[:abs_diff], master[:trans_abs_diff]
+    
+    if master.ext[:iter] == 0
+        # warm start initially to the exact over invested point
+        gamma_core, s_energy_int_core = zeros(E), zeros(N)
+        if master.ext[:warmstart]
+            gamma_core, s_energy_int_core = get_over_invested_point(data["param"]["core_point_simdir"], data)
+        end
+        y_core = [gamma_core, s_energy_int_core]
+        push!(master.ext[:y_trust], y_core)
+        master.ext[:l1_radius] = [1]
+        
+        y_trust = master.ext[:y_trust][end]
+        gamma_trust, s_energy_int_trust = y_trust
+
+        @constraint(master,
+            trans_abs_diff_ub[a in 1:E],
+            trans_abs_diff[a] >= gamma[a] - gamma_trust[a])
+        @constraint(master,
+            trans_abs_diff_lb[a in 1:E],
+            trans_abs_diff[a] >= gamma_trust[a] - gamma[a])
+        @constraint(master,
+            abs_diff_ub[i in 1:N],
+            abs_diff[i] >= s_energy_int[i] - s_energy_int_trust[i])
+        @constraint(master,
+            abs_diff_lb[i in 1:N],
+            abs_diff[i] >= s_energy_int_trust[i] - s_energy_int[i])
+        @constraint(master,
+            abs_diff_total,
+            sum(abs_diff[i] for i in 1:N) + sum(trans_abs_diff[a] for a in 1:E) == 0)
+        return
+    else
+        remove_trust_region!(master)
+    end
+    
+    # Move these assignments outside the if-else block to ensure they're always defined
+    y_trust = master.ext[:y_trust][end]
+    gamma_trust, s_energy_int_trust = y_trust
+
+    @constraint(master,
+        trans_abs_diff_ub[a in 1:E],
+        trans_abs_diff[a] >= gamma[a] - gamma_trust[a])
+    @constraint(master,
+        trans_abs_diff_lb[a in 1:E],
+        trans_abs_diff[a] >= gamma_trust[a] - gamma[a])
+    
+    @constraint(master,
+        abs_diff_ub[i in 1:N],
+        abs_diff[i] >= s_energy_int[i] - s_energy_int_trust[i])
+    @constraint(master,
+        abs_diff_lb[i in 1:N],
+        abs_diff[i] >= s_energy_int_trust[i] - s_energy_int[i])
+    @constraint(master,
+            abs_diff_total,
+            sum(abs_diff[i] for i in 1:N) + sum(trans_abs_diff[a] for a in 1:E) <= master.ext[:l1_radius][end])
+end
+
+function add_box_step!(master, box_size)
+    if master.ext[:stabilization] != "boxstep"
+        return
+    end
+
+    data = master.ext[:data]
+    # Initialize sets
+    R = data["param"]["num_representatives"]
+    N = length(data["bus"])
+    E = length(data["branch"])
+    T = data["param"]["num_hours"]
+    G = length(data["gen"])
+    K = data["param"]["num_cap_upgrades_max"]
+
+    if master.ext[:iter] == 0
+        box_size = 0
+        gamma_core, s_energy_int_core = zeros(E), zeros(N)
+        
+        if master.ext[:warmstart]
+            gamma_core, s_energy_int_core = get_over_invested_point(data["param"]["core_point_simdir"], data)
+        end
+        y_core = [gamma_core, s_energy_int_core]
+        push!(master.ext[:y_trust], y_core)
+    else
+        remove_trust_region!(master)
+    end
 
     y_trust = master.ext[:y_trust][end]
     gamma_trust, s_energy_int_trust = y_trust
@@ -911,15 +1038,19 @@ function add_box_step!(master, box_size)
 end
 
 function remove_trust_region!(master)
-    """constraint_names = [
-        :trans_abs_diff_ub, :trans_abs_diff_lb, :transmission_trust_region,
-        :abs_diff_ub, :abs_diff_lb, :siting_trust_region,
-        :sizing_abs_diff_ub, :sizing_abs_diff_lb, :sizing_trust_region
-    ]"""
+    stab_method = master.ext[:stabilization]
 
-    constraint_names = [
-    :trans_box_ub, :trans_box_lb, :stor_box_lb, :stor_box_ub
-    ]
+    if stab_method == "trust_region"
+        constraint_names = [
+            :trans_abs_diff_ub, :trans_abs_diff_lb, :abs_diff_ub, :abs_diff_lb, :abs_diff_total,
+        ]
+    elseif stab_method == "boxstep"
+        constraint_names = [
+        :trans_box_ub, :trans_box_lb, :stor_box_lb, :stor_box_ub
+        ]
+    else
+        return
+    end
 
     obj_dict = object_dictionary(master)
 
@@ -944,5 +1075,58 @@ function remove_trust_region!(master)
         else
             println("Constraint $name not found in model")
         end
+    end
+end
+
+function get_max_flow_capacity(sub, data)
+    E = length(data["branch"])
+    K = data["param"]["num_cap_upgrades_max"]
+    gamma = value.(sub[:gamma])
+
+    max_flow_capacity = zeros(E)
+
+    for a in 1:E
+        cap_increment = get_capacity_increment(data, a)
+        line_limit_base = data["branch"]["$a"]["rate_a"]
+        max_flow_capacity[a] = line_limit_base + K * cap_increment
+        # max_flow_capacity[a] = line_limit_base + gamma[a] * cap_increment
+    end
+
+    return max_flow_capacity
+end
+
+function compute_flow_overhead(sub, data, hour)
+    N = length(data["bus"])
+    E = length(data["branch"])
+    G = length(data["gen"])
+    nodal_injections = zeros(N)
+    gen_bus_map = sub.ext[:gen_bus_map]
+    pg = value.(sub[:pg])
+    ue = value.(sub[:ue])
+    ch, dis = value.(sub[:ch]), value.(sub[:dis])
+
+    for i in 1:N
+        nodal_injections[i] = (sum(pg[1, g, hour] for g in 1:G if gen_bus_map[g] == i; init=0.0)
+                - data["bus"]["$i"]["load"]["1"][hour]
+                + ue[1, i, hour] - ch[1, i, hour] + dis[1, i, hour])
+    end
+
+    ptdf = sub.ext[:PTDF]
+    flows = ptdf * nodal_injections
+
+    max_flow_capacity = get_max_flow_capacity(sub, data)
+
+    max_inj_before_violation = zeros(N)
+
+    m_minus_f = max_flow_capacity - flows
+    minus_m_minus_f = - max_flow_capacity - flows
+
+    for i in 1:N
+        injections_allowed = zeros(E)
+        for a in 1:E
+            injections_allowed[a] = ptdf[a,i] > 0 ? m_minus_f[a] / ptdf[a,i] : (ptdf[a,i] < 0 ? minus_m_minus_f[a] / ptdf[a,i] : Inf)
+        end
+
+        max_inj_before_violation[i] = minimum(injections_allowed)
     end
 end
