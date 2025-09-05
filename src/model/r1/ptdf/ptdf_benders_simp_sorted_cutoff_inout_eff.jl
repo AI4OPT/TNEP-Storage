@@ -89,12 +89,13 @@ function define_master_ptdf(data::Dict{String, Any})
     #
     #   II. Constraints
     #    
-    """
-    JuMP.@constraint(master, 
-        no_load_shed,
-        ue_sum <= 0
-    )
-    """
+    if master.ext[:warmstart]
+        JuMP.@constraint(master, 
+            no_load_shed,
+            ue_sum <= 0
+        )
+    end
+
 
     """
     # Check if previous investments exist
@@ -146,9 +147,16 @@ function define_master_ptdf(data::Dict{String, Any})
     #   III. Objective
     #
     # Start with the base objective terms
-    obj_expr = sum(s_energy_int[i] * data["param"]["storage_energy_size"] * data["param"]["bess_energy_cost"] for i in 1:N) + 
+    if master.ext[:warmstart]
+        obj_expr = sum(s_energy_int[i] * data["param"]["storage_energy_size"] * data["param"]["bess_energy_cost"] for i in 1:N) + 
             sum(data["param"]["cap_upgrade_cost"] * data["param"]["cap_upgrade_increment"] * data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
             theta + ue_sum * 365 * data["param"]["under_served_penalty"]
+    else
+        obj_expr = sum(s_energy_int[i] * data["param"]["storage_energy_size"] * data["param"]["bess_energy_cost"] for i in 1:N) + 
+                sum(data["param"]["cap_upgrade_cost"] * data["param"]["cap_upgrade_increment"] * data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
+                theta + ue_sum * 365 * data["param"]["under_served_penalty"]
+    end
+
     y = gamma, s_energy_int
 
     # Update the objective    
@@ -664,9 +672,6 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
             benders_ptdf_write_to_csv(filename, y_val, master_obj, theta_val, phi_val, total_ue)
             add_benders_cut_ptdf(master, theta, duals, y, y_val, phi_val)
 
-            # Update serious step (move trust region)
-            push!(master.ext[:y_trust], y_val)
-
             # Check convergence
             gap = abs(master_obj + phi_val - theta_val - master_obj) / (1e-10 + abs(master_obj))
             push!(master.ext[:gap], gap)
@@ -680,8 +685,9 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
                 push!(master.ext[:total_ue], total_ue)
             end
         elseif master.ext[:stabilization] == "trust_region"
+            l1_max = get(data["param"], "l1_max", 8192)
             if total_ue > 1e-2
-                new_l1_radius = master.ext[:l1_radius][end] * 2
+                new_l1_radius = minimum([l1_max, master.ext[:l1_radius][end] * 2])
                 println("[DEBUG] Load shed $total_ue detected, expanding transmission l1_radius to $(new_l1_radius)")
                 push!(master.ext[:l1_radius], new_l1_radius)
             else
@@ -695,7 +701,7 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
                     println("[DEBUG] Serious step, so reducing l1_radius to $(new_l1_radius)")
                     push!(master.ext[:l1_radius], new_l1_radius)
                 else
-                    new_l1_radius = master.ext[:l1_radius][end] * 2
+                    new_l1_radius = minimum([l1_max, master.ext[:l1_radius][end] * 2])
                     println("[DEBUG] No load shed or improvement in objective, expanding transmission l1_radius to $(new_l1_radius)")
                     push!(master.ext[:l1_radius], new_l1_radius)
                 end

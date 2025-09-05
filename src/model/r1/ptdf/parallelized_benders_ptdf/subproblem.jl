@@ -16,40 +16,11 @@ function save_tracked_constraints(simdir, tracked_constraints, n_violated)
     CSV.write(joinpath(simdir, "output", "tracked_constraints.csv"), df)
 end
 
-function load_tracked_constraints_df(simdir)
-    if isfile(joinpath(simdir, "output", "tracked_constraints.csv"))
-        return CSV.read(joinpath(simdir, "output", "tracked_constraints.csv"), DataFrame)
-
-    elseif isfile(joinpath(simdir, "tracked_constraints.csv"))
-        return CSV.read(joinpath(simdir, "tracked_constraints.csv"), DataFrame)
-    else
-        return nothing
-    end
-end
-
-function convert_tracked_df_to_dict(tracked_df)
-    tracked_constraints = Dict()
-    if tracked_df !== nothing
-        for row in eachrow(tracked_df)
-            key = (row.arc, row.rep, row.time, row.ub)
-            # You can store additional data as the value, or just mark as tracked
-            tracked_constraints[key] = true
-        end
-    end
-    return tracked_constraints
-end
-
-function solve_subproblem_ptdf(simdir, y_val; max_ptdf_iterations=256, max_ptdf_per_iteration=32, ptdf_tol=1e-6, logging=nothing)
-
-    if !isnothing(logging)
-        println("[DEBUG] $logging: Beginning subproblem solve")
-    end
-
-    # unpack investment decisions
-    gamma_val, s_power_val, s_energy_val = y_val
-
-    # Get subproblem data
-    data = JSON.parsefile(joinpath(simdir, "data.json"))
+function create_subproblem_model(simdir, data, tracked_constraints)
+    """
+    Creates the subproblem model with all variables and constraints except the objective function.
+    Returns the model ready for objective setting and solving.
+    """
 
     # Initialize sets
     R = data["param"]["num_representatives"]
@@ -64,13 +35,12 @@ function solve_subproblem_ptdf(simdir, y_val; max_ptdf_iterations=256, max_ptdf_
     sub = JuMP.Model(sub_optimizer)
     set_optimizer_attribute(sub, "LogFile", joinpath(simdir, "gurobi_sub_logfile.log"))
     set_optimizer_attribute(sub, "MIPGap", data["param"]["mip_gap"])
+    set_optimizer_attribute(sub, "Method", 1)      # Force dual simplex
+    set_optimizer_attribute(sub, "Crossover", 0)   # Disable crossover
 
-    # Set up the PTDF metadata
-    sub.ext[:solve_metadata] = Dict(
-        :max_ptdf_iterations => max_ptdf_iterations,
-        :max_ptdf_per_iteration => max_ptdf_per_iteration,
-        :ptdf_tol => ptdf_tol
-    )
+    # Store additional data in model extensions
+    sub.ext[:data] = data
+    sub.ext[:simdir] = simdir
     
     # Compute PTDF matrix
     sub.ext[:PTDF] = do_all_ptdf(data)
@@ -82,6 +52,9 @@ function solve_subproblem_ptdf(simdir, y_val; max_ptdf_iterations=256, max_ptdf_
         sub.ext[:PTDF] = ptdf_trimmed
     end
 
+    # Initialize tracked constraints with the passed dictionary
+    sub.ext[:tracked_constraints] = deepcopy(tracked_constraints)
+    
     # Get sets of branches with/without thermal limits
     rate_a_zero, rate_a_nonzero = get_rate_a_zero(data)
     sub.ext[:rate_a_nonzero] = Set(parse(Int, x) for x in rate_a_nonzero)
@@ -91,6 +64,7 @@ function solve_subproblem_ptdf(simdir, y_val; max_ptdf_iterations=256, max_ptdf_
 
     # Pre-compute useful mappings that don't change during the solution process
     gen_bus_map = Dict(parse(Int, g) => data["gen"]["$g"]["gen_bus"] for g in keys(data["gen"]))
+    sub.ext[:gen_bus_map] = gen_bus_map
 
     #
     #   I. Variables
@@ -129,17 +103,15 @@ function solve_subproblem_ptdf(simdir, y_val; max_ptdf_iterations=256, max_ptdf_
 
     # Fix investment variables based on master problem decisions
     @variable(sub, gamma[a=1:E])
-    @variable(sub, s_power[i=1:N])
-    @variable(sub, s_energy[i=1:N])
+    @variable(sub, s_energy_int[i=1:N])
 
     #
     #   II. Constraints
     #
 
     # FIX INVESTMENT DECISIONS FROM MASTER PROBLEM (DUALS USED FOR CUTS)
-    @constraint(sub, master_gamma[a=1:E], gamma[a] == gamma_val[a])
-    @constraint(sub, master_power[i=1:N], s_power[i] == s_power_val[i])
-    @constraint(sub, master_energy[i=1:N], s_energy[i] == s_energy_val[i])
+    # @constraint(sub, master_gamma[a=1:E], gamma[a] == gamma_val[a])
+    # @constraint(sub, master_energy[i=1:N], s_energy_int[i] == s_energy_int_val[i])
 
     # Global power balance
     @constraint(sub, 
@@ -163,52 +135,40 @@ function solve_subproblem_ptdf(simdir, y_val; max_ptdf_iterations=256, max_ptdf_
     # Initial and final SOC
     @constraint(sub,
         soc_start[r=1:R, i=1:N],
-        soc[r,i,1] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy[i] + ch[r,i,1] * data["param"]["bess_efficiency"] - dis[r,i,1] / data["param"]["bess_efficiency"]
+        soc[r,i,1] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy_int[i] * data["param"]["storage_energy_size"] + ch[r,i,1] * data["param"]["bess_efficiency"] - dis[r,i,1] / data["param"]["bess_efficiency"]
     )
     @constraint(sub,
         soc_end[r=1:R, i=1:N],
-        soc[r,i,T] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy[i]
+        soc[r,i,T] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy_int[i] * data["param"]["storage_energy_size"]
     )
 
     # SOC limits
     @constraint(sub, 
         soc_energy_ub[r=1:R, i=1:N, t=1:T],
-        soc[r,i,t] <= s_energy[i]
+        soc[r,i,t] <= s_energy_int[i] * data["param"]["storage_energy_size"]
     )
     
     # Charging/discharging limits
     @constraint(sub,
         charge_discharge_lb[r=1:R, i=1:N, t=1:T],
-        dis[r,i,t] <= s_power[i]
+        dis[r,i,t] <= s_energy_int[i] * data["param"]["storage_energy_size"] / 4
     )
     @constraint(sub,
         charge_discharge_ub[r=1:R, i=1:N, t=1:T],
-        ch[r,i,t] <= s_power[i]
+        ch[r,i,t] <= s_energy_int[i] * data["param"]["storage_energy_size"] / 4
     )
-
-    # Objective function
-    operational_weight = get(data["param"], "operational_weight", 1)
-
-    @objective(sub, Min,
-        sum(
-            data["param"]["representative_prob"][r] *
-            (
-                sum(
-                    sum(compute_gen_cost(pg[r, g, t], data["gen"]["$g"]) for g=1:G) +
-                    sum(data["param"]["under_served_penalty"] * ue[r, i, t] for i=1:N) + 
-                    sum(get(data["param"], "storage_operation_cost", 0.0) * (ch[r,i,t] + dis[r,i,t]) for i=1:N)
-                for t=1:T)
-            )
-        for r=1:R) * operational_weight
-    )
-
-    # Initialize tracked constraints
-    tracked_df = load_tracked_constraints_df(simdir)
-    tracked_constraints = convert_tracked_df_to_dict(tracked_df)
 
     # Apply warm-start using tracked constraints
     if !isempty(tracked_constraints)
-        println("[DEBUG] Beginning optimized warm-start for subproblem")        
+        println("[DEBUG] Beginning optimized warm-start for subproblem")
+        
+        # Convert dictionary to DataFrame for grouping
+        arc_list = [k[1] for k in keys(tracked_constraints)]
+        rep_list = [k[2] for k in keys(tracked_constraints)]
+        time_list = [k[3] for k in keys(tracked_constraints)]
+        ub_list = [k[4] for k in keys(tracked_constraints)]
+        tracked_df = DataFrame(arc=arc_list, rep=rep_list, time=time_list, ub=ub_list)
+        
         # Group by arc for efficient processing
         arc_groups = groupby(tracked_df, :arc)
         total_constraints = 0
@@ -252,12 +212,115 @@ function solve_subproblem_ptdf(simdir, y_val; max_ptdf_iterations=256, max_ptdf_
         println("[DEBUG] Warm-started subproblem with $total_constraints constraints")
     end
 
+    return sub
+end
+
+function set_operational_objective!(sub)
+    """
+    Sets the operational cost objective function on the subproblem model.
+    """
+    data = sub.ext[:data]
+    R = data["param"]["num_representatives"]
+    N = length(data["bus"])
+    T = data["param"]["num_hours"]
+    G = length(data["gen"])
+    
+    operational_weight = get(data["param"], "operational_weight", 1)
+    @objective(sub, Min,
+        sum(
+            data["param"]["representative_prob"][r] *
+            (
+                sum(
+                    sum(compute_gen_cost(sub[:pg][r, g, t], data["gen"]["$g"]) for g=1:G) +
+                    sum(data["param"]["under_served_penalty"] * sub[:ue][r, i, t] for i=1:N) + 
+                    sum(get(data["param"], "storage_operation_cost", 0.0) * (sub[:ch][r,i,t] + sub[:dis][r,i,t]) for i=1:N)
+                for t=1:T)
+            )
+        for r=1:R) * operational_weight
+    )
+end
+
+function set_underserved_objective!(sub)
+    """
+    Sets the underserved energy objective function on the subproblem model.
+    """
+    data = sub.ext[:data]
+    R = data["param"]["num_representatives"]
+    N = length(data["bus"])
+    T = data["param"]["num_hours"]
+    
+    @objective(sub, Min,
+        sum(
+            data["param"]["representative_prob"][r] *
+            (
+                sum(
+                    sum(sub[:ue][r, i, t] for i=1:N)
+                for t=1:T)
+            )
+        for r=1:R)
+    )
+end
+
+function set_sub_investments!(sub, y_val)
+    data = sub.ext[:data]
+    N = length(data["bus"])
+    E = length(data["branch"])
+
+    gamma = sub[:gamma]
+    s_energy_int = sub[:s_energy_int]
+
+    # Check and remove existing master_gamma constraints if they exist
+    if haskey(sub.obj_dict, :master_gamma)
+        delete(sub, sub[:master_gamma])
+        unregister(sub, :master_gamma)
+    end
+    
+    # Check and remove existing master_energy constraints if they exist
+    if haskey(sub.obj_dict, :master_energy)
+        delete(sub, sub[:master_energy])
+        unregister(sub, :master_energy)
+    end
+
+    # FIX INVESTMENT DECISIONS FROM MASTER PROBLEM (DUALS USED FOR CUTS)
+    gamma_val, s_energy_int_val = y_val
+    @constraint(sub, master_gamma[a=1:E], gamma[a] == gamma_val[a])
+    @constraint(sub, master_energy[i=1:N], s_energy_int[i] == s_energy_int_val[i])
+end
+
+function solve_subproblem_ptdf!(sub; max_ptdf_iterations=256, max_ptdf_per_iteration=32, ptdf_tol=1e-6, logging=nothing)
+    """
+    Solves the subproblem using lazy PTDF constraints.
+    The model should already be created and have an objective function set.
+    """
+    
+    if !isnothing(logging)
+        println("[DEBUG] $logging: Beginning subproblem solve")
+    end
+    
+    # Get data from model extensions
+    data = sub.ext[:data]
+    simdir = sub.ext[:simdir]
+    gen_bus_map = sub.ext[:gen_bus_map]
+    
+    # Set up the PTDF metadata
+    sub.ext[:solve_metadata] = Dict(
+        :max_ptdf_iterations => max_ptdf_iterations,
+        :max_ptdf_per_iteration => max_ptdf_per_iteration,
+        :ptdf_tol => ptdf_tol
+    )
+    
+    R = data["param"]["num_representatives"]
+    N = length(data["bus"])
+    E = length(data["branch"])
+    T = data["param"]["num_hours"]
+    G = length(data["gen"])
+
     # Solve using lazy PTDF constraints
     solved = false
     niter = 0
     t0 = time()
 
-    while !solved && niter < sub.ext[:solve_metadata][:max_ptdf_iterations]
+    while !solved && niter < max_ptdf_iterations
         # Solve model
         println("[DEBUG] Solving PTDF subproblem for constraint discovery: subiteration $niter")
         optimize!(sub)
@@ -294,11 +357,11 @@ function solve_subproblem_ptdf(simdir, y_val; max_ptdf_iterations=256, max_ptdf_
                 violation_amount = abs(flow_val) - line_limit_fixed
                 ub = (flow_val >= 0)
 
-                if get(tracked_constraints, (a, r, t, ub), false)
+                if get(sub.ext[:tracked_constraints], (a, r, t, ub), false)
                     continue
                 end
         
-                if violation_amount > sub.ext[:solve_metadata][:ptdf_tol]
+                if violation_amount > ptdf_tol
                     push!(violations, (a, r, t, ub, violation_amount))
                 end
             end
@@ -309,8 +372,7 @@ function solve_subproblem_ptdf(simdir, y_val; max_ptdf_iterations=256, max_ptdf_
         n_added = 0
 
         # Add up to the limit
-        max_to_add = sub.ext[:solve_metadata][:max_ptdf_per_iteration]
-        for (a, r, t, ub, _) in Iterators.take(sorted_violations, max_to_add)
+        for (a, r, t, ub, _) in Iterators.take(sorted_violations, max_ptdf_per_iteration)
 
             ptdf_row = sub.ext[:PTDF][a,:]
             cap_increment = get_capacity_increment(data, a)
@@ -331,17 +393,16 @@ function solve_subproblem_ptdf(simdir, y_val; max_ptdf_iterations=256, max_ptdf_
                 sub[:ptdf_flow]["$(a)_$(r)_$(t)_lb"] = @constraint(sub, flow_expr >= -line_limit_expr)
             end
         
-            tracked_constraints[(a, r, t, ub)] = true
+            sub.ext[:tracked_constraints][(a, r, t, ub)] = true
             n_added += 1
         end
 
         if n_added > 0
-            save_tracked_constraints(simdir, tracked_constraints, n_violated)
+            save_tracked_constraints(simdir, sub, n_violated)
         end
         solved = (n_violated == 0)
         niter += 1
 
-        # println("approx. progress $(checked_count / E)")
         println("[DEBUG] PTDF Subproblem Iteration $niter: Found $n_violated violations, added $n_added constraints")
     end
 
@@ -349,14 +410,22 @@ function solve_subproblem_ptdf(simdir, y_val; max_ptdf_iterations=256, max_ptdf_
     solve_time = time() - t0
     sub.ext[:solve_metadata][:solve_time] = solve_time
 
+    return sub
+end
+
+function extract_subproblem_duals(sub)
+    """
+    Extracts duals from the solved subproblem for Benders cuts.
+    """
     # Extract duals for Benders cuts
-    # Note: Ensure the model is solved to optimality before extracting duals
     if termination_status(sub) ∈ (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
-        dual_gamma = [dual(master_gamma[a]) for a=1:E]
-        dual_power = [dual(master_power[i]) for i=1:N]
+        E = length(sub.ext[:data]["branch"])
+        N = length(sub.ext[:data]["bus"])
         
-        duals = (dual_gamma, dual_power)
-        return sub, objective_value(sub), duals
+        dual_gamma = [dual(sub[:master_gamma][a]) for a=1:E]
+        dual_energy = [dual(sub[:master_energy][i]) for i=1:N]
+        
+        return (dual_gamma, dual_energy)
     else
         error("Subproblem failed to solve optimally: $(termination_status(sub))")
     end

@@ -10,9 +10,6 @@ include("process_max_upgrades.jl")
 include("master_problem.jl")
 include("subproblem.jl")
 include("benders_logging.jl")
-include("stabilization.jl")
-include("process_max_upgrades.jl")
-
 
 # This function sets up the superdirectory and the subproblem directories, and generates each data.json file
 # It also copies the master config into subproblem specific configs
@@ -73,154 +70,254 @@ function parallelized_ptdf_benders(superdir)
 
     # Set up the data by reading the config
     master_data = set_up_data(superdir)
-
-    # Compute the initial core point
-    compute_superset_core_point(superdir)
     println("[DEBUG] Finished setting up directories and files for $superdir")
 
     # Create master problem
-    master, y, theta = load_or_make_master_problem(superdir, master_data, date_weights)
+    master, y, theta = define_master_ptdf(superdir, master_data, date_weights)
 
     # Main benders loop
-    gamma_val, s_power_val, s_energy_val = master_benders_loop(superdir, master, y, theta, master_data)
+    gamma_val, s_energy_int_val = master_benders_loop(superdir, master, master_data, date_weights)
 
     # Save final investments
-    export_investments_csv(master_data, gamma_val, s_power_val, s_energy_val, output_dir=joinpath(superdir,"final_output"))
-
+    export_investments_csv(master_data, gamma_val, s_energy_int_val, output_dir=joinpath(superdir,"final_output"))
+    return master
 end
 
-# This function will get the initial core point for the benders (an over-invested first stage)
-function compute_superset_core_point(superdir)
-    # Read the full config file
-    config_file = joinpath(superdir, "config.toml")
-    toml_data = TOML.parsefile(config_file)
-
-    # Get the initial core points (solved without benders)
-    # has rep day optimal investments
-    initial_optima_dir = toml_data["initial_optima_dir"]
-
-    dates = toml_data["dates"]
-
-    csv_trans_files = [joinpath(initial_optima_dir, a_date, "output", "line_investments.csv") for a_date in dates]
-    csv_stor_files = [joinpath(initial_optima_dir, a_date, "output", "storage_investments.csv") for a_date in dates]
-
-    process_csv_max_upgrade(csv_trans_files, joinpath(superdir, "line_investments.csv"))
-    process_csv_max_storage(csv_stor_files, joinpath(superdir, "storage_investments.csv"))
+mutable struct PersistentSubproblemWorker
+    sub_model::Model
+    work_channel::Channel{Vector{Any}} # receives y_val
+    result_channel::Channel{Any} # returns duals
+    task::Task
+    worker_id::Int
 end
 
-function master_benders_loop(superdir, master, y, theta, master_data, max_iterations=100000, tolerance=0.01)
+function create_persistent_workers(superdir, date_weights)
+    workers = PersistentSubproblemWorker[]
+
+    for i in 1:length(date_weights)
+        work_channel = Channel{Vector{Any}}(1)
+        result_channel = Channel{Any}(1)
+
+        worker = PersistentSubproblemWorker(
+            Model(),
+            work_channel,
+            result_channel,
+            Task(() -> nothing),
+            i
+        )
+
+        worker.task = Threads.@spawn begin
+            # Create subproblem model once in this thread
+            id = worker.worker_id
+            date = date_weights[id][1]
+            simdir = joinpath(superdir, date)
+            data = JSON.parsefile(joinpath(simdir, "data.json"))
+
+            # Initialize tracked constraints dictionary to store across iterations
+            tracked_constraints = Dict{Tuple{Int,Int,Int,Bool}, Bool}()
+
+            # Load previous constraints if available
+            if isfile(joinpath(simdir, "tracked_constraints.csv"))
+                tracked_df = CSV.read(joinpath(simdir, "tracked_constraints.csv"), DataFrame)
+                println("[DEBUG] Loading $(nrow(tracked_df)) previously tracked constraints")
+                
+                for row in eachrow(tracked_df)
+                    if row.tracked
+                        tracked_constraints[(row.arc, row.rep, row.time, row.ub)] = true
+                    end
+                end
+            end
+
+            worker.sub_model = create_subproblem_model(simdir, data, tracked_constraints)
+            println("Worker $(worker.worker_id) on date $(date) initialized on thread $(Threads.threadid())")
+
+            while true
+                try
+                    # Wait for work (y_val)
+                    y_val = take!(work_channel)
+
+                    # Solve subproblem
+                    set_sub_investments!(worker.sub_model, y_val)
+                    # Phase 1: check feasibility of no load shed
+                    set_underserved_objective!(worker.sub_model)
+                    solve_subproblem_ptdf!(worker.sub_model; max_ptdf_iterations=256, max_ptdf_per_iteration=32, ptdf_tol=1e-6)
+                    total_ue = objective_value(worker.sub_model)
+                    duals = extract_subproblem_duals(worker.sub_model)
+
+                    if total_ue > 0 # If failed Phase 1, infeasible due to load shed
+                        println("[DEBUG] Worker $(worker.worker_id) on date $(date): add FEASIBILITY cut, load shed $(total_ue) detected")
+
+                        results = [total_ue, 0, duals, worker.worker_id]
+                        put!(result_channel, results)
+                    
+                    else # Passed Phase 1, move onto Phase 2 to check operational objective
+                        set_operational_objective!(worker.sub_model)
+                        solve_subproblem_ptdf!(worker.sub_model; max_ptdf_iterations=256, max_ptdf_per_iteration=32, ptdf_tol=1e-6)
+                        phi_val = objective_value(worker.sub_model)
+                        duals = extract_subproblem_duals(worker.sub_model)
+                        total_ue = vec(sum(value.(worker.sub_model[:ue]),dims=[1,2,3]))[1]
+
+                        results = [total_ue, phi_val, duals, worker.worker_id]
+                        put!(result_channel, results)
+                    end
+                
+                catch e
+                    if e isa InvalidStateException
+                        println("Worker $(worker.worker_id) shutting down")
+                        break  # Channel closed, exit gracefully
+                    else
+                        println("Error in worker $(worker.worker_id): $e")
+                        put!(result_channel, nothing)  # Signal error
+                    end
+                end
+            end
+        end
+
+        push!(workers, worker)
+    end
+
+    return workers
+end
+
+function solve_subproblems_parallel!(workers, y_val)
+    # Send work to all workers (concurrent dispatch)
+    for worker in workers
+        put!(worker.work_channel, copy(y_val))
+    end
+
+    # Collect all results (wait for completion)
+    all_results = []
+    for worker in workers   
+        results = take!(worker.result_channel) # Blocks until worker is done
+        push!(all_results, results)
+    end
+
+    return all_results
+end
+
+function add_all_benders_cuts(master, master_obj, theta_val, all_results, y_val)
+    y = master[:gamma], master[:s_energy_int]
+    date_weights = master.ext[:date_weights]
+    superdir = master.ext[:superdir]
+    data = master.ext[:data]
+
+    total_theta_val = 0
+    total_phi_val = 0
+    total_ue = 0
+
+    for result in all_results
+        ue = result[1]
+        phi_val = result[2]
+        duals = result[3]
+        date_index = result[4]
+
+        if ue > 0
+            # Add feasibility cut
+            add_benders_cut_ptdf(master, master[:ue_sum], duals, y, y_val, ue)
+        else
+            # Add optimality cut
+            add_benders_cut_ptdf(master, master[:theta][date_index], duals, y, y_val, phi_val)
+        end
+
+        # Create the rep-day specific benders logs
+        output_dir = joinpath(superdir, date_weights[date_index][1])
+        benders_ptdf_write_to_csv(output_dir, y_val, master_obj, theta_val[date_index], phi_val, ue)
+
+        # Also begin building the aggregate benders log
+        total_theta_val += theta_val[date_index] * date_weights[date_index][2]
+        if ue > 0
+            total_phi_val += (theta_val[date_index] + data["param"]["under_served_penalty"] * ue) * date_weights[date_index][2]
+        else
+            total_phi_val += phi_val * date_weights[date_index][2]
+        end
+        total_ue += ue * date_weights[date_index][2]
+    end
+
+    benders_ptdf_write_to_csv(superdir, y_val, master_obj, total_theta_val, total_phi_val, total_ue)
+    current_obj = master_obj + total_phi_val - total_theta_val
+    return current_obj, total_ue
+end
+
+function master_benders_loop(superdir, master, master_data, date_weights, max_iterations=100000, tolerance=0.01)
+    max_iterations=100000
+    tolerance=0.01
     converged = false
     iter = master.ext[:iter]
     date_weights = master.ext[:date_weights]
-    
-    # Unpack y variables
-    gamma, s_power, s_energy = y
-    gamma_val, s_power_val, s_energy_val = nothing, nothing, nothing
 
-    while !converged && iter < max_iterations
-        # Solve master problem
-        println("[DEBUG] Solving master problem: iteration $iter")
-        update_master_objective!(superdir, master, master_data, y, theta)
-        optimize!(master)
-        
-        if !has_values(master)
-            error("Master problem has no solution: $(termination_status(master))")
-        end
-        
-        # Get master solution
-        gamma_val = value.(gamma)
-        s_power_val = value.(s_power)
-        s_energy_val = value.(s_energy)
-        theta_val = value.(theta)
-        y_raw = [gamma_val, s_power_val, s_energy_val]
-        push!(master.ext[:y_raw], y_raw) # y_raw list is updated
+    workers = create_persistent_workers(superdir, date_weights)
+    # Let workers initialize
+    sleep(1)
 
-        # Save raw solution
-        export_investments_csv(master_data, gamma_val, s_power_val, s_energy_val, output_dir=joinpath(superdir,"benders_output"), file_suffix="$iter")
+    gamma_val, s_energy_int_val = nothing, nothing
 
-        # Compute the evaluation point where Bender's cuts will be made
-        y_eval, y_core = compute_eval_core_points(superdir, master, master_data) # y_eval and y_core are updated
-        lambda_val = master.ext[:stabilization_lambda][end]
+    try
+        for iteration in 1:max_iterations
+            println("[DEBUG] Solving master problem: iteration $iter")
+            # Solve master problem
+            add_trust_region!(master)
+            optimize!(master)
 
-        gamma_eval, s_power_eval, s_energy_eval = y_eval
-        export_investments_csv(master_data, gamma_eval, s_power_eval, s_energy_eval, output_dir=joinpath(superdir,"benders_output"), file_suffix="eval_$iter")
+            # Get master solution
+            gamma_val = value.(master[:gamma])
+            s_energy_int_val = value.(master[:s_energy_int])
+            theta_val = value.(master[:theta])
 
-        # This is thread SAFE - pre-allocate and use indexed assignment
-        date_weights_vec = sort(collect(date_weights), by=first) 
-        subproblem_results = Vector{Tuple}(undef, length(date_weights_vec))
-        @threads for i in 1:length(date_weights_vec)
-            rep_index, (a_date, prob) = date_weights_vec[i]
-            @assert rep_index == i  # Verify our assumption
-            thread_id = threadid()
-            println("Thread $thread_id: Starting subproblem for $a_date (rep_index $rep_index)")
-            start_time = time()
-            
-            try
-                simdir = joinpath(superdir, a_date)
-                _, phi_val, duals = solve_subproblem_ptdf(simdir, y_eval, logging="Eval Point iter $iter for $a_date")
-                
-                solve_time = time() - start_time
-                println("Thread $thread_id: Completed $a_date in $(round(solve_time, digits=2)) seconds")
-                
-                subproblem_results[i] = (a_date, simdir, phi_val, duals)
-                
-            catch e
-                solve_time = time() - start_time
-                println("Thread $thread_id: ERROR solving $a_date after $(round(solve_time, digits=2)) seconds: $e")
-                rethrow(e)
+            # Save lower bound
+            master_obj = objective_value(master)
+
+            # Export investments
+            y_val = [gamma_val, s_energy_int_val]
+            export_investments_csv(master_data, gamma_val, s_energy_int_val, output_dir=joinpath(superdir,"benders_output"), file_suffix="$iter")
+
+            # Solve all subproblems in parallel
+            println("[DEBUG] Iteration $(iter): solving all subproblems in parallel...")
+            all_results = solve_subproblems_parallel!(workers, y_val)
+
+            # Add Benders cuts sequentially, make Benders logs
+            println("[DEBUG] Iteration $(iter): adding Benders cuts...")
+            current_obj, total_ue = add_all_benders_cuts(master, master_obj, theta_val, all_results, y_val)
+
+            # Update with serious step of the trust/anchor point if satisfy conditions
+            if master.ext[:stabilization] == "trust_region"
+                l1_max = get(master_data["param"], "l1_max", 8192)
+                if total_ue > 0
+                    new_l1_radius = minimum([l1_max, master.ext[:l1_radius][end] * 2])
+                    println("[DEBUG] Load shed $total_ue detected, expanding transmission l1_radius to $(new_l1_radius)")
+                    push!(master.ext[:l1_radius], new_l1_radius)
+                else
+                    if (current_obj < master.ext[:total_obj][end])
+                        println("[DEBUG] Cheaper total objective $(current_obj) detected, taking serious step")
+                        push!(master.ext[:y_trust], y_val)
+                        push!(master.ext[:total_obj], current_obj)
+
+                        new_l1_radius = maximum([1, master.ext[:l1_radius][end] / 2])
+                        println("[DEBUG] Serious step, so reducing l1_radius to $(new_l1_radius)")
+                        push!(master.ext[:l1_radius], new_l1_radius)
+                    else
+                        new_l1_radius = minimum([l1_max, master.ext[:l1_radius][end] * 2])
+                        println("[DEBUG] No load shed or improvement in objective, expanding transmission l1_radius to $(new_l1_radius)")
+                        push!(master.ext[:l1_radius], new_l1_radius)
+                    end
+                end
             end
-        end
-        println("[DEBUG] Iteration $(iter): all subproblems solved!")
 
-        # Sequentially save subproblem Bender's logs and add cuts to the master problem
-        master_obj_val = objective_value(master)
-        for rep_index in 1:length(subproblem_results)
-            a_date, simdir, phi_val, duals = subproblem_results[rep_index]
-            
-            # Individual subproblem Bender's log
-            benders_ptdf_write_to_csv(simdir, master_obj_val, theta_val[rep_index], phi_val, y_eval, lambda_val=lambda_val)
-
-            # Add the cut to the master problem
-            add_benders_cut_ptdf(master, theta[rep_index], duals, y, y_eval, phi_val)
+            # TODO: check for convergence
+            master.ext[:iter] += 1
+            iter = master.ext[:iter]
         end
 
-        # Master problem Bender's log
-        R = length(date_weights)
-        total_theta_val = sum(theta_val[r] * date_weights[r][2] for r in 1:R)
-        total_phi_val = sum(subproblem_results[r][3] * date_weights[r][2] for r in 1:R)
-        benders_ptdf_write_to_csv(superdir, master_obj_val, total_theta_val, total_phi_val, y_eval, lambda_val=lambda_val)
-
-        # Clear references
-        subproblem_results = nothing
-        GC.gc()
-
-        # Check convergence
-        gap = abs(total_theta_val - total_phi_val) / (1e-10 + abs(total_theta_val))
-        push!(master.ext[:gap], gap)
-        println("[DEBUG] Benders iteration $(iter): Master objective = $(master_obj_val), theta = $(total_theta_val), phi = $(total_phi_val), gap = $(gap)")
-
-        # If converged, exit benders loop
-        lambda = master.ext[:stabilization_lambda][end]
-        if gap < 0.01 && lambda < 1e-10
-            println("[DEBUG] Final gap at discrete solution = $(gap) < $(tolerance). Converged after $(iter) iterations.")
-            println("[DEBUG] Stabilization lambda was $(lambda).")
-            converged = true
+    finally
+        # Clean shutdown
+        println("Shutting down workers...")
+        for worker in workers
+            close(worker.work_channel)
         end
-        
-        # Update iter count and save master problem with metadata/extensions
-        master.ext[:iter] += 1
-        iter = master.ext[:iter]
-        save_master_problem(master, superdir)
+
+        # Wait a moment for graceful shutdown
+        sleep(1)
     end
 
-    if !converged
-        println("[DEBUG] Benders decomposition did not converge after $max_iterations iterations")
-    end
-    
     # Return final solution
-    return [gamma_val, s_power_val, s_energy_val]
+    return [gamma_val, s_energy_int_val]
 end
-
-    
-    
-
