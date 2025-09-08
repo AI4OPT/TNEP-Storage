@@ -10,6 +10,7 @@ include("process_max_upgrades.jl")
 include("master_problem.jl")
 include("subproblem.jl")
 include("benders_logging.jl")
+include("compare_l1_investments.jl")
 
 # This function sets up the superdirectory and the subproblem directories, and generates each data.json file
 # It also copies the master config into subproblem specific configs
@@ -44,6 +45,7 @@ function set_up_directories(superdir)
 
         # Warm-start subproblem with tracked constraints
         # tracked_file = joinpath(initial_optima_dir, a_date, "output", "tracked_constraints.csv")
+        # tracked_file = joinpath(superdir, a_date, "output", "tracked_constraints.csv")
         # cp(tracked_file, joinpath(simdir, "tracked_constraints.csv"), force=true)
 
         # Create subproblem data
@@ -280,29 +282,27 @@ function master_benders_loop(superdir, master, master_data, date_weights, max_it
 
             # Update with serious step of the trust/anchor point if satisfy conditions
             if master.ext[:stabilization] == "trust_region"
-                l1_max = get(master_data["param"], "l1_max", 8192)
-                if total_ue > 0
-                    new_l1_radius = minimum([l1_max, master.ext[:l1_radius][end] * 2])
-                    println("[DEBUG] Load shed $total_ue detected, expanding transmission l1_radius to $(new_l1_radius)")
-                    push!(master.ext[:l1_radius], new_l1_radius)
-                else
-                    if (current_obj < master.ext[:total_obj][end])
+                if total_ue == 0
+                    if (current_obj < master.ext[:total_obj][end]) # If actual improvement, serious step and reduce l1 radius to 1
                         println("[DEBUG] Cheaper total objective $(current_obj) detected, taking serious step")
                         push!(master.ext[:y_trust], y_val)
                         push!(master.ext[:total_obj], current_obj)
-
-                        new_l1_radius = maximum([1, master.ext[:l1_radius][end] / 2])
-                        println("[DEBUG] Serious step, so reducing l1_radius to $(new_l1_radius)")
-                        push!(master.ext[:l1_radius], new_l1_radius)
-                    else
-                        new_l1_radius = minimum([l1_max, master.ext[:l1_radius][end] * 2])
-                        println("[DEBUG] No load shed or improvement in objective, expanding transmission l1_radius to $(new_l1_radius)")
-                        push!(master.ext[:l1_radius], new_l1_radius)
+                        println("[DEBUG] Serious step, so reducing l1_radius to 1")
+                        push!(master.ext[:l1_radius], 1)
+                        add_level_set!(master, current_obj)
+                    else # No actual improvement, null step
+                        l1_distance = compare_y_vals(y_val, master.ext[:last_y_val])
+                        if l1_distance == 0 # If repeating the same investment
+                            new_l1_radius = master.ext[:l1_radius][end] + 1
+                            println("[DEBUG] Stuck in local region, expanding transmission l1_radius to $(new_l1_radius)")
+                            push!(master.ext[:l1_radius], new_l1_radius)
+                        end
                     end
                 end
             end
 
             # TODO: check for convergence
+            master.ext[:last_y_val] = y_val
             master.ext[:iter] += 1
             iter = master.ext[:iter]
         end

@@ -12,6 +12,7 @@ include("ptdf_save_data.jl")
 include("ptdf_core_point.jl")
 include("ptdf_benders_pareto.jl")
 include("ptdf_benders_save_load_master.jl")
+include("parallelized_benders_ptdf/compare_l1_investments.jl")
 
 function define_master_ptdf(data::Dict{String, Any})
     # Initialize model
@@ -43,6 +44,7 @@ function define_master_ptdf(data::Dict{String, Any})
     master.ext[:data] = data
     master.ext[:total_ue] = [Inf]
     master.ext[:total_obj] = [Inf]
+    master.ext[:last_y_val] = [zeros(E), zeros(N)]
 
     # Get incidence matrix from extension
     incidence_matrix = master.ext[:INCIDENCE] = do_all_incidence(data)
@@ -80,6 +82,7 @@ function define_master_ptdf(data::Dict{String, Any})
 
     master.ext[:warmstart] = get(data["param"], "warmstart", false)
     master.ext[:stabilization] = get(data["param"], "stabilization", false)
+    master.ext[:level_set] = get(data["param"], "level_set", false)
 
     if master.ext[:stabilization] == "trust_region"
         JuMP.@variable(master, abs_diff[1:N] >= 0)
@@ -159,8 +162,9 @@ function define_master_ptdf(data::Dict{String, Any})
 
     y = gamma, s_energy_int
 
-    # Update the objective    
+    # Set the objective    
     JuMP.@objective(master, Min, obj_expr)
+    master.ext[:obj_expr] = obj_expr
 
     return master, y, theta
 end
@@ -183,7 +187,6 @@ function create_subproblem_model(simdir, data, tracked_constraints)
     sub_optimizer = Gurobi.Optimizer
     sub = JuMP.Model(sub_optimizer)
     set_optimizer_attribute(sub, "LogFile", joinpath(simdir, "gurobi_sub_logfile.log"))
-    set_optimizer_attribute(sub, "MIPGap", data["param"]["mip_gap"])
     set_optimizer_attribute(sub, "Method", 1)      # Force dual simplex
     set_optimizer_attribute(sub, "Crossover", 0)   # Disable crossover
 
@@ -336,7 +339,7 @@ function create_subproblem_model(simdir, data, tracked_constraints)
             rep_time_pairs = [(row.rep, row.time, row.ub) for row in constraints_batch]
 
             # Pre-compute the line limits for all constraints in this group
-            line_limit = line_limit_base + sub[:gamma][a] * cap_increment
+            line_limit_expr = line_limit_base + sub[:gamma][a] * cap_increment
             
             # Generate constraints efficiently
             for (r, t, ub) in rep_time_pairs
@@ -351,9 +354,9 @@ function create_subproblem_model(simdir, data, tracked_constraints)
                 
                 # Add constraint that should be added depending on ub (upper bound)
                 if ub
-                    sub[:ptdf_flow]["$(a)_$(r)_$(t)_ub"] = @constraint(sub, flow_expr <= line_limit)
+                    sub[:ptdf_flow]["$(a)_$(r)_$(t)_ub"] = @constraint(sub, flow_expr <= line_limit_expr)
                 else
-                    sub[:ptdf_flow]["$(a)_$(r)_$(t)_lb"] = @constraint(sub, flow_expr >= -line_limit)
+                    sub[:ptdf_flow]["$(a)_$(r)_$(t)_lb"] = @constraint(sub, flow_expr >= -line_limit_expr)
                 end
             end
         end
@@ -436,7 +439,7 @@ function set_sub_investments!(sub, y_val)
     @constraint(sub, master_energy[i=1:N], s_energy_int[i] == s_energy_int_val[i])
 end
 
-function solve_subproblem_ptdf!(sub; max_ptdf_iterations=256, max_ptdf_per_iteration=32, ptdf_tol=1e-6, logging=nothing)
+function solve_subproblem_ptdf!(sub; max_ptdf_iterations=256, max_ptdf_per_iteration=32, ptdf_tol=0, logging=nothing)
     """
     Solves the subproblem using lazy PTDF constraints.
     The model should already be created and have an objective function set.
@@ -479,15 +482,10 @@ function solve_subproblem_ptdf!(sub; max_ptdf_iterations=256, max_ptdf_per_itera
         st ∈ (MOI.OPTIMAL, MOI.LOCALLY_SOLVED) || break
 
         # Get current solution values
-        pg_values = value.(sub[:pg])
-        ue_values = value.(sub[:ue])
-        ch_values = value.(sub[:ch])
-        dis_values = value.(sub[:dis])
         gamma_values = value.(sub[:gamma])
 
         # Compute all flows at once
-        flows = zeros(length(sub.ext[:rate_a_nonzero]), R, T)
-        compute_flows!(flows, pg_values, ue_values, ch_values, dis_values, data, sub.ext[:PTDF])
+        flows = compute_flows!(sub)
 
         # Add violations prioritizing by size
         violations = []
@@ -549,15 +547,15 @@ function solve_subproblem_ptdf!(sub; max_ptdf_iterations=256, max_ptdf_per_itera
         if n_added > 0
             save_tracked_constraints(simdir, sub, n_violated)
         end
-        solved = (n_violated == 0)
+        solved = (n_added == 0)
         niter += 1
 
         println("[DEBUG] PTDF Subproblem Iteration $niter: Found $n_violated violations, added $n_added constraints")
     end
 
     # Record solve time
-    solve_time = time() - t0
-    sub.ext[:solve_metadata][:solve_time] = solve_time
+    # solve_time = time() - t0
+    # sub.ext[:solve_metadata][:solve_time] = solve_time
 
     return sub
 end
@@ -619,7 +617,7 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
     # initialize subproblem
     sub = create_subproblem_model(simdir, data, tracked_constraints)
 
-    while !converged && iter < max_iterations
+    for iteration in 1:max_iterations
         # Solve master problem
         println("[DEBUG] Solving master problem: iteration $iter")
         add_box_step!(master, 1)
@@ -632,7 +630,8 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
         # Save lower bound (no trust region)
         master_obj = objective_value(master) 
 
-        line_file = "sim/r1/PSCC2026/nobenders/reformulated/discrete/2035pc_om_d/2016-08-11/output/line_investments.csv"
+
+        line_file = "sim/r1/PSCC2026/benderstest/PSCC2026/feasibility/cand/2030-01-27-ws-st-exp-8max/benders_output/line_investments_4.csv"
         # line_inv = CSV.read(line_file, DataFrame)
         # gamma_val = line_inv[:, :Upgrade_Lvl]
         # storage_inv = CSV.read(storage_file, DataFrame)
@@ -644,7 +643,7 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
         set_sub_investments!(sub, y_val)
         # Phase 1: check feasibility of no load shed
         set_underserved_objective!(sub) 
-        solve_subproblem_ptdf!(sub; max_ptdf_iterations=256, max_ptdf_per_iteration=32, ptdf_tol=1e-6, logging="Eval Point iter $iter")
+        solve_subproblem_ptdf!(sub; max_ptdf_iterations=256, max_ptdf_per_iteration=32, ptdf_tol=0, logging="Eval Point iter $iter")
         total_ue = objective_value(sub)
         duals = extract_subproblem_duals(sub)
 
@@ -661,7 +660,7 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
         else # Passed Phase 1, move onto Phase 2 to check operational objective
             println("[DEBUG] Master iter $iter: add OPTIMALITY cut, there is no load shed")
             set_operational_objective!(sub)
-            solve_subproblem_ptdf!(sub; max_ptdf_iterations=256, max_ptdf_per_iteration=32, ptdf_tol=1e-6)
+            solve_subproblem_ptdf!(sub; max_ptdf_iterations=256, max_ptdf_per_iteration=32, ptdf_tol=0)
             phi_val = objective_value(sub)
             duals = extract_subproblem_duals(sub)
             total_ue = vec(sum(value.(sub[:ue]),dims=[1,2,3]))[1]
@@ -685,30 +684,28 @@ function benders_iteration_ptdf(simdir, master, y, theta, data, max_iterations=1
                 push!(master.ext[:total_ue], total_ue)
             end
         elseif master.ext[:stabilization] == "trust_region"
-            l1_max = get(data["param"], "l1_max", 8192)
-            if total_ue > 1e-2
-                new_l1_radius = minimum([l1_max, master.ext[:l1_radius][end] * 2])
-                println("[DEBUG] Load shed $total_ue detected, expanding transmission l1_radius to $(new_l1_radius)")
-                push!(master.ext[:l1_radius], new_l1_radius)
-            else
+            if total_ue == 0
                 current_total_obj = master_obj + phi_val - theta_val
-                if (current_total_obj < master.ext[:total_obj][end])
+                if (current_total_obj < master.ext[:total_obj][end]) # If actual improvement, serious step and reduce l1 radius to 1
                     println("[DEBUG] Cheaper total objective $(current_total_obj) detected, taking serious step")
                     push!(master.ext[:y_trust], y_val)
                     push!(master.ext[:total_obj], current_total_obj)
-
-                    new_l1_radius = maximum([1, master.ext[:l1_radius][end] / 2])
-                    println("[DEBUG] Serious step, so reducing l1_radius to $(new_l1_radius)")
-                    push!(master.ext[:l1_radius], new_l1_radius)
+                    println("[DEBUG] Serious step, so reducing l1_radius to 1")
+                    push!(master.ext[:l1_radius], 1)
+                    add_level_set!(master, current_total_obj)
                 else
-                    new_l1_radius = minimum([l1_max, master.ext[:l1_radius][end] * 2])
-                    println("[DEBUG] No load shed or improvement in objective, expanding transmission l1_radius to $(new_l1_radius)")
-                    push!(master.ext[:l1_radius], new_l1_radius)
+                    l1_distance = compare_y_vals(y_val, master.ext[:last_y_val])
+                    if l1_distance == 0 # If repeating the same investment
+                        new_l1_radius = master.ext[:l1_radius][end] + 1
+                        println("[DEBUG] Stuck in local region, expanding transmission l1_radius to $(new_l1_radius)")
+                        push!(master.ext[:l1_radius], new_l1_radius)
+                    end
                 end
             end
         end
 
         # Update iter count and save master problem with metadata/extensions
+        master.ext[:last_y_val] = y_val
         master.ext[:iter] += 1
         iter = master.ext[:iter]
         # save_master_problem(master, simdir)      
@@ -1056,6 +1053,44 @@ function add_box_step!(master, box_size)
         s_energy_int_trust[i] - s_energy_int[i] <= box_size)
 end
 
+function add_level_set!(master, current_obj)
+    if master.ext[:level_set] != true
+        return
+    end
+    remove_level_set!(master)
+
+    obj_expr = master.ext[:obj_expr]
+    @constraint(master,
+        level_set,
+        obj_expr <= current_obj
+    )
+end
+
+function remove_level_set!(master)
+    obj_dict = object_dictionary(master)
+    name = :level_set
+    if haskey(obj_dict, name)
+        try
+            constraint_obj = obj_dict[name]
+
+            # JuMP.delete works on both single constraints and arrays
+            JuMP.delete(master, constraint_obj)
+            JuMP.unregister(master, name)
+            println("Removed constraint: $name")
+
+        catch e
+            println("Warning: Could not remove $name: $e")
+            # Force unregister
+            try
+                JuMP.unregister(master, name)
+            catch
+            end
+        end
+    else
+        println("Constraint $name not found in model")
+    end
+end
+
 function remove_trust_region!(master)
     stab_method = master.ext[:stabilization]
 
@@ -1148,4 +1183,33 @@ function compute_flow_overhead(sub, data, hour)
 
         max_inj_before_violation[i] = minimum(injections_allowed)
     end
+end
+
+function compute_flows!(sub)
+    data = sub.ext[:data]
+    ptdf = sub.ext[:PTDF]
+    
+    N = length(data["bus"])
+    E = length(data["branch"])
+    G = length(data["gen"])
+    T = data["param"]["num_hours"]
+    nodal_injections = zeros(N)
+    gen_bus_map = sub.ext[:gen_bus_map]
+    pg = value.(sub[:pg])
+    ue = value.(sub[:ue])
+    ch, dis = value.(sub[:ch]), value.(sub[:dis])
+
+    flows = zeros(E, 1, T)
+
+    for t in 1:T
+        fill!(nodal_injections, 0.0)
+        for i in 1:N
+            nodal_injections[i] = (sum(pg[1, g, t] for g in 1:G if gen_bus_map[g] == i; init=0.0)
+                    - data["bus"]["$i"]["load"]["1"][t]
+                    + ue[1, i, t] - ch[1, i, t] + dis[1, i, t])
+        end
+        flows[:, 1, t] = ptdf * nodal_injections
+    end
+    
+    return flows
 end

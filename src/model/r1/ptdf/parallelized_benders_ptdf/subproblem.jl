@@ -330,15 +330,10 @@ function solve_subproblem_ptdf!(sub; max_ptdf_iterations=256, max_ptdf_per_itera
         st ∈ (MOI.OPTIMAL, MOI.LOCALLY_SOLVED) || break
 
         # Get current solution values
-        pg_values = value.(sub[:pg])
-        ue_values = value.(sub[:ue])
-        ch_values = value.(sub[:ch])
-        dis_values = value.(sub[:dis])
         gamma_values = value.(sub[:gamma])
 
         # Compute all flows at once
-        flows = zeros(length(sub.ext[:rate_a_nonzero]), R, T)
-        compute_flows!(flows, pg_values, ue_values, ch_values, dis_values, data, sub.ext[:PTDF])
+        flows = compute_flows!(sub)
 
         # Add violations prioritizing by size
         violations = []
@@ -429,4 +424,33 @@ function extract_subproblem_duals(sub)
     else
         error("Subproblem failed to solve optimally: $(termination_status(sub))")
     end
+end
+
+function compute_flows!(sub)
+    data = sub.ext[:data]
+    ptdf = sub.ext[:PTDF]
+    
+    N = length(data["bus"])
+    E = length(data["branch"])
+    G = length(data["gen"])
+    T = data["param"]["num_hours"]
+    nodal_injections = zeros(N)
+    gen_bus_map = sub.ext[:gen_bus_map]
+    pg = value.(sub[:pg])
+    ue = value.(sub[:ue])
+    ch, dis = value.(sub[:ch]), value.(sub[:dis])
+
+    flows = zeros(E, 1, T)
+
+    for t in 1:T
+        fill!(nodal_injections, 0.0)
+        for i in 1:N
+            nodal_injections[i] = (sum(pg[1, g, t] for g in 1:G if gen_bus_map[g] == i; init=0.0)
+                    - data["bus"]["$i"]["load"]["1"][t]
+                    + ue[1, i, t] - ch[1, i, t] + dis[1, i, t])
+        end
+        flows[:, 1, t] = ptdf * nodal_injections
+    end
+    
+    return flows
 end

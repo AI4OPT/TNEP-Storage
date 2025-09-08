@@ -33,6 +33,7 @@ function define_master_ptdf(superdir, data::Dict{String, Any}, date_weights::Dic
     master.ext[:data] = data
     master.ext[:total_ue] = [Inf]
     master.ext[:total_obj] = [Inf]
+    master.ext[:last_y_val] = [zeros(E), zeros(N)]
 
     # Create extension for date_weights, superdir
     master.ext[:date_weights] = date_weights
@@ -68,6 +69,7 @@ function define_master_ptdf(superdir, data::Dict{String, Any}, date_weights::Dic
 
     master.ext[:warmstart] = get(data["param"], "warmstart", false)
     master.ext[:stabilization] = get(data["param"], "stabilization", false)
+    master.ext[:level_set] = get(data["param"], "level_set", false)
 
     if master.ext[:stabilization] == "trust_region"
         JuMP.@variable(master, abs_diff[1:N] >= 0)
@@ -131,6 +133,7 @@ function define_master_ptdf(superdir, data::Dict{String, Any}, date_weights::Dic
 
     # Update the objective    
     JuMP.@objective(master, Min, obj_expr)
+    master.ext[:obj_expr] = obj_expr
 
     return master, y, theta
 end
@@ -296,3 +299,40 @@ function remove_trust_region!(master)
     end
 end
 
+function add_level_set!(master, current_obj)
+    if master.ext[:level_set] != true
+        return
+    end
+    remove_level_set!(master)
+
+    obj_expr = master.ext[:obj_expr]
+    @constraint(master,
+        level_set,
+        obj_expr <= current_obj
+    )
+end
+
+function remove_level_set!(master)
+    obj_dict = object_dictionary(master)
+    name = :level_set
+    if haskey(obj_dict, name)
+        try
+            constraint_obj = obj_dict[name]
+
+            # JuMP.delete works on both single constraints and arrays
+            JuMP.delete(master, constraint_obj)
+            JuMP.unregister(master, name)
+            println("Removed constraint: $name")
+
+        catch e
+            println("Warning: Could not remove $name: $e")
+            # Force unregister
+            try
+                JuMP.unregister(master, name)
+            catch
+            end
+        end
+    else
+        println("Constraint $name not found in model")
+    end
+end
