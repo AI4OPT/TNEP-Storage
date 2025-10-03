@@ -49,6 +49,7 @@ function compute_superset_core_point(superdir)
     toml_data = TOML.parsefile(config_file)
     storage_energy_size = get(toml_data, "storage_energy_size", 2.5)
 
+
     # Get the initial core points (solved without benders)
     # has rep day optimal investments
     initial_optima_dir = toml_data["initial_optima_dir"]
@@ -63,5 +64,31 @@ function compute_superset_core_point(superdir)
 
     gamma_val = trans_df[:, :Upgrade_Lvl]
     s_energy_int_val = stor_df[:, :Storage_Energy] * 1 / storage_energy_size
-    return ceil.(Int, gamma_val), ceil.(Int, s_energy_int_val)
+    gamma_val = safe_ceil.(gamma_val)
+    s_energy_int_val = safe_ceil.(s_energy_int_val)
+
+    if haskey(toml_data, "inv_dir")
+        inv_dir = toml_data["inv_dir"]
+        trans_file = joinpath(inv_dir, "line_investments.csv")
+        stor_file = joinpath(inv_dir, "storage_investments.csv")
+
+        trans_df = CSV.read(trans_file, DataFrame)
+        stor_df = CSV.read(stor_file, DataFrame)
+
+        gamma_val = trans_df[:, :Upgrade_Lvl]
+        s_energy_int_val = stor_df[:, :Storage_Energy]
+    end
+
+    return gamma_val, s_energy_int_val
+end
+
+function safe_ceil(x, tolerance=1e-8)
+    # If x is very close to an integer, round to that integer
+    # Otherwise, take the ceiling
+    rounded = round(Int, x)
+    if abs(x - rounded) < tolerance
+        return Int(rounded)
+    else
+        return Int(ceil(x))
+    end
 end

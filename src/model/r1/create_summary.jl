@@ -62,6 +62,17 @@ function write_summary_to_csv(simdir, model, data)
             for t in 1:T)
         for r in 1:R)
     end
+
+
+    ch = value.(model[:ch])
+    dis = value.(model[:dis])
+    # Storage operation costs
+    storage_operation_costs = operational_weight * sum(data["param"]["representative_prob"][r] * 
+            sum(
+                sum(get(data["param"], "storage_operation_cost", 0.0) * (ch[r,i,t] + dis[r,i,t]) for i=1:N)
+            for t in 1:T)
+        for r in 1:R)
+
     
     # Calculate under-served penalty
     under_served_penalty = operational_weight * sum(data["param"]["representative_prob"][r] * 
@@ -82,6 +93,7 @@ function write_summary_to_csv(simdir, model, data)
         "under_served_penalty" => under_served_penalty,
         "generation_costs" => generation_costs,
         "storage_investment_costs" => storage_investment_costs,
+        "storage_operation_costs" => storage_operation_costs,
         "line_investment_costs" => line_investment_costs,
         "num_line_investments" => num_line_investments,
         "num_storage_investments" => num_storage_investments,
@@ -103,7 +115,7 @@ function write_summary_to_csv(simdir, model, data)
     
     # Add rows in desired order
     order = ["over_generation_penalty", "under_served_penalty", "generation_costs", 
-            "storage_investment_costs", "line_investment_costs", "num_line_investments",
+            "storage_investment_costs", "storage_operation_costs", "line_investment_costs", "num_line_investments",
             "num_storage_investments", "total_storage_capacity", "avg_storage_capacity",
             "storage_cand_count"]
             

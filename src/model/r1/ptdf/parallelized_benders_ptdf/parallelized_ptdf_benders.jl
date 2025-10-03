@@ -237,7 +237,7 @@ function add_all_benders_cuts(master, master_obj, theta_val, all_results, y_val)
 
     benders_ptdf_write_to_csv(superdir, y_val, master_obj, total_theta_val, total_phi_val, total_ue)
     current_obj = master_obj + total_phi_val - total_theta_val
-    return current_obj, total_ue
+    return current_obj, total_phi_val, total_theta_val, total_ue
 end
 
 function master_benders_loop(superdir, master, master_data, date_weights, max_iterations=100000, tolerance=0.01)
@@ -278,7 +278,7 @@ function master_benders_loop(superdir, master, master_data, date_weights, max_it
 
             # Add Benders cuts sequentially, make Benders logs
             println("[DEBUG] Iteration $(iter): adding Benders cuts...")
-            current_obj, total_ue = add_all_benders_cuts(master, master_obj, theta_val, all_results, y_val)
+            current_obj, total_phi_val, total_theta_val, total_ue = add_all_benders_cuts(master, master_obj, theta_val, all_results, y_val)
 
             # Update with serious step of the trust/anchor point if satisfy conditions
             if master.ext[:stabilization] == "trust_region"
@@ -292,7 +292,7 @@ function master_benders_loop(superdir, master, master_data, date_weights, max_it
                         add_level_set!(master, current_obj)
                     else # No actual improvement, null step
                         l1_distance = compare_y_vals(y_val, master.ext[:last_y_val])
-                        if l1_distance == 0 # If repeating the same investment
+                        if isapprox(total_theta_val, total_phi_val, atol=1e-3) || l1_distance == 0 # LB = UB or same investment
                             new_l1_radius = master.ext[:l1_radius][end] + 1
                             println("[DEBUG] Stuck in local region, expanding transmission l1_radius to $(new_l1_radius)")
                             push!(master.ext[:l1_radius], new_l1_radius)

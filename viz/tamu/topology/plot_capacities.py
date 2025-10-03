@@ -37,35 +37,98 @@ df_solar = df_storage[df_storage["solar_capacity"] > 0]
 df_wind = df_storage[df_storage["wind_capacity"] > 0]
 df_nonrenewable = df_storage[df_storage["nonrenewable_capacity"] > 0]
 
-# Plot for Solar
-fig = px.scatter_mapbox(
-    df_solar,
-    lat='Lat',
-    lon='Lon',
-    size='solar_capacity',               # Size based on solar capacity
-    color='solar_capacity',              # Color based on solar capacity
-    color_continuous_scale='YlOrRd_r',    # Use viridis color scale
-    center=dict(lat=31.5, lon=-99.5),    # Center the map
-    zoom=4,                              # Set zoom level
-    labels={'solar_capacity': 'Solar Capacity (100 MW)'},
-    mapbox_style="carto-positron",       # Map style
+fig = go.Figure()
+# Add nonrenewable plants (e.g., gray circles)
+fig.add_trace(go.Scattergeo(
+    lat=df_nonrenewable['Lat'],
+    lon=df_nonrenewable['Lon'],
+    mode='markers',
+    marker=dict(
+        size=18,           # Static size
+        color='gray',      # Color
+        opacity=0.8,       # Opacity
+        line=dict(width=1, color='black')  # Optional: border
+    ),
+    name='Nonrenewable',
+    showlegend=True
+))
+
+# Add wind plants (e.g., blue circles)
+fig.add_trace(go.Scattergeo(
+    lat=df_wind['Lat'],
+    lon=df_wind['Lon'],
+    mode='markers',
+    marker=dict(
+        size=16,           # Different size
+        color='blue',      # Color
+        opacity=0.7,       # Opacity
+        line=dict(width=1, color='darkblue')
+    ),
+    name='Wind',
+    showlegend=True
+))
+
+# Add solar plants (e.g., yellow circles)
+fig.add_trace(go.Scattergeo(
+    lat=df_solar['Lat'],
+    lon=df_solar['Lon'],
+    mode='markers',
+    marker=dict(
+        size=14,            # Different size
+        color='red',    # Color
+        opacity=0.9,       # Opacity
+        line=dict(width=1, color='orange')
+    ),
+    name='Solar',
+    showlegend=True
+))
+
+# Updated parameter names
+fig.update_geos(
+    lonaxis_range=[-105, -94],
+    lataxis_range=[25.5, 36], 
+    showland=True,
+    showocean=True,
+    oceancolor="lightblue",
+    showlakes=True,
+    lakecolor="lightblue",
+    showcountries=True,
+    countrycolor="lightgray",
+    countrywidth=0,  # Width of country borders
+    showsubunits=True,  # This shows states/provinces
+    subunitcolor="lightgray",
+    subunitwidth=3
 )
 
-# Function to add lines to the map
-def add_lines(df, color="black", width=0.2):
+# Update layout with colorbar customization
+fig.update_layout(
+    legend=dict(
+        x=0.78,                    # Horizontal position (0=left, 1=right)
+        font=dict(
+            size=20,               # Font size for legend text
+            color="black",         # Font color
+        ),
+        orientation="v",           # "v" for vertical, "h" for horizontal
+        xanchor="left",           # Anchor point for x position
+        yanchor="top"             # Anchor point for y position
+    )
+)
+
+# Function to add lines - use Scattergeo for lines too
+def add_lines(df, color, width_func):
     traces = []
     for _, row in df.iterrows():
-        traces.append(go.Scattermapbox(
+        traces.append(go.Scattergeo(
             lat=[row['Lat1'], row['Lat2']],
             lon=[row['Lon1'], row['Lon2']],
             mode='lines',
             showlegend=False,
-            line=dict(color=color, width=width)
+            line=dict(color=color, width=width_func(row))
         ))
     return traces
 
 # Add all lines (black, width 0.2)
-fig.add_traces(add_lines(df_lines, color="black", width=0.2))
+fig.add_traces(add_lines(df_lines, "black", lambda row: 0.4))
 
 # Save the map
-fig.write_image(f"../../../{simdir}/visual/solar_cap.png")
+fig.write_html(f"../../../{simdir}/cap.html")

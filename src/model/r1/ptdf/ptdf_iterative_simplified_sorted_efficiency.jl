@@ -291,6 +291,12 @@ function create_base_model(data::Dict{String, Any}, optimizer)
         add_prev_upgrades(model, data, gamma, s_energy, prev_dir)
     end
 
+    # Check if fixed investments to test
+    if haskey(data["param"], "inv_dir")
+        inv_dir = data["param"]["inv_dir"]
+        add_prev_upgrades(model, data, gamma, s_energy, inv_dir; equality=true)
+    end
+
     # if rate a is zero (unlimited), then don't allow upgrades
     JuMP.@constraint(model, 
         rate_a_zero_line_upgrade[a in rate_a_zero],
@@ -371,20 +377,32 @@ function create_base_model(data::Dict{String, Any}, optimizer)
 
     # Objective
     operational_weight = get(data["param"], "operational_weight", 1)
-    @objective(model, Min,
-        sum(s_energy[i] * data["param"]["bess_energy_cost"] for i in 1:N) +
+
+    objective_expr = (sum(s_energy[i] * data["param"]["bess_energy_cost"] for i in 1:N) +
         sum(data["param"]["cap_upgrade_cost"] * get_capacity_increment(data, a) * data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
         sum(
             data["param"]["representative_prob"][r] *
             (
                 sum(
+                    sum(data["param"]["under_served_penalty"] * ue[r, i, t] for i in 1:N)
+                for t in 1:T)
+            )
+        for r in 1:R) * operational_weight)
+
+    if haskey(data["param"], "only_feasibility") && data["param"]["only_feasibility"]
+        @objective(model, Min, objective_expr)
+    else
+        objective_expr += sum(
+            data["param"]["representative_prob"][r] *
+            (
+                sum(
                     sum(compute_gen_cost(pg[r, g, t], data["gen"]["$g"]) for g in 1:G) +
-                    sum(data["param"]["under_served_penalty"] * ue[r, i, t] for i in 1:N) +
                     sum(get(data["param"], "storage_operation_cost", 0.0) * (ch[r,i,t] + dis[r,i,t]) for i=1:N)
                 for t in 1:T)
             )
         for r in 1:R) * operational_weight
-    )
+        @objective(model, Min, objective_expr)
+    end
     
     return model
 end
@@ -417,7 +435,7 @@ function compute_flows!(flows, pg_values, ue_values, ch_values, dis_values, data
     end
 end
 
-function add_prev_upgrades(model, data, gamma, s_energy, prev_dir; tolerance=1e-5)
+function add_prev_upgrades(model, data, gamma, s_energy, prev_dir; tolerance=1e-5, equality=false)
     E = length(data["branch"])
     N = length(data["bus"])
 
@@ -427,12 +445,23 @@ function add_prev_upgrades(model, data, gamma, s_energy, prev_dir; tolerance=1e-
     trans_df = CSV.read(trans_file, DataFrame)
     storage_df = CSV.read(storage_file, DataFrame)
 
-    @constraint(model,
-        old_gamma[a in 1:E, trans_df[a, :Upgrade_Lvl] > tolerance],
-        gamma[a] >= trans_df[a, :Upgrade_Lvl]
-    )
-    @constraint(model,
-        old_s_energy[i in 1:N, storage_df[i, :Storage_Energy] > tolerance],
-        s_energy[i] >= storage_df[i, :Storage_Energy]
-    )
+    if equality
+        @constraint(model,
+            old_gamma[a in 1:E, trans_df[a, :Upgrade_Lvl] > tolerance],
+            gamma[a] == trans_df[a, :Upgrade_Lvl]
+        )
+        @constraint(model,
+            old_s_energy[i in 1:N, storage_df[i, :Storage_Energy] > tolerance],
+            s_energy[i] == storage_df[i, :Storage_Energy] * data["param"]["storage_energy_size"]
+        )
+    else
+        @constraint(model,
+            old_gamma[a in 1:E, trans_df[a, :Upgrade_Lvl] > tolerance],
+            gamma[a] >= trans_df[a, :Upgrade_Lvl]
+        )
+        @constraint(model,
+            old_s_energy[i in 1:N, storage_df[i, :Storage_Energy] > tolerance],
+            s_energy[i] >= storage_df[i, :Storage_Energy] * data["param"]["storage_energy_size"]
+        )
+    end
 end

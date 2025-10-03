@@ -13,6 +13,7 @@ include("create_summary.jl")
 include("ptdf/create_model_ptdf.jl")
 include("ptdf/ptdf_iterative_simplified_sorted.jl")
 include("ptdf/ptdf_iterative_simplified_sorted_efficiency.jl")
+include("create_model_phase_angle.jl")
 
 function set_up_data(simdir)
     data_path = joinpath(simdir, "data.json")
@@ -40,6 +41,9 @@ function run_model(simdir; timeout=84600)
     if !haskey(data["param"], "storage_linearized") || data["param"]["storage_linearized"] == false
         println("create_model_r1")
         model = create_model_r1(data, optimizer)
+    elseif data["param"]["storage_linearized"] == "phase_angle"
+        println("create_model_phase_angle")
+        model = create_model_phase_angle(data, optimizer)
     elseif data["param"]["storage_linearized"] == "ptdf_simplified_sorted" && haskey(data["param"], "bess_efficiency") && data["param"]["bess_efficiency"] < 1.0
         println("create_model_r1_ptdf_iterative_simplified_sorted_efficiency")
         model = create_model_r1_ptdf_iterative_simplified_sorted_efficiency(simdir, data, optimizer)

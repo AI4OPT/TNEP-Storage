@@ -78,13 +78,19 @@ function define_master_ptdf(superdir, data::Dict{String, Any}, date_weights::Dic
 
     #
     #   II. Constraints
-    #    
-    """
+    #
+    if master.ext[:warmstart]
+        JuMP.@constraint(master, 
+            no_load_shed,
+            ue_sum <= 0
+        )
+    end    
+
     # Check if previous investments exist
     if haskey(data["param"], "previous_investment_dir")
         prev_dir = data["param"]["previous_investment_dir"]
-        add_prev_upgrades(master, data, gamma, s_energy, prev_dir, candidate_branches)
-    end"""
+        add_prev_upgrades(master, data, prev_dir)
+    end
 
     # if rate a is zero (unlimited), then don't allow upgrades
     JuMP.@constraint(master, 
@@ -99,6 +105,16 @@ function define_master_ptdf(superdir, data::Dict{String, Any}, date_weights::Dic
     )
 
     master.ext[:over_invested_point] = compute_superset_core_point(superdir)
+
+    # fix optimistic over-invested transmission
+    gamma_over_invested = master.ext[:over_invested_point][1]
+    if get(data["param"], "over_invested_transmission", false)
+        @constraint(master,
+            over_invest_gamma[a in 1:E],
+            gamma[a] >= gamma_over_invested[a]
+        )
+    end
+
     # storage candidates
     if get(data["param"], "storage_cand", false)
         storage_upgrades = master.ext[:over_invested_point][2]
@@ -127,7 +143,7 @@ function define_master_ptdf(superdir, data::Dict{String, Any}, date_weights::Dic
     # Start with the base objective terms
     obj_expr = sum(s_energy_int[i] * data["param"]["storage_energy_size"] * data["param"]["bess_energy_cost"] for i in 1:N) + 
             sum(data["param"]["cap_upgrade_cost"] * data["param"]["cap_upgrade_increment"] * data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
-            sum(theta[r] * date_weights[r][2] for r in 1:R) + ue_sum * 365 * data["param"]["under_served_penalty"]
+            sum(theta[r] * date_weights[r][2] for r in 1:R) + ue_sum * data["param"]["operational_weight"] * data["param"]["under_served_penalty"]
 
     y = gamma, s_energy_int
 
@@ -152,29 +168,27 @@ function add_benders_cut_ptdf(master, theta, duals, y, y_val, phi_val)
     )
 end
 
-function add_prev_upgrades(master, data, gamma, s_energy, prev_dir, candidate_branches=nothing; tolerance=1e-5)
+function add_prev_upgrades(master, data, prev_dir)
     E = length(data["branch"])
     N = length(data["bus"])
+    gamma = master[:gamma]
+    s_energy_int = master[:s_energy_int]
 
     trans_file = joinpath(prev_dir, "line_investments.csv")
     storage_file = joinpath(prev_dir, "storage_investments.csv")
     trans_df = CSV.read(trans_file, DataFrame)
     storage_df = CSV.read(storage_file, DataFrame)
 
-    if candidate_branches !== nothing
-        valid_branches = [a for a in 1:E if (a in candidate_branches) && (trans_df[a, :Upgrade_Lvl] > tolerance)]
-    else
-        # Original behavior if no candidate set provided
-        valid_branches = [a for a in 1:E if trans_df[a, :Upgrade_Lvl] > tolerance]
-    end
+    nonzero_trans_indices = findall(x -> x > 0, trans_df[:, :Upgrade_Lvl])
+    nonzero_storage_indices = findall(x -> x > 0, storage_df[:, :Storage_Energy])
 
     @constraint(master,
-        old_gamma[a in valid_branches],
+        old_gamma[a in nonzero_trans_indices],
         gamma[a] >= trans_df[a, :Upgrade_Lvl]
     )
     @constraint(master,
-        old_s_energy[i in 1:N, storage_df[i, :Storage_Energy] > tolerance],
-        s_energy[i] >= storage_df[i, :Storage_Energy]
+        old_s_energy[i in nonzero_storage_indices],
+        s_energy_int[i] >= storage_df[i, :Storage_Energy]
     )
 end
 
