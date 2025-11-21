@@ -69,7 +69,7 @@ function define_master_ptdf(data::Dict{String, Any})
     JuMP.@variable(master, 0 <= gamma[a=1:E] <= K, Int)
 
     # binary variable for installation of storage
-    # JuMP.@variable(master, sigma[i=1:N], Bin)
+    JuMP.@variable(master, sigma[i=1:N], Bin)
 
     # energy rating of storage
     JuMP.@variable(master, s_energy_int[i=1:N] >= 0, Int)
@@ -118,6 +118,11 @@ function define_master_ptdf(data::Dict{String, Any})
     JuMP.@constraint(master, 
         installed_energy_ub[i in 1:N],
         s_energy_int[i] * data["param"]["storage_energy_size"] <= data["param"]["max_energy_rating"]
+    )
+
+    JuMP.@constraint(master, 
+        energy_if_installed[i in 1:N],
+        s_energy_int[i]  <= data["param"]["max_energy_rating"] * sigma[i]
     )
 
     # storage candidates
@@ -256,6 +261,7 @@ function create_subproblem_model(simdir, data, tracked_constraints)
     # Fix investment variables based on master problem decisions
     @variable(sub, gamma[a=1:E])
     @variable(sub, s_energy_int[i=1:N])
+    @variable(sub, sigma[i=1:N])
 
     #
     #   II. Constraints

@@ -4,3 +4,6 @@
 /EIA
 /PACE
 /exp
+*.png
+*.csv
+*.json
