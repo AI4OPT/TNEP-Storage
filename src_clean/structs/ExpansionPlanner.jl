@@ -1,12 +1,9 @@
 using Gurobi
 using JSON
 
-include("../../helpers/convert_units.jl")
-include("../../helpers/setup_simdir.jl")
-include("add_params_profiles.jl")
-include("../n1/export_model.jl")
-include("../n2/decarbonization.jl")
-include("create_summary.jl")
+include("PhaseAngleModel.jl")
+include("PTDFModel.jl")
+include("../helpers/helpers.jl")
 
 function set_up_data(simdir)
     data_path = joinpath(simdir, "data.json")
@@ -45,14 +42,12 @@ function create_model!(planner::ExpansionPlanner)
         
     if data["param"]["storage_linearized"] == "phase_angle"
         println("create_model_phase_angle")
-        jump_model = create_model_phase_angle(data, optimizer)
-        planner.model = PhaseAngleModel(jump_model, data, simdir)
+        planner.model = create_model_phase_angle(data, optimizer)
         
     elseif data["param"]["storage_linearized"] == "ptdf_simplified_sorted"
         println("create_model_r1_ptdf_iterative_simplified_sorted_efficiency")
-        jump_model = create_model_r1_ptdf_iterative_simplified_sorted_efficiency(
+        planner.model = create_model_r1_ptdf_iterative_simplified_sorted(
             planner.simdir, data, optimizer)
-        planner.model = PTDFModel(jump_model, data, simdir)
     else
         error("Unknown storage_linearized value: $storage_linearized")
     end
@@ -83,7 +78,7 @@ end
 
 function export_results!(model::OptimizationModel)
     # Call base export
-    export_model(model.simdir, model.jump_model, model.data)
+    export_model(model.simdir, model.jump_model, model.data, model.ptdf_matrix)
     write_summary_to_csv(model.simdir, model.jump_model, model.data)
 end
 
@@ -94,7 +89,7 @@ function run_model(simdir::String; timeout=84600)
     configure_optimizer!(planner)
     
     # This will dispatch to the right optimize! method
-    optimize!(planner.model)
+    solve!(planner.model)
     
     # Check status
     jump_model = planner.model.jump_model
