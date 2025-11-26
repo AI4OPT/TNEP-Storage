@@ -143,48 +143,30 @@ function create_base_model(data::Dict{String, Any}, optimizer)
         == 0
     )
 
-    # Check if previous investments exist
+    # Check if previous investments exist (for minimum constraints)
     if haskey(data["param"], "previous_investment_dir")
         prev_dir = data["param"]["previous_investment_dir"]
-        add_prev_upgrades(model, data, gamma, s_energy, prev_dir)
+        gamma_min, s_energy_min = load_investments_from_dir(
+            prev_dir, 
+            data, 
+            E=model.E, 
+            N=model.N, 
+            allow_missing=false  # Use zeros for missing files
+        )
+        set_previous_investments!(model, gamma_min, s_energy_min)
     end
 
-    # Check if current investments to test
+    # Check if current investments to test (for fixing constraints)
     if haskey(data["param"], "current_investment_dir")
         cur_dir = data["param"]["current_investment_dir"]
-        trans_file = joinpath(cur_dir, "line_investments.csv")
-        storage_file = joinpath(cur_dir, "storage_investments.csv")
-        
-        # Only add transmission constraints if the file exists
-        if isfile(trans_file)
-            trans_df = CSV.read(trans_file, DataFrame)
-            @constraint(model,
-                current_gamma[a in 1:E],
-                gamma[a] == trans_df[a, :Upgrade_Lvl]
-            )
-        end
-        
-        # Only add storage constraints if the file exists
-        if isfile(storage_file)
-            storage_df = CSV.read(storage_file, DataFrame)
-            if get(data["param"], "storage_needs_scaling", false)
-                @constraint(model,
-                    current_s_energy[i in 1:N],
-                    s_energy[i] == storage_df[i, :Storage_Energy] * data["param"]["storage_energy_size"]
-                )
-            else
-                @constraint(model,
-                    current_s_energy[i in 1:N],
-                    s_energy[i] == storage_df[i, :Storage_Energy]
-                )
-            end
-        end
-    end
-
-    # Check if fixed investments to test (alternative parameter name)
-    if haskey(data["param"], "inv_dir")
-        inv_dir = data["param"]["inv_dir"]
-        add_prev_upgrades(model, data, gamma, s_energy, inv_dir; equality=true)
+        gamma_val, s_energy_val = load_investments_from_dir(
+            cur_dir, 
+            data, 
+            E=model.E, 
+            N=model.N, 
+            allow_missing=true  # Use nothing for missing files
+        )
+        fix_investments!(model, gamma_val, s_energy_val)
     end
 
     # If rate a is zero (unlimited), then don't allow upgrades
@@ -521,6 +503,245 @@ function save_tracked_constraints(simdir, model::PTDFModel, n_violated)
     
     # Save to CSV
     CSV.write(joinpath(output_dir, "tracked_constraints.csv"), df)
+end
+
+function set_previous_investments!(
+    model::PTDFModel,
+    gamma_min::Vector,
+    s_energy_min::Vector;
+    export_csv::Bool=true
+)
+    """
+    Set previous upgrade levels for investments in the PTDFModel.
+    This ensures new investments are at least as large as previous investments.
+    
+    Parameters:
+    -----------
+    model : PTDFModel
+        The model to set previous upgrades in
+    gamma_min : Vector
+        Previous line investment levels for all lines
+    s_energy_min : Vector
+        Previous storage investment levels for all nodes
+    export_csv : Bool
+        Whether to export previous upgrades to CSV (default: true)
+    """
+    
+    E = model.E
+    N = model.N
+    
+    # Validate dimensions
+    if length(gamma_min) != E
+        throw(ArgumentError("gamma_min length ($(length(gamma_min))) must match number of lines ($E)"))
+    end
+    
+    if length(s_energy_min) != N
+        throw(ArgumentError("s_energy_min length ($(length(s_energy_min))) must match number of nodes ($N)"))
+    end
+    
+    # Export previous upgrades if requested
+    if export_csv
+        min_upgrades_dir = joinpath(model.simdir, "previous_investment_dir")
+        export_investments_csv(
+            model.data, 
+            gamma_min,
+            s_energy_min,
+            output_dir=min_upgrades_dir
+        )
+        @info "Exported previous upgrades to $min_upgrades_dir"
+    end
+    
+    # Handle previous line investments
+    # Remove existing constraint if it exists
+    if haskey(model.jump_model.obj_dict, :min_gamma)
+        delete(model.jump_model, model.jump_model[:min_gamma])
+        unregister(model.jump_model, :min_gamma)
+    end
+    
+    # Set previous line investment levels
+    @constraint(
+        model.jump_model,
+        min_gamma[a=1:E],
+        model.jump_model[:gamma][a] >= gamma_min[a]
+    )
+    
+    num_line_constraints = count(x -> x > 0, gamma_min)
+    if num_line_constraints > 0
+        @info "Set previous line upgrades for $num_line_constraints lines"
+    end
+    
+    # Handle previous storage investments
+    # Remove existing constraint if it exists
+    if haskey(model.jump_model.obj_dict, :min_energy)
+        delete(model.jump_model, model.jump_model[:min_energy])
+        unregister(model.jump_model, :min_energy)
+    end
+    
+    # Set previous storage investment levels
+    @constraint(
+        model.jump_model,
+        min_energy[i=1:N],
+        model.jump_model[:s_energy][i] >= s_energy_min[i]
+    )
+    
+    num_storage_constraints = count(x -> x > 0, s_energy_min)
+    if num_storage_constraints > 0
+        @info "Set previous storage upgrades for $num_storage_constraints nodes"
+    end
+    
+    return nothing
+end
+
+function fix_investments!(
+    model::PTDFModel, 
+    gamma_val::Union{Vector,Nothing}=nothing, 
+    s_energy_val::Union{Vector,Nothing}=nothing;
+    export_csv::Bool=true
+)
+    """
+    Fix investment decisions in the PTDFModel for Benders decomposition.
+    This is used when the model serves as a subproblem.
+    
+    Parameters:
+    -----------
+    model : PTDFModel
+        The model to fix investments in
+    gamma_val : Vector or Nothing
+        Line investment values. If nothing, line investments won't be fixed
+    s_energy_val : Vector or Nothing  
+        Storage investment values. If nothing, storage investments won't be fixed
+    export_csv : Bool
+        Whether to export investments to CSV (default: true)
+    
+    Examples:
+    ---------
+    # Fix both line and storage investments
+    fix_investments!(model, gamma_val, s_energy_val)
+    
+    # Fix only line investments
+    fix_investments!(model, gamma_val, nothing)
+    
+    # Fix only storage investments
+    fix_investments!(model, nothing, s_energy_val)
+    """
+    
+    # Validate that at least one investment type is provided
+    if isnothing(gamma_val) && isnothing(s_energy_val)
+        @warn "No investment values provided. No constraints will be fixed."
+        return
+    end
+    
+    E = model.E
+    N = model.N
+    
+    # Validate dimensions if values are provided
+    if !isnothing(gamma_val) && length(gamma_val) != E
+        throw(ArgumentError("gamma_val length ($(length(gamma_val))) must match number of lines ($E)"))
+    end
+    
+    if !isnothing(s_energy_val) && length(s_energy_val) != N
+        throw(ArgumentError("s_energy_val length ($(length(s_energy_val))) must match number of nodes ($N)"))
+    end
+    
+    # Export investments if requested
+    if export_csv
+        current_inv_dir = joinpath(model.simdir, "current_investments")
+        export_investments_csv(
+            model.data, 
+            isnothing(gamma_val) ? zeros(E) : gamma_val,
+            isnothing(s_energy_val) ? zeros(N) : s_energy_val,
+            output_dir=current_inv_dir
+        )
+    end
+    
+    # Handle line investments (gamma)
+    if !isnothing(gamma_val)
+        # Remove existing constraint if it exists
+        if haskey(model.jump_model.obj_dict, :master_gamma)
+            delete(model.jump_model, model.jump_model[:master_gamma])
+            unregister(model.jump_model, :master_gamma)
+        end
+        
+        # Fix line investment decisions
+        @constraint(
+            model.jump_model, 
+            master_gamma[a=1:E], 
+            model.jump_model[:gamma][a] == gamma_val[a]
+        )
+    end
+    
+    # Handle storage investments (s_energy)
+    if !isnothing(s_energy_val)
+        # Remove existing constraint if it exists
+        if haskey(model.jump_model.obj_dict, :master_energy)
+            delete(model.jump_model, model.jump_model[:master_energy])
+            unregister(model.jump_model, :master_energy)
+        end
+        
+        # Fix storage investment decisions
+        @constraint(
+            model.jump_model, 
+            master_energy[i=1:N], 
+            model.jump_model[:s_energy][i] == s_energy_val[i]
+        )
+    end
+    
+    return nothing
+end
+
+function extract_investment_duals(model::PTDFModel)
+    """
+    Extract duals from investment-fixing constraints for Benders cuts.
+    """
+    if termination_status(model.jump_model) ∉ (MOI.OPTIMAL, MOI.LOCALLY_SOLVED)
+        error("Model not solved optimally: $(termination_status(model.jump_model))")
+    end
+    
+    dual_gamma = [dual(model.jump_model[:master_gamma][a]) for a=1:model.E]
+    dual_energy = [dual(model.jump_model[:master_energy][i]) for i=1:model.N]
+    
+    return (dual_gamma, dual_energy)
+end
+
+function set_objective!(model::PTDFModel, objective_type::Symbol)
+    """
+    Set the objective function for the PTDFModel.
+    objective_type can be :operational or :feasibility
+    """
+    data = model.data
+    R = model.R
+    N = model.N
+    T = model.T
+    G = model.G
+    
+    operational_weight = get(data["param"], "operational_weight", 1)
+    
+    if objective_type == :feasibility
+        # Minimize unserved energy only
+        @objective(model.jump_model, Min,
+            sum(
+                data["param"]["representative_prob"][r] *
+                sum(sum(model.jump_model[:ue][r, i, t] for i=1:N) for t=1:T)
+            for r=1:R)
+        )
+    elseif objective_type == :operational
+        # Full operational cost
+        @objective(model.jump_model, Min,
+            sum(
+                data["param"]["representative_prob"][r] *
+                (
+                    sum(
+                        sum(compute_gen_cost(model.jump_model[:pg][r, g, t], data["gen"]["$g"]) for g=1:G) +
+                        sum(data["param"]["under_served_penalty"] * model.jump_model[:ue][r, i, t] for i=1:N) + 
+                        sum(get(data["param"], "storage_operation_cost", 0.0) * 
+                            (model.jump_model[:ch][r,i,t] + model.jump_model[:dis][r,i,t]) for i=1:N)
+                    for t=1:T)
+                )
+            for r=1:R) * operational_weight
+        )
+    else
+        error("Unknown objective type: $objective_type. Use :operational or :feasibility")
+    end
 end
 
 # Overloaded version that accepts PTDFModel directly

@@ -131,7 +131,7 @@ function create_sbatch_file(job_name::String,
     #SBATCH --mail-user=$email
 
     cd /storage/home/hcoda1/1/kwu381/TNEP-Storage
-    julia --project=. exp/run_model_r1.jl $sim_path $tasks_per_node
+    julia --project=. exp/clean/run_expansionplanner.jl $sim_path $tasks_per_node
     """
     
     open(output_file, "w") do file
@@ -166,8 +166,8 @@ end
 
 """
 stressdir
-pace_dir = "PACE/r1/PowerUp/2030"
-name_suffix="_2030"
+pace_dir = "PACE/r1/PowerUp/2030nobenders"
+name_suffix="_2030nobenders"
 
 setup_stress_test(stressdir, pace_dir=pace_dir, name_suffix=name_suffix, submit_jobs=true)
 """

@@ -40,6 +40,7 @@ function create_model!(planner::ExpansionPlanner)
     data = planner.data
     optimizer = planner.optimizer
         
+    # TODO: add phase angle functionality and test
     if data["param"]["storage_linearized"] == "phase_angle"
         println("create_model_phase_angle")
         planner.model = create_model_phase_angle(data, optimizer)
