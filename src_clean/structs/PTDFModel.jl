@@ -602,6 +602,9 @@ function fix_investments!(
     Fix investment decisions in the PTDFModel for Benders decomposition.
     This is used when the model serves as a subproblem.
     
+    Removes integer restrictions and bounds from fixed variables to enable
+    dual variable access (required for Benders cuts).
+    
     Parameters:
     -----------
     model : PTDFModel
@@ -638,7 +641,6 @@ function fix_investments!(
     if !isnothing(gamma_val) && length(gamma_val) != E
         throw(ArgumentError("gamma_val length ($(length(gamma_val))) must match number of lines ($E)"))
     end
-    
     if !isnothing(s_energy_val) && length(s_energy_val) != N
         throw(ArgumentError("s_energy_val length ($(length(s_energy_val))) must match number of nodes ($N)"))
     end
@@ -656,6 +658,24 @@ function fix_investments!(
     
     # Handle line investments (gamma)
     if !isnothing(gamma_val)
+        gamma = model.jump_model[:gamma]
+        
+        # Make variables free for dual access
+        for a in 1:E
+            # Remove integer restriction if present
+            if is_integer(gamma[a])
+                unset_integer(gamma[a])
+            end
+            
+            # Remove bounds
+            if has_lower_bound(gamma[a])
+                delete_lower_bound(gamma[a])
+            end
+            if has_upper_bound(gamma[a])
+                delete_upper_bound(gamma[a])
+            end
+        end
+        
         # Remove existing constraint if it exists
         if haskey(model.jump_model.obj_dict, :master_gamma)
             delete(model.jump_model, model.jump_model[:master_gamma])
@@ -666,12 +686,25 @@ function fix_investments!(
         @constraint(
             model.jump_model, 
             master_gamma[a=1:E], 
-            model.jump_model[:gamma][a] == gamma_val[a]
+            gamma[a] == gamma_val[a]
         )
     end
     
     # Handle storage investments (s_energy)
     if !isnothing(s_energy_val)
+        s_energy = model.jump_model[:s_energy]
+        
+        # Make variables free for dual access
+        for i in 1:N
+            # Remove bounds
+            if has_lower_bound(s_energy[i])
+                delete_lower_bound(s_energy[i])
+            end
+            if has_upper_bound(s_energy[i])
+                delete_upper_bound(s_energy[i])
+            end
+        end
+        
         # Remove existing constraint if it exists
         if haskey(model.jump_model.obj_dict, :master_energy)
             delete(model.jump_model, model.jump_model[:master_energy])
@@ -682,7 +715,7 @@ function fix_investments!(
         @constraint(
             model.jump_model, 
             master_energy[i=1:N], 
-            model.jump_model[:s_energy][i] == s_energy_val[i]
+            s_energy[i] == s_energy_val[i]
         )
     end
     

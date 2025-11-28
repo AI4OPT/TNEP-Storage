@@ -117,15 +117,7 @@ mutable struct BendersMasterProblem
         
         # Compute over-invested point
         over_invested_point = compute_superset_core_point(superdir)
-        
-        # Fix optimistic over-invested transmission
-        gamma_over_invested = over_invested_point[1]
-        if get(data["param"], "over_invested_transmission", false)
-            @constraint(jump_model,
-                over_invest_gamma[a in 1:E],
-                gamma[a] >= gamma_over_invested[a]
-            )
-        end
+        export_investments_csv(data, over_invested_point[1], over_invested_point[2], output_dir=joinpath(superdir, "warmstart"))
         
         # Storage candidates
         if get(data["param"], "storage_cand", false)

@@ -4,6 +4,7 @@ using JSON
 include("PhaseAngleModel.jl")
 include("PTDFModel.jl")
 include("../helpers/helpers.jl")
+include("ParallelizedBenders.jl")
 
 function set_up_data(simdir)
     data_path = joinpath(simdir, "data.json")

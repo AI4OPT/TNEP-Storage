@@ -166,8 +166,8 @@ end
 
 """
 stressdir
-pace_dir = "PACE/r1/PowerUp/2030nobenders"
-name_suffix="_2030nobenders"
+pace_dir = "PACE/r1/PowerUp/2035nobenders"
+name_suffix="_2035nobenders"
 
 setup_stress_test(stressdir, pace_dir=pace_dir, name_suffix=name_suffix, submit_jobs=true)
 """

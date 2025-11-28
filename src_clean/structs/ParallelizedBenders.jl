@@ -5,15 +5,9 @@ using Base.Threads
 using JSON
 using TOML
 
-include("helpers/helpers.jl")
+include("../helpers/helpers.jl")
 include("BendersSubproblem.jl")
 include("BendersMasterProblem.jl")
-
-# TODO: resolve imports, and test if any of the benders works
-
-include("process_max_upgrades.jl")
-include("benders_logging.jl")
-include("compare_l1_investments.jl")
 
 # Persistent subproblem worker for parallel execution
 mutable struct PersistentSubproblemWorker
@@ -126,10 +120,11 @@ function create_persistent_workers(superdir::String,
         simdir = joinpath(superdir, date)
         work_channel = Channel{Vector{Any}}(1)
         result_channel = Channel{Any}(1)
+        subproblem_data = JSON.parsefile(joinpath(simdir, "data.json"))
         
         # Create placeholder - will be initialized in worker thread
         worker = PersistentSubproblemWorker(
-            BendersSubproblem(Dict{String,Any}(), Gurobi.Optimizer, simdir),  # Placeholder
+            BendersSubproblem(subproblem_data, Gurobi.Optimizer, simdir),  # Placeholder
             work_channel,
             result_channel,
             Task(() -> nothing),
