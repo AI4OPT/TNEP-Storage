@@ -165,7 +165,7 @@ mutable struct BendersMasterProblem
             date_weights,
             Vector{Vector{Vector{Float64}}}(),  # y_trust
             Vector{Float64}(),  # gap
-            0,  # iter
+            1,  # iter
             [Inf],  # total_ue
             [Inf],  # total_obj
             [zeros(E), zeros(N)],  # last_y_val
@@ -270,7 +270,7 @@ function add_trust_region!(master::BendersMasterProblem)
         return
     end
     
-    if master.iter == 0
+    if master.iter == 1
         # Initialize trust region at over-invested point
         gamma_core, s_energy_int_core = zeros(master.E), zeros(master.N)
         if master.warmstart

@@ -6,6 +6,7 @@ using JSON
 using TOML
 
 include("../helpers/helpers.jl")
+include("../utils/utils.jl")
 include("BendersSubproblem.jl")
 include("BendersMasterProblem.jl")
 
@@ -33,6 +34,7 @@ mutable struct ParallelizedBenders
     converged::Bool
     
     # Statistics tracking
+    master_times::Vector{Float64}
     iteration_times::Vector{Float64}
     gaps::Vector{Float64}
     objectives::Vector{Float64}
@@ -70,7 +72,7 @@ mutable struct ParallelizedBenders
         
         new(master, workers, superdir, date_weights,
             max_iterations, tolerance, false,
-            Float64[], Float64[], Float64[])
+            Float64[], Float64[], Float64[], Float64[])
     end
 end
 
@@ -397,7 +399,11 @@ function solve!(benders::ParallelizedBenders)
             # Solve master problem
             println("[DEBUG] Solving master problem...")
             add_trust_region!(master)
+            master_start = time()
             optimize!(master)
+            master_time = time() - master_start
+            push!(benders.master_times, master_time)
+            println("[DEBUG] Master solve time: $(round(master_time, digits=2))s")
             
             # Get master solution
             gamma_val, s_energy_int_val = get_investments(master)
@@ -452,8 +458,12 @@ function solve!(benders::ParallelizedBenders)
                 println("Total iterations: $(master.iter)")
                 println("Total time: $(round(sum(benders.iteration_times), digits=2))s")
                 println("="^80)
+                export_results(benders)
                 break
             end
+
+            # Export results
+            export_results(benders)
             
             # Increment iteration
             increment_iteration!(master)
@@ -472,7 +482,7 @@ function solve!(benders::ParallelizedBenders)
     end
     
     # Return final solution
-    return get_investments(master)
+    return master.last_y_val
 end
 
 # Shutdown workers
@@ -500,18 +510,19 @@ function export_results(benders::ParallelizedBenders)
     """
     Export final investment decisions and statistics.
     """
-    gamma_val, s_energy_int_val = get_investments(benders.master)
+    gamma_val, s_energy_int_val = benders.master.last_y_val
     
     # Export investments
     export_investments_csv(benders.master.data, gamma_val, s_energy_int_val,
-                          output_dir=joinpath(benders.superdir, "final_output"))
+                          output_dir=joinpath(benders.superdir, "output"))
     
     # Export convergence statistics
     stats_df = DataFrame(
         iteration = 1:length(benders.gaps),
         gap = benders.gaps,
         objective = benders.objectives,
-        time = benders.iteration_times
+        time = benders.iteration_times,
+        master_time = benders.master_times
     )
     
     CSV.write(joinpath(benders.superdir, "output", "convergence_stats.csv"), stats_df)
@@ -532,10 +543,7 @@ function parallelized_ptdf_benders(superdir::String;
                                  tolerance=tolerance)
     
     # Solve
-    gamma_val, s_energy_int_val = solve!(benders)
-    
-    # Export results
-    export_results(benders)
-    
+    solve!(benders)
+        
     return benders
 end

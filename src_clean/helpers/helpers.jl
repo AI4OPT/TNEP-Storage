@@ -1,5 +1,4 @@
 include("convert_units.jl")
-include("setup_simdir.jl")
 include("add_params_profiles.jl")
 include("export_model.jl")
 include("decarbonization.jl")

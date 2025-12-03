@@ -4,7 +4,6 @@ using JSON
 include("PhaseAngleModel.jl")
 include("PTDFModel.jl")
 include("../helpers/helpers.jl")
-include("ParallelizedBenders.jl")
 
 function set_up_data(simdir)
     data_path = joinpath(simdir, "data.json")
@@ -30,7 +29,8 @@ mutable struct ExpansionPlanner
     function ExpansionPlanner(simdir::String; 
                              optimizer_type=Gurobi.Optimizer,
                              timeout=84600)
-        setup_simdir(simdir)
+        mkpath(joinpath(simdir, "output"))
+        mkpath(joinpath(simdir, "visual"))
         data = set_up_data(simdir)
         new(simdir, data, optimizer_type, nothing, timeout)
     end
@@ -106,4 +106,9 @@ function run_model(simdir::String; timeout=84600)
     export_results!(planner)
     
     return jump_model, planner.data
+end
+
+function get_first_stage_lb(superdir::String)
+
+    run_model(simdir)
 end
