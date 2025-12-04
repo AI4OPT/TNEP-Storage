@@ -738,7 +738,7 @@ end
 
 function set_objective!(model::PTDFModel, objective_type::Symbol)
     """
-    Set the objective function for the PTDFModel.
+    Set the objective function for the PTDFModel. Assumes that fix_investments! has been called
     objective_type can be :operational or :feasibility
     """
     data = model.data

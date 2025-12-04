@@ -41,7 +41,7 @@ mutable struct ParallelizedBenders
     
     function ParallelizedBenders(superdir::String; 
                                 max_iterations::Int=100000,
-                                tolerance::Float64=0.01)
+                                tolerance::Float64=0.005)
         
         # Read configuration
         config_file = joinpath(superdir, "config.toml")
@@ -70,9 +70,18 @@ mutable struct ParallelizedBenders
         # Let workers initialize
         sleep(1)
         
-        new(master, workers, superdir, date_weights,
-            max_iterations, tolerance, false,
-            Float64[], Float64[], Float64[], Float64[])
+        new(master, 
+            workers, 
+            superdir, 
+            date_weights,
+            max_iterations, 
+            tolerance, 
+            false, # converged
+            Float64[], # master_times
+            Float64[], # iteration_times
+            Float64[], # gaps
+            Float64[] # objectives
+            )
     end
 end
 
@@ -338,11 +347,11 @@ function update_trust_region!(benders::ParallelizedBenders,
     end
     
     if total_ue < 1e-6
-        if current_obj < master.total_obj[end]
+        if current_obj < master.upper_bound
             # Actual improvement - serious step
             println("[DEBUG] Serious step: objective improved from $(master.total_obj[end]) to $current_obj")
             push!(master.y_trust, [y_val[1], y_val[2]])
-            push!(master.total_obj, current_obj)
+            master.upper_bound = current_obj
             
             # Reset l1 radius
             println("[DEBUG] Resetting l1_radius to 1")
@@ -400,7 +409,7 @@ function solve!(benders::ParallelizedBenders)
             println("[DEBUG] Solving master problem...")
             add_trust_region!(master)
             master_start = time()
-            optimize!(master)
+            solve!(master)
             master_time = time() - master_start
             push!(benders.master_times, master_time)
             println("[DEBUG] Master solve time: $(round(master_time, digits=2))s")
@@ -428,8 +437,7 @@ function solve!(benders::ParallelizedBenders)
                 add_all_cuts!(benders, theta_val, all_results, y_val)
             
             # Calculate gap
-            gap = abs(master_obj + total_phi_val - total_theta_val - master_obj) / 
-                  (1e-10 + abs(master_obj))
+            gap = calculate_gap(benders, master_obj, total_phi_val, total_theta_val)
             push!(benders.gaps, gap)
             push!(benders.objectives, current_obj)
             
@@ -482,7 +490,26 @@ function solve!(benders::ParallelizedBenders)
     end
     
     # Return final solution
-    return master.last_y_val
+    return master.y_trust[end]
+end
+
+function calculate_gap(benders::ParallelizedBenders, master_obj, total_phi_val, total_theta_val)
+    """
+    Calculates the gap of Benders: (UB - LB) / UB
+    UB should be the lowest observed UB.
+    LB should be the highest observed LB.
+    """
+    if benders.master.stabilization == "trust_region"
+        gap = abs(benders.master.upper_bound - benders.master.lower_bound) /
+                    (benders.master.upper_bound)
+
+    else
+        # vanilla calculation of benders gap (master_obj )
+        gap = abs(benders.master.upper_bound - master_obj) / 
+                  (benders.master.upper_bound)
+    end
+
+    return gap
 end
 
 # Shutdown workers
@@ -510,7 +537,7 @@ function export_results(benders::ParallelizedBenders)
     """
     Export final investment decisions and statistics.
     """
-    gamma_val, s_energy_int_val = benders.master.last_y_val
+    gamma_val, s_energy_int_val = benders.master.y_trust[end]
     
     # Export investments
     export_investments_csv(benders.master.data, gamma_val, s_energy_int_val,
@@ -533,10 +560,14 @@ end
 # Main entry point
 function parallelized_ptdf_benders(superdir::String; 
                                   max_iterations::Int=100000,
-                                  tolerance::Float64=0.01)
+                                  tolerance::Float64=0.005)
     """
     Main entry point for parallelized Benders decomposition.
     """
+    # TODO: make a wrapper function in main.jl
+    # println("[DEBUG] Computing global lower bound...")
+    # lb_value = compute_benders_lb(superdir, force_lb=force_lb)
+
     # Create Benders decomposition
     benders = ParallelizedBenders(superdir; 
                                  max_iterations=max_iterations,

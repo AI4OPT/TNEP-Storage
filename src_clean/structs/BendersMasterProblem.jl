@@ -22,6 +22,8 @@ mutable struct BendersMasterProblem
     iter::Int
     total_ue::Vector{Float64}
     total_obj::Vector{Float64}
+    upper_bound::Float64,
+    lower_bound::Union{Nothing, Float64},
     last_y_val::Vector{Vector{Float64}}
     over_invested_point::Tuple{Vector{Float64}, Vector{Float64}}
     
@@ -168,6 +170,8 @@ mutable struct BendersMasterProblem
             1,  # iter
             [Inf],  # total_ue
             [Inf],  # total_obj
+            Inf, # upper_bound
+            nothing, # lower_bound
             [zeros(E), zeros(N)],  # last_y_val
             over_invested_point,
             warmstart, stabilization, level_set_flag,
@@ -198,10 +202,7 @@ function add_prev_upgrades_internal!(model::JuMP.Model, data, prev_dir, gamma, s
     )
 end
 
-# Optimize method
-import JuMP: optimize!
-
-function optimize!(master::BendersMasterProblem)
+function solve!(master::BendersMasterProblem)
     """
     Optimize the Benders master problem.
     """

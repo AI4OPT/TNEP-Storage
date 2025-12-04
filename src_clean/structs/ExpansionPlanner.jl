@@ -43,11 +43,11 @@ function create_model!(planner::ExpansionPlanner)
         
     # TODO: add phase angle functionality and test
     if data["param"]["storage_linearized"] == "phase_angle"
-        println("create_model_phase_angle")
+        println("clean_create_model_phase_angle")
         planner.model = create_model_phase_angle(data, optimizer)
         
     elseif data["param"]["storage_linearized"] == "ptdf_simplified_sorted"
-        println("create_model_r1_ptdf_iterative_simplified_sorted_efficiency")
+        println("clean_create_model_r1_ptdf_iterative_simplified_sorted_efficiency")
         planner.model = create_model_r1_ptdf_iterative_simplified_sorted(
             planner.simdir, data, optimizer)
     else
@@ -69,7 +69,7 @@ function configure_optimizer!(planner::ExpansionPlanner)
 end
 
 # Multiple dispatch for optimize! - default behavior
-function optimize!(planner::ExpansionPlanner)
+function solve!(planner::ExpansionPlanner)
     optimize!(planner.model.jump_model)
 end
 
@@ -106,9 +106,4 @@ function run_model(simdir::String; timeout=84600)
     export_results!(planner)
     
     return jump_model, planner.data
-end
-
-function get_first_stage_lb(superdir::String)
-
-    run_model(simdir)
 end
