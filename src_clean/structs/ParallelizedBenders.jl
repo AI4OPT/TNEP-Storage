@@ -16,7 +16,6 @@ mutable struct PersistentSubproblemWorker
     work_channel::Channel{Vector{Any}}
     result_channel::Channel{Any}
     task::Task
-    worker_id::Int
     date::String
     simdir::String
 end
@@ -26,7 +25,7 @@ mutable struct ParallelizedBenders
     master::BendersMasterProblem
     workers::Vector{PersistentSubproblemWorker}
     superdir::String
-    date_weights::Dict{Int, Tuple{String, Float64}}
+    date_weights::Dict{String, Float64}
     
     # Convergence parameters
     max_iterations::Int
@@ -41,7 +40,8 @@ mutable struct ParallelizedBenders
     
     function ParallelizedBenders(superdir::String; 
                                 max_iterations::Int=100000,
-                                tolerance::Float64=0.005)
+                                tolerance::Float64=0.005,
+                                lower_bound::Float64=0.0)
         
         # Read configuration
         config_file = joinpath(superdir, "config.toml")
@@ -50,22 +50,23 @@ mutable struct ParallelizedBenders
         rep_prob = toml_data["representative_prob"]
         
         # Create date_weights mapping
-        date_weights = Dict{Int, Tuple{String, Float64}}()
+        date_weights = Dict{String, Float64}()
         for i in 1:length(dates)
-            date_weights[i] = (dates[i], rep_prob[i])
+            date_weights[dates[i][6:end]] = rep_prob[i]
         end
         
         # Set up directories and data
-        set_up_directories(superdir, toml_data)
+        simdirs = create_simdirs(superdir, toml_data)
         master_data = set_up_data(superdir)
         
         println("[DEBUG] Finished setting up directories and files for $superdir")
         
         # Create master problem
         master = BendersMasterProblem(superdir, master_data, date_weights)
+        master.lower_bound = lower_bound
         
         # Initialize workers
-        workers = create_persistent_workers(superdir, date_weights)
+        workers = create_persistent_workers(superdir, simdirs, date_weights)
         
         # Let workers initialize
         sleep(1)
@@ -85,63 +86,34 @@ mutable struct ParallelizedBenders
     end
 end
 
-# Set up directories for master and subproblems
-function set_up_directories(superdir::String, toml_data::Dict)
-    """
-    Set up the superdirectory and subproblem directories, and generate data.json files.
-    """
-    dates = toml_data["dates"]
-    
-    # Create master output directories
-    mkpath(joinpath(superdir, "output"))
-    mkpath(joinpath(superdir, "benders_output"))
-    
-    for a_date in dates
-        # Create subproblem directory
-        simdir = joinpath(superdir, a_date)
-        mkpath(simdir)
-        mkpath(joinpath(simdir, "output"))
-        
-        # Make subproblem specific config
-        config = deepcopy(toml_data)
-        config["dates"] = [a_date]
-        config["representative_prob"] = [1.0]
-        config["num_representatives"] = 1
-        
-        open(joinpath(simdir, "config.toml"), "w") do io
-            TOML.print(io, config)
-        end
-        
-        # Create subproblem data
-        set_up_data(simdir)
-    end
-end
-
 # Create persistent worker threads
-function create_persistent_workers(superdir::String, 
-                                  date_weights::Dict{Int, Tuple{String, Float64}})
+function create_persistent_workers(superdir::String, simdirs,
+                                  date_weights::Dict{String, Float64})
     """
     Create persistent worker threads for parallel subproblem solving.
     Each worker maintains its own BendersSubproblem (wrapping PTDFModel).
     """
     workers = PersistentSubproblemWorker[]
     
-    for i in 1:length(date_weights)
-        date = date_weights[i][1]
+    # TODO
+    for i in 1:length(simdirs)
+        simdir = simdirs[i]
+        date = basename(simdir)
+        year = date[begin:4]
+        basedate = date[6:end]
         simdir = joinpath(superdir, date)
         work_channel = Channel{Vector{Any}}(1)
         result_channel = Channel{Any}(1)
-        subproblem_data = JSON.parsefile(joinpath(simdir, "data.json"))
+        subproblem_data = set_up_data(simdir)
         
         # Create placeholder - will be initialized in worker thread
         worker = PersistentSubproblemWorker(
-            BendersSubproblem(subproblem_data, Gurobi.Optimizer, simdir),  # Placeholder
+            BendersSubproblem(subproblem_data, Gurobi.Optimizer, simdir),  # BendersSubproblem
             work_channel,
             result_channel,
             Task(() -> nothing),
-            i,
-            date,
-            simdir
+            date, # date
+            simdir # simdir
         )
         
         worker.task = Threads.@spawn worker_loop(worker)
@@ -172,7 +144,7 @@ function worker_loop(worker::PersistentSubproblemWorker)
             ptdf_tol=1e-6
         )
         
-        println("[DEBUG] Worker $(worker.worker_id) ($(worker.date)) initialized on thread $(Threads.threadid())")
+        println("[DEBUG] Worker $(worker.date) initialized on thread $(Threads.threadid())")
         
         # Main work loop
         while true
@@ -188,9 +160,9 @@ function worker_loop(worker::PersistentSubproblemWorker)
         
     catch e
         if e isa InvalidStateException
-            println("[DEBUG] Worker $(worker.worker_id) shutting down gracefully")
+            println("[DEBUG] Worker $(worker.date) shutting down gracefully")
         else
-            println("[ERROR] Worker $(worker.worker_id) encountered error: $e")
+            println("[ERROR] Worker $(worker.date) encountered error: $e")
             rethrow(e)
         end
     end
@@ -216,13 +188,12 @@ function solve_worker_subproblem(worker::PersistentSubproblemWorker,
     
     if total_ue > 1e-6
         # Infeasible - need feasibility cut
-        println("[DEBUG] Worker $(worker.worker_id) ($(worker.date)): FEASIBILITY cut, unserved energy = $(round(total_ue, digits=4))")
+        println("[DEBUG] Worker $(worker.date): FEASIBILITY cut, unserved energy = $(round(total_ue, digits=4))")
         
         return Dict(
             :total_ue => total_ue,
             :phi_val => 0.0,
             :duals => duals,
-            :worker_id => worker.worker_id,
             :is_feasibility_cut => true,
             :date => worker.date
         )
@@ -233,13 +204,12 @@ function solve_worker_subproblem(worker::PersistentSubproblemWorker,
         duals = extract_duals(worker.subproblem)
         total_ue_actual = get_total_unserved_energy(worker.subproblem)
         
-        println("[DEBUG] Worker $(worker.worker_id) ($(worker.date)): OPTIMALITY cut, phi = $(round(phi_val, digits=2))")
+        println("[DEBUG] Worker $(worker.date): OPTIMALITY cut, phi = $(round(phi_val, digits=2))")
         
         return Dict(
             :total_ue => total_ue_actual,
             :phi_val => phi_val,
             :duals => duals,
-            :worker_id => worker.worker_id,
             :is_feasibility_cut => false,
             :date => worker.date
         )
@@ -289,7 +259,6 @@ function add_all_cuts!(benders::ParallelizedBenders,
         ue = result[:total_ue]
         phi_val = result[:phi_val]
         duals = result[:duals]
-        worker_id = result[:worker_id]
         is_feasibility_cut = result[:is_feasibility_cut]
         date = result[:date]
         
@@ -298,21 +267,21 @@ function add_all_cuts!(benders::ParallelizedBenders,
             add_feasibility_cut!(master, duals, y_val, ue)
         else
             # Add optimality cut for this representative period
-            add_benders_cut!(master, worker_id, duals, y_val, phi_val)
+            add_benders_cut!(master, date, duals, y_val, phi_val)
         end
         
         # Create rep-day specific log
         output_dir = joinpath(benders.superdir, date)
         benders_ptdf_write_to_csv(output_dir, y_val, master_obj, 
-                                 theta_val[worker_id], phi_val, ue)
+                                 theta_val[date], phi_val, ue)
         
         # Accumulate for aggregate statistics
-        weight = benders.date_weights[worker_id][2]
-        total_theta_val += theta_val[worker_id] * weight
+        weight = benders.date_weights[date[6:end]]
+        total_theta_val += theta_val[date] * weight
         
         if is_feasibility_cut
             penalty = master.data["param"]["under_served_penalty"]
-            total_phi_val += (theta_val[worker_id] + penalty * ue) * weight
+            total_phi_val += (theta_val[date] + penalty * ue) * weight
         else
             total_phi_val += phi_val * weight
         end
@@ -523,7 +492,7 @@ function shutdown!(benders::ParallelizedBenders)
         try
             close(worker.work_channel)
         catch e
-            println("[WARNING] Error closing channel for worker $(worker.worker_id): $e")
+            println("[WARNING] Error closing channel for worker $(worker.date): $e")
         end
     end
     
@@ -560,7 +529,8 @@ end
 # Main entry point
 function parallelized_ptdf_benders(superdir::String; 
                                   max_iterations::Int=100000,
-                                  tolerance::Float64=0.005)
+                                  tolerance::Float64=0.005,
+                                  lower_bound::Float64=0.0)
     """
     Main entry point for parallelized Benders decomposition.
     """
@@ -571,7 +541,8 @@ function parallelized_ptdf_benders(superdir::String;
     # Create Benders decomposition
     benders = ParallelizedBenders(superdir; 
                                  max_iterations=max_iterations,
-                                 tolerance=tolerance)
+                                 tolerance=tolerance,
+                                 lower_bound=lower_bound)
     
     # Solve
     solve!(benders)

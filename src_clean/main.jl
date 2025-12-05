@@ -10,5 +10,9 @@ function parallelized_benders_wrapper(superdir::String;
     println("[DEBUG] Computing global lower bound...")
     lb_value = compute_benders_lb(superdir, force_lb=force_lb)
 
-    # benders = parallelized_ptdf_benders(superdir, max_iterations=max_iterations, tolerance=tolerance)
+    # benders = parallelized_ptdf_benders(superdir, max_iterations=max_iterations, tolerance=tolerance, )
 end
+
+# superdir = "sim/PowerUp/benders/2030batchtest"
+# lb_value = compute_benders_lb(superdir)
+# parallelized_ptdf_benders(superdir, lower_bound=lb_value)

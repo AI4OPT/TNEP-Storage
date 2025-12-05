@@ -111,6 +111,7 @@ function add_profiles(data)
     end
 end
 
+"""
 function make_date_subdirs(simdir, data)
     for date in data["param"]["dates"]
         dirname = joinpath(simdir, "output", date)
@@ -119,11 +120,12 @@ function make_date_subdirs(simdir, data)
         end
     end
 end
+"""
 
 function add_params_profiles(simdir)
     data = add_params(simdir)
     add_profiles(data)
-    make_date_subdirs(simdir, data)
+    # make_date_subdirs(simdir, data)
 
     # Calculate and check the sum of representatives' probabilities
     sum_probabilities = sum(values(data["param"]["representative_prob"]))

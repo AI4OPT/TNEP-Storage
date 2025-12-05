@@ -16,14 +16,14 @@ mutable struct BendersMasterProblem
     ue_sum::VariableRef
     
     # Metadata and tracking
-    date_weights::Dict{Int, Tuple{String, Float64}}
+    date_weights::Dict{String, Float64}
     y_trust::Vector{Vector{Vector{Float64}}}
     gap::Vector{Float64}
     iter::Int
     total_ue::Vector{Float64}
     total_obj::Vector{Float64}
-    upper_bound::Float64,
-    lower_bound::Union{Nothing, Float64},
+    upper_bound::Float64
+    lower_bound::Float64
     last_y_val::Vector{Vector{Float64}}
     over_invested_point::Tuple{Vector{Float64}, Vector{Float64}}
     
@@ -42,7 +42,7 @@ mutable struct BendersMasterProblem
     
     # Inner constructor
     function BendersMasterProblem(superdir::String, data::Dict{String, Any}, 
-                                 date_weights::Dict{Int, Tuple{String, Float64}})
+                                 date_weights::Dict{String, Float64})
         
         # Initialize model
         optimizer = Gurobi.Optimizer
@@ -80,7 +80,13 @@ mutable struct BendersMasterProblem
         @variable(jump_model, s_energy_int[i=1:N] >= 0, Int)
         
         # Subproblem objectives
-        @variable(jump_model, theta[r=1:R] >= 0)
+        if typeof(data["param"]["decarbonization_year"]) == Int
+            year = data["param"]["decarbonization_year"]
+            dates = [string(year) * x[5:end] for x in data["param"]["dates"]]
+            @variable(jump_model, theta[dates] >= 0)
+        else
+            error("Expected decarbonization year to be an Int")
+        end
         
         # Subproblem load shed
         @variable(jump_model, ue_sum >= 0)
@@ -152,7 +158,7 @@ mutable struct BendersMasterProblem
                 data["param"]["bess_energy_cost"] for i in 1:N) + 
             sum(data["param"]["cap_upgrade_cost"] * data["param"]["cap_upgrade_increment"] * 
                 data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
-            sum(theta[r] * date_weights[r][2] for r in 1:R) + 
+            sum(theta[date] * date_weights[date[6:end]] for date in dates) + 
             ue_sum * data["param"]["operational_weight"] * data["param"]["under_served_penalty"]
         )
         
@@ -171,7 +177,7 @@ mutable struct BendersMasterProblem
             [Inf],  # total_ue
             [Inf],  # total_obj
             Inf, # upper_bound
-            nothing, # lower_bound
+            0.0, # lower_bound
             [zeros(E), zeros(N)],  # last_y_val
             over_invested_point,
             warmstart, stabilization, level_set_flag,
@@ -231,7 +237,7 @@ function get_theta_values(master::BendersMasterProblem)
 end
 
 # Add Benders cut
-function add_benders_cut!(master::BendersMasterProblem, rep_index::Int, 
+function add_benders_cut!(master::BendersMasterProblem, date::String, 
                          duals::Tuple, y_val::Tuple, phi_val::Float64)
     """
     Add a Benders optimality cut for a specific representative period.
@@ -240,7 +246,7 @@ function add_benders_cut!(master::BendersMasterProblem, rep_index::Int,
     gamma_val, s_energy_int_val = y_val
     
     @constraint(master.jump_model, 
-        master.theta[rep_index] >= phi_val + 
+        master.theta[date] >= phi_val + 
         sum(dual_gamma[a] * (master.gamma[a] - gamma_val[a]) for a=1:master.E) +
         sum(dual_energy[i] * (master.s_energy_int[i] - s_energy_int_val[i]) for i=1:master.N)
     )

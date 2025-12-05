@@ -6,6 +6,8 @@ include("PTDFModel.jl")
 include("../helpers/helpers.jl")
 
 function set_up_data(simdir)
+    mkpath(joinpath(simdir, "output"))
+    mkpath(joinpath(simdir, "visual"))
     data_path = joinpath(simdir, "data.json")
     data = add_params_profiles(simdir)
     data = update_decarbonization(simdir, data)
@@ -29,8 +31,6 @@ mutable struct ExpansionPlanner
     function ExpansionPlanner(simdir::String; 
                              optimizer_type=Gurobi.Optimizer,
                              timeout=84600)
-        mkpath(joinpath(simdir, "output"))
-        mkpath(joinpath(simdir, "visual"))
         data = set_up_data(simdir)
         new(simdir, data, optimizer_type, nothing, timeout)
     end
