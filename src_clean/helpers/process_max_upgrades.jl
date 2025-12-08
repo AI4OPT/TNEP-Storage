@@ -49,8 +49,6 @@ function compute_superset_core_point(superdir)
     # Read the full config file
     config_file = joinpath(superdir, "config.toml")
     toml_data = TOML.parsefile(config_file)
-    storage_energy_size = get(toml_data, "storage_energy_size", 2.5)
-
 
     # Get the initial core points (solved without benders)
     # has rep day optimal investments
@@ -65,9 +63,9 @@ function compute_superset_core_point(superdir)
     stor_df = process_csv_max_storage(csv_stor_files, joinpath(superdir, "storage_investments.csv"))
 
     gamma_val = trans_df[:, :Upgrade_Lvl]
-    s_energy_int_val = stor_df[:, :Storage_Energy] * 1 / storage_energy_size
+    s_energy_val = stor_df[:, :Storage_Energy]
     gamma_val = safe_ceil.(gamma_val)
-    s_energy_int_val = safe_ceil.(s_energy_int_val)
+    s_energy_val = safe_ceil.(s_energy_val)
 
     if haskey(toml_data, "inv_dir")
         inv_dir = toml_data["inv_dir"]
@@ -78,10 +76,10 @@ function compute_superset_core_point(superdir)
         stor_df = CSV.read(stor_file, DataFrame)
 
         gamma_val = trans_df[:, :Upgrade_Lvl]
-        s_energy_int_val = stor_df[:, :Storage_Energy]
+        s_energy_val = stor_df[:, :Storage_Energy]
     end
 
-    return gamma_val, s_energy_int_val
+    return gamma_val, s_energy_val
 end
 
 function safe_ceil(x, tolerance=1e-8)
@@ -99,8 +97,8 @@ function compare_y_vals(y_val_1, y_val_2)
     gamma1 = y_val_1[1]
     gamma2 = y_val_2[1]
 
-    s_energy_int1 = y_val_1[2]
-    s_energy_int2 = y_val_2[2]
+    s_energy_1 = y_val_1[2]
+    s_energy_2 = y_val_2[2]
 
-    return sum(abs.(gamma1 .- gamma2)) + sum(abs.(s_energy_int1 .- s_energy_int2))
+    return sum(abs.(gamma1 .- gamma2)) + sum(abs.(s_energy_1 .- s_energy_2))
 end

@@ -3,44 +3,12 @@ using CSV
 using DataFrames
 
 include("../structs/ExpansionPlanner.jl")
-
-function create_simdirs(superdir::String, toml_data::Dict; only_feasibility=nothing)
-    simdirs = String[]
-    year = toml_data["decarbonization_year"]
-    
-    for rep in toml_data["dates"]
-        simdir = joinpath(superdir, string(year) * rep[5:end])
-        
-        # Create directory if needed
-        mkpath(simdir)
-        
-        # Create modified config
-        config = deepcopy(toml_data)
-        config["dates"] = [rep]
-        config["representative_prob"] = [1.0]
-        config["num_representatives"] = 1
-
-        if !isnothing(only_feasibility)
-            config["only_feasibility"] = only_feasibility
-        end
-        
-        # Write config
-        open(joinpath(simdir, "config.toml"), "w") do io
-            TOML.print(io, config)
-        end
-        
-        push!(simdirs, simdir)
-        println("Created simulation directory: $simdir")
-    end
-    
-    return simdirs
-end
+most_challenging = "2016-08-11"
 
 function create_sbatch_file(job_name::String, 
                            log_file::String, 
                            sim_path::String, 
                            output_file::String,
-                           stage_type::String;  # "first_stage" or "second_stage"
                            nodes::Int=1,
                            tasks_per_node::Int=24,
                            mem_per_cpu::String="12G",
@@ -60,7 +28,7 @@ function create_sbatch_file(job_name::String,
     #SBATCH --mail-type=BEGIN,END,FAIL
     #SBATCH --mail-user=$email
     cd /storage/home/hcoda1/1/kwu381/TNEP-Storage
-    julia --project=. exp/clean/run_lb_single.jl $sim_path $tasks_per_node $stage_type
+    julia --project=. exp/clean/run_lb_single.jl $sim_path $tasks_per_node
     """
     open(output_file, "w") do file
         write(file, content)
@@ -71,7 +39,6 @@ end
 function create_batch_files(simdirs::Vector{String},
                            pace_dir::String,
                            name_suffix::String,
-                           stage_type::String,
                            submit_jobs::Bool)
     mkpath(pace_dir)
     for simdir in simdirs
@@ -79,7 +46,7 @@ function create_batch_files(simdirs::Vector{String},
         job_name = "$(rep)$(name_suffix)"
         log_file = joinpath("lower_bound", job_name)
         output_file = joinpath(pace_dir, "run_$(rep).sbatch")
-        create_sbatch_file(job_name, log_file, simdir, output_file, stage_type)
+        create_sbatch_file(job_name, log_file, simdir, output_file)
     end
     if submit_jobs
         submit_sbatch_jobs(pace_dir)
@@ -106,12 +73,21 @@ function aggregate_first_stage_lb(first_lb_dir::String)
     objectives = Float64[]
     
     for simdir in simdirs
-        obj_file = joinpath(simdir, "output", "objective.csv")
-        if isfile(obj_file)
-            df = CSV.read(obj_file, DataFrame)
-            push!(objectives, df[1, :objective])
+        summary = joinpath(simdir, "output", "summary_data.csv")
+        if isfile(summary)
+            df = CSV.read(summary, DataFrame)
+        
+            # Extract line and storage investment costs
+            line_cost_row = df[df.Variable .== "line_investment_costs", :]
+            storage_cost_row = df[df.Variable .== "storage_investment_costs", :]
+        
+            line_cost = isempty(line_cost_row) ? 0.0 : line_cost_row[1, :Value]
+            storage_cost = isempty(storage_cost_row) ? 0.0 : storage_cost_row[1, :Value]
+        
+            # Push the sum of both investment costs
+            push!(objectives, line_cost + storage_cost)
         else
-            error("Missing objective file: $obj_file. Job may not have completed yet.")
+            error("Missing objective file: $summary. Job may not have completed yet.")
         end
     end
     
@@ -124,7 +100,6 @@ function aggregate_first_stage_lb(first_lb_dir::String)
     
     println("First-stage LB: $first_lb_val")
     return first_lb_val
-    
 end
 
 function aggregate_second_stage_lb(second_lb_dir::String, superdir::String)
@@ -136,9 +111,11 @@ function aggregate_second_stage_lb(second_lb_dir::String, superdir::String)
     toml_data = TOML.parsefile(config_file)
     rep_prob = toml_data["representative_prob"]
     dates = toml_data["dates"]
+    year = toml_data["decarbonization_year"]
+    real_dates = [string(year) * date[5:end] for date in dates]
     
     # Find simdirs in order matching dates
-    simdirs = [joinpath(second_lb_dir, date) for date in dates]
+    simdirs = [joinpath(second_lb_dir, date) for date in real_dates]
     @assert length(simdirs) == length(rep_prob) "Mismatch between simdirs and probabilities"
     
     # Read objectives from result files
@@ -164,24 +141,70 @@ function aggregate_second_stage_lb(second_lb_dir::String, superdir::String)
     return second_lb_val
 end
 
-function compute_first_stage_lb(superdir, first_lb_dir; submit_jobs::Bool=true)
+function compute_first_stage_lb(superdir, first_lb_dir, most_challenging; submit_jobs::Bool=true)
     """
     First-stage LB: computed by achieving zero load-shed feasibility on the "most challenging" representative day
-    Solves <only_feasibility = true> for all representative days
+    E.g. "most challenging" == "2016-08-11
+    Solves <only_feasibility = true> the most challenging representative day
     """
     # Read config file
     config_file = joinpath(superdir, "config.toml")
     !isfile(config_file) && error("Config file not found: $config_file")
     toml_data = TOML.parsefile(config_file)
     
-    # Create first stage simdirs
-    simdirs = create_simdirs(first_lb_dir, toml_data, only_feasibility=true)
+    # Create the simdir
+    year = toml_data["decarbonization_year"]
+    simdir = joinpath(first_lb_dir, string(year) * most_challenging[5:end])
+    mkpath(simdir)
     
-    # Create and submit batch files
+    config = deepcopy(toml_data)
+    config["dates"] = [most_challenging]
+    config["representative_prob"] = [1.0]
+    config["num_representatives"] = 1
+    config["only_feasibility"] = true
+    
+    # Write config
+    open(joinpath(simdir, "config.toml"), "w") do io
+        TOML.print(io, config)
+    end
+    
+    # Create batch file
     pace_dir = joinpath(first_lb_dir, "batch_files")
-    create_batch_files(simdirs, pace_dir, "_first_lb", "first_stage", submit_jobs)
+    mkpath(pace_dir)
     
-    println("First-stage batch jobs submitted. Results will be available after jobs complete.")
+    job_name = "$(basename(simdir))_first_lb"
+    log_file = joinpath("lower_bound", job_name)
+    batch_file = joinpath(pace_dir, "$(job_name).sbatch")
+    
+    content = """
+    #!/bin/bash
+    #SBATCH -J$job_name
+    #SBATCH -qinferno
+    #SBATCH --account=gts-phentenryck3-coda20
+    #SBATCH -N1 --ntasks-per-node=24
+    #SBATCH --mem-per-cpu=12G
+    #SBATCH -t48:00:00
+    #SBATCH -o/storage/home/hcoda1/1/kwu381/TNEP-Storage/PACE/logs/$log_file.out
+    #SBATCH --mail-type=BEGIN,END,FAIL
+    #SBATCH --mail-user=kwu381@gatech.edu
+    
+    cd /storage/home/hcoda1/1/kwu381/TNEP-Storage
+    julia --project=. exp/clean/run_expansionplanner.jl $simdir
+    """
+    
+    open(batch_file, "w") do file
+        write(file, content)
+    end
+    
+    # Submit the job if requested
+    if submit_jobs
+        run(`sbatch $batch_file`)
+        println("First-stage batch job submitted: $batch_file")
+    else
+        println("Batch file created but not submitted: $batch_file")
+    end
+    
+    println("Results will be available after job completes.")
     println("To aggregate results later, run: aggregate_first_stage_lb(\"$first_lb_dir\")")
     
     return nothing
@@ -218,7 +241,7 @@ function compute_second_stage_lb(superdir, second_lb_dir; submit_jobs::Bool=true
     
     # Create and submit batch files
     pace_dir = joinpath(second_lb_dir, "batch_files")
-    create_batch_files(simdirs, pace_dir, "_second_lb", "second_stage", submit_jobs)
+    create_batch_files(simdirs, pace_dir, "_second_lb", submit_jobs)
     
     println("Second-stage batch jobs submitted. Results will be available after jobs complete.")
     println("To aggregate results later, run: aggregate_second_stage_lb(\"$second_lb_dir\", \"$superdir\")")
@@ -226,14 +249,19 @@ function compute_second_stage_lb(superdir, second_lb_dir; submit_jobs::Bool=true
     return nothing
 end
 
-function compute_benders_lb(superdir::String; force_lb::Bool=false)
+function compute_benders_lb(superdir::String, most_challenging::String; force_lb::Bool=false, submit_jobs::Bool=true)
     """
     Computes a valid global lower bound by summing first-stage and second-stage LBs.
-    If CSV files exist, reads and returns their sum. Otherwise, submits batch jobs.
+    Priority order:
+    1. If CSV files exist, reads and returns their sum
+    2. If result files exist but not aggregated, aggregates them
+    3. Otherwise, submits batch jobs (if submit_jobs=true)
     
     # Arguments
     - `superdir::String`: Directory containing the main config file
+    - `most_challenging::String`: Most challenging representative day
     - `force_lb::Bool=false`: Force recomputation even if results exist
+    - `submit_jobs::Bool=true`: Whether to submit batch jobs if needed
     
     # Returns
     - `Float64`: Total lower bound (first_lb + second_lb), or `nothing` if jobs need to run
@@ -244,7 +272,7 @@ function compute_benders_lb(superdir::String; force_lb::Bool=false)
     first_lb_file = joinpath(first_lb_dir, "first_stage_lb.csv")
     second_lb_file = joinpath(second_lb_dir, "second_stage_lb.csv")
     
-    # Check if both files exist and we're not forcing recomputation
+    # Priority 1: Check if both aggregated files exist and we're not forcing recomputation
     if !force_lb && isfile(first_lb_file) && isfile(second_lb_file)
         println("="^80)
         println("READING EXISTING LOWER BOUND RESULTS")
@@ -252,12 +280,12 @@ function compute_benders_lb(superdir::String; force_lb::Bool=false)
         
         # Read first-stage lower bound
         first_lb_df = CSV.read(first_lb_file, DataFrame)
-        first_lb = first_lb_df[1, :first_stage_lb]  # Adjust column name as needed
+        first_lb = first_lb_df[1, :first_stage_lb]
         println("First-stage LB: $(round(first_lb, digits=2))")
         
         # Read second-stage lower bound
         second_lb_df = CSV.read(second_lb_file, DataFrame)
-        second_lb = second_lb_df[1, :second_stage_lb]  # Adjust column name as needed
+        second_lb = second_lb_df[1, :second_stage_lb]
         println("Second-stage LB: $(round(second_lb, digits=2))")
         
         # Compute total
@@ -268,27 +296,93 @@ function compute_benders_lb(superdir::String; force_lb::Bool=false)
         return total_lb
     end
     
-    # Otherwise, submit batch jobs
+    # Priority 2: Try to aggregate if result files exist
+    first_lb = nothing
+    second_lb = nothing
+    
+    if !force_lb
+        # Check if first-stage results can be aggregated
+        if !isfile(first_lb_file)
+            year = TOML.parsefile(joinpath(superdir, "config.toml"))["decarbonization_year"]
+            first_stage_simdir = joinpath(first_lb_dir, string(year) * most_challenging[5:end])
+            summary_file = joinpath(first_stage_simdir, "output", "summary_data.csv")
+            
+            if isfile(summary_file)
+                println("="^80)
+                println("AGGREGATING FIRST-STAGE RESULTS")
+                println("="^80)
+                try
+                    first_lb = aggregate_first_stage_lb(first_lb_dir)
+                catch e
+                    println("Warning: Could not aggregate first-stage results: $e")
+                end
+            end
+        else
+            first_lb_df = CSV.read(first_lb_file, DataFrame)
+            first_lb = first_lb_df[1, :first_stage_lb]
+            println("First-stage LB already computed: $(round(first_lb, digits=2))")
+        end
+        
+        # Check if second-stage results can be aggregated
+        if !isfile(second_lb_file)
+            config = TOML.parsefile(joinpath(superdir, "config.toml"))
+            year = config["decarbonization_year"]
+            dates = config["dates"]
+            real_dates = [string(year) * date[5:end] for date in dates]
+            
+            # Check if at least one objective file exists
+            any_obj_exists = any(isfile(joinpath(second_lb_dir, date, "output", "objective.csv")) for date in real_dates)
+            
+            if any_obj_exists
+                println("="^80)
+                println("AGGREGATING SECOND-STAGE RESULTS")
+                println("="^80)
+                try
+                    second_lb = aggregate_second_stage_lb(second_lb_dir, superdir)
+                catch e
+                    println("Warning: Could not aggregate second-stage results: $e")
+                end
+            end
+        else
+            second_lb_df = CSV.read(second_lb_file, DataFrame)
+            second_lb = second_lb_df[1, :second_stage_lb]
+            println("Second-stage LB already computed: $(round(second_lb, digits=2))")
+        end
+        
+        # If both bounds were successfully obtained, return the sum
+        if first_lb !== nothing && second_lb !== nothing
+            total_lb = first_lb + second_lb
+            println("\n" * "="^80)
+            println("Total Benders LB: $(round(total_lb, digits=2))")
+            println("="^80)
+            return total_lb
+        end
+    end
+    
+    # Priority 3: Submit batch jobs if enabled
+    if !submit_jobs
+        println("="^80)
+        println("CANNOT COMPUTE LOWER BOUND")
+        println("="^80)
+        println("Results not available and submit_jobs=false")
+        println("Set submit_jobs=true to submit batch jobs")
+        return nothing
+    end
+    
     println("="^80)
     println("BATCH MODE: Submitting lower bound computation jobs")
     println("="^80)
     
     # Submit first-stage jobs if needed
-    if force_lb || !isfile(first_lb_file)
+    if force_lb || first_lb === nothing
         println("\nSubmitting first-stage lower bound jobs...")
-        compute_first_stage_lb(superdir, first_lb_dir)
-    else
-        println("\nFirst-stage results already exist at: $first_lb_file")
-        println("Use force_lb=true to recompute")
+        compute_first_stage_lb(superdir, first_lb_dir, most_challenging, submit_jobs=true)
     end
     
     # Submit second-stage jobs if needed
-    if force_lb || !isfile(second_lb_file)
+    if force_lb || second_lb === nothing
         println("\nSubmitting second-stage lower bound jobs...")
-        compute_second_stage_lb(superdir, second_lb_dir)
-    else
-        println("\nSecond-stage results already exist at: $second_lb_file")
-        println("Use force_lb=true to recompute")
+        compute_second_stage_lb(superdir, second_lb_dir, submit_jobs=true)
     end
     
     println("\n" * "="^80)

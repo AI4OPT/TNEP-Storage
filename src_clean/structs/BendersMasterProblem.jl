@@ -1,4 +1,5 @@
 using JuMP
+using JuMP.Containers
 using Gurobi
 using Serialization
 using CSV, DataFrames
@@ -11,8 +12,8 @@ mutable struct BendersMasterProblem
     
     # Decision variables (stored for convenience)
     gamma::Vector{VariableRef}
-    s_energy_int::Vector{VariableRef}
-    theta::Vector{VariableRef}
+    s_energy::Vector{VariableRef}
+    theta::DenseAxisArray{VariableRef, 1}
     ue_sum::VariableRef
     
     # Metadata and tracking
@@ -77,7 +78,7 @@ mutable struct BendersMasterProblem
         @variable(jump_model, 0 <= gamma[a=1:E] <= K, Int)
         
         # Energy rating of storage
-        @variable(jump_model, s_energy_int[i=1:N] >= 0, Int)
+        @variable(jump_model, s_energy[i=1:N] >= 0, Int)
         
         # Subproblem objectives
         if typeof(data["param"]["decarbonization_year"]) == Int
@@ -108,7 +109,7 @@ mutable struct BendersMasterProblem
         # Check if previous investments exist
         if haskey(data["param"], "previous_investment_dir")
             prev_dir = data["param"]["previous_investment_dir"]
-            add_prev_upgrades_internal!(jump_model, data, prev_dir, gamma, s_energy_int)
+            add_prev_upgrades_internal!(superdir, jump_model, data, prev_dir, gamma, s_energy)
         end
         
         # If rate a is zero (unlimited), then don't allow upgrades
@@ -120,7 +121,7 @@ mutable struct BendersMasterProblem
         # Energy rating maximum
         @constraint(jump_model, 
             installed_energy_ub[i in 1:N],
-            s_energy_int[i] * data["param"]["storage_energy_size"] <= data["param"]["max_energy_rating"]
+            s_energy[i] * data["param"]["storage_energy_size"] <= data["param"]["max_energy_rating"]
         )
         
         # Compute over-invested point
@@ -134,7 +135,7 @@ mutable struct BendersMasterProblem
             
             @constraint(jump_model, 
                 energy_cand[i in storage_non_indices],
-                s_energy_int[i] == 0
+                s_energy[i] == 0
             )
         end
         
@@ -154,7 +155,7 @@ mutable struct BendersMasterProblem
         #
         
         obj_expr = (
-            sum(s_energy_int[i] * data["param"]["storage_energy_size"] * 
+            sum(s_energy[i] * data["param"]["storage_energy_size"] * 
                 data["param"]["bess_energy_cost"] for i in 1:N) + 
             sum(data["param"]["cap_upgrade_cost"] * data["param"]["cap_upgrade_increment"] * 
                 data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
@@ -169,7 +170,7 @@ mutable struct BendersMasterProblem
         
         # Create and return the struct
         new(jump_model, data, superdir,
-            gamma, s_energy_int, theta, ue_sum,
+            gamma, s_energy, theta, ue_sum,
             date_weights,
             Vector{Vector{Vector{Float64}}}(),  # y_trust
             Vector{Float64}(),  # gap
@@ -186,7 +187,7 @@ mutable struct BendersMasterProblem
 end
 
 # Helper function for adding previous upgrades (internal use)
-function add_prev_upgrades_internal!(model::JuMP.Model, data, prev_dir, gamma, s_energy_int)
+function add_prev_upgrades_internal!(superdir, model::JuMP.Model, data, prev_dir, gamma, s_energy; export_csv::Bool=true)
     E = length(data["branch"])
     N = length(data["bus"])
     
@@ -204,8 +205,20 @@ function add_prev_upgrades_internal!(model::JuMP.Model, data, prev_dir, gamma, s
     )
     @constraint(model,
         old_s_energy[i in nonzero_storage_indices],
-        s_energy_int[i] >= storage_df[i, :Storage_Energy]
+        s_energy[i] >= storage_df[i, :Storage_Energy]
     )
+
+    # Export previous upgrades if requested
+    if export_csv
+        min_upgrades_dir = joinpath(superdir, "previous_investment_dir")
+        export_investments_csv(
+            data, 
+            gamma_min,
+            s_energy_min,
+            output_dir=min_upgrades_dir
+        )
+        @info "Exported previous upgrades to $min_upgrades_dir"
+    end
 end
 
 function solve!(master::BendersMasterProblem)
@@ -219,11 +232,11 @@ end
 function get_investments(master::BendersMasterProblem)
     """
     Get current investment decision values.
-    Returns (gamma_val, s_energy_int_val)
+    Returns (gamma_val, s_energy_val)
     """
     gamma_val = value.(master.gamma)
-    s_energy_int_val = value.(master.s_energy_int)
-    return (gamma_val, s_energy_int_val)
+    s_energy_val = value.(master.s_energy)
+    return (gamma_val, s_energy_val)
 end
 
 # Get objective value
@@ -243,12 +256,12 @@ function add_benders_cut!(master::BendersMasterProblem, date::String,
     Add a Benders optimality cut for a specific representative period.
     """
     dual_gamma, dual_energy = duals
-    gamma_val, s_energy_int_val = y_val
+    gamma_val, s_energy_val = y_val
     
     @constraint(master.jump_model, 
         master.theta[date] >= phi_val + 
         sum(dual_gamma[a] * (master.gamma[a] - gamma_val[a]) for a=1:master.E) +
-        sum(dual_energy[i] * (master.s_energy_int[i] - s_energy_int_val[i]) for i=1:master.N)
+        sum(dual_energy[i] * (master.s_energy[i] - s_energy_val[i]) for i=1:master.N)
     )
 end
 
@@ -259,12 +272,12 @@ function add_feasibility_cut!(master::BendersMasterProblem,
     Add a Benders feasibility cut.
     """
     dual_gamma, dual_energy = duals
-    gamma_val, s_energy_int_val = y_val
+    gamma_val, s_energy_val = y_val
     
     @constraint(master.jump_model, 
         master.ue_sum >= ue_val + 
         sum(dual_gamma[a] * (master.gamma[a] - gamma_val[a]) for a=1:master.E) +
-        sum(dual_energy[i] * (master.s_energy_int[i] - s_energy_int_val[i]) for i=1:master.N)
+        sum(dual_energy[i] * (master.s_energy[i] - s_energy_val[i]) for i=1:master.N)
     )
 end
 
@@ -279,16 +292,16 @@ function add_trust_region!(master::BendersMasterProblem)
     
     if master.iter == 1
         # Initialize trust region at over-invested point
-        gamma_core, s_energy_int_core = zeros(master.E), zeros(master.N)
+        gamma_core, s_energy_core = zeros(master.E), zeros(master.N)
         if master.warmstart
-            gamma_core, s_energy_int_core = master.over_invested_point
+            gamma_core, s_energy_core = master.over_invested_point
         end
-        y_core = [gamma_core, s_energy_int_core]
+        y_core = [gamma_core, s_energy_core]
         push!(master.y_trust, y_core)
         master.jump_model.ext[:l1_radius] = [1]
         
         y_trust = master.y_trust[end]
-        gamma_trust, s_energy_int_trust = y_trust
+        gamma_trust, s_energy_trust = y_trust
         
         abs_diff = master.jump_model[:abs_diff]
         trans_abs_diff = master.jump_model[:trans_abs_diff]
@@ -302,10 +315,10 @@ function add_trust_region!(master::BendersMasterProblem)
         
         @constraint(master.jump_model,
             abs_diff_ub[i in 1:master.N],
-            abs_diff[i] >= master.s_energy_int[i] - s_energy_int_trust[i])
+            abs_diff[i] >= master.s_energy[i] - s_energy_trust[i])
         @constraint(master.jump_model,
             abs_diff_lb[i in 1:master.N],
-            abs_diff[i] >= s_energy_int_trust[i] - master.s_energy_int[i])
+            abs_diff[i] >= s_energy_trust[i] - master.s_energy[i])
         
         @constraint(master.jump_model,
             trans_abs_diff_total,
@@ -319,7 +332,7 @@ function add_trust_region!(master::BendersMasterProblem)
     end
     
     y_trust = master.y_trust[end]
-    gamma_trust, s_energy_int_trust = y_trust
+    gamma_trust, s_energy_trust = y_trust
     
     abs_diff = master.jump_model[:abs_diff]
     trans_abs_diff = master.jump_model[:trans_abs_diff]
@@ -333,10 +346,10 @@ function add_trust_region!(master::BendersMasterProblem)
     
     @constraint(master.jump_model,
         abs_diff_ub[i in 1:master.N],
-        abs_diff[i] >= master.s_energy_int[i] - s_energy_int_trust[i])
+        abs_diff[i] >= master.s_energy[i] - s_energy_trust[i])
     @constraint(master.jump_model,
         abs_diff_lb[i in 1:master.N],
-        abs_diff[i] >= s_energy_int_trust[i] - master.s_energy_int[i])
+        abs_diff[i] >= s_energy_trust[i] - master.s_energy[i])
     
     @constraint(master.jump_model,
         trans_abs_diff_total,

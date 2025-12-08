@@ -23,7 +23,7 @@ function write_summary_to_csv(simdir, model, data)
     energy_data = df_storage_investments[!, :Storage_Energy]
     N = length(energy_data)
     storage_investment_costs = (
-        sum(energy_data[i] * data["param"]["bess_energy_cost"] for i in 1:N) 
+        sum(energy_data[i] * data["param"]["bess_energy_cost"] for i in 1:N) * data["param"]["storage_energy_size"] 
         + num_storage_investments * data["param"]["storage_fixed_cost"]
     )
 

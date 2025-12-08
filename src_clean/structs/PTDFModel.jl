@@ -65,10 +65,28 @@ mutable struct PTDFModel <: OptimizationModel
         jump_model[:ptdf_flow] = Dict{String, ConstraintRef}()
         
         # Create and return the model
-        new(jump_model, data, simdir, ptdf_matrix, 
+        model = new(jump_model, data, simdir, ptdf_matrix, 
             Dict{Tuple{Int,Int,Int,Bool}, Bool}(),
             rate_a_set, max_ptdf_iterations, max_ptdf_per_iteration, 
             ptdf_tol, 0.0, gen_bus_map, R, N, E, T, G)
+
+        if haskey(data["param"], "previous_investment_dir")
+            prev_dir = data["param"]["previous_investment_dir"]
+            gamma_min, s_energy_min = load_investments_from_dir(
+                prev_dir, data, E=E, N=N, allow_missing=false
+            )
+            set_previous_investments!(model, gamma_min, s_energy_min)
+        end
+    
+        if haskey(data["param"], "current_investment_dir")
+            cur_dir = data["param"]["current_investment_dir"]
+            gamma_val, s_energy_val = load_investments_from_dir(
+                cur_dir, data, E=E, N=N, allow_missing=true
+            )
+            fix_investments!(model, gamma_val, s_energy_val)
+        end
+        
+        return model
     end
 end
 
@@ -84,7 +102,7 @@ function create_base_model(data::Dict{String, Any}, optimizer)
     rate_a_zero, rate_a_nonzero = get_rate_a_zero(data)
     gen_bus_map = Dict(parse(Int, g) => data["gen"]["$g"]["gen_bus"] for g in keys(data["gen"]))
 
-    model = JuMP.Model(optimizer)
+    jump_model = JuMP.Model(optimizer)
 
     #
     #   I. Variables
@@ -92,7 +110,7 @@ function create_base_model(data::Dict{String, Any}, optimizer)
     
     # Generator active dispatch
     nonrenewable_generators = filter(g -> lowercase(data["gen"][g]["gen_type"]) ∉ data["param"]["renewable_types"], keys(data["gen"]))
-    @variable(model, pg[r in 1:R, g in 1:G, t in 1:T])
+    @variable(jump_model, pg[r in 1:R, g in 1:G, t in 1:T])
 
     for g in 1:G
         gen = data["gen"]["$g"]
@@ -116,24 +134,24 @@ function create_base_model(data::Dict{String, Any}, optimizer)
     # Conditional variable declaration based on whether relaxed model is used
     if haskey(data["param"], "relaxed_first_stage") && data["param"]["relaxed_first_stage"] == true
         # Use continuous variables for relaxed model
-        @variable(model, 0 <= gamma[a=1:E] <= K)
+        @variable(jump_model, 0 <= gamma[a=1:E] <= K)
     else
         # Use integer variables for standard model
-        @variable(model, 0 <= gamma[a=1:E] <= K, Int)
+        @variable(jump_model, 0 <= gamma[a=1:E] <= K, Int)
     end
     
-    @variable(model, ue[r=1:R, i=1:N, t=1:T] >= 0)  # under-served energy at bus
-    @variable(model, s_energy[i=1:N] >= 0)  # energy rating of storage
-    @variable(model, soc[r=1:R, i=1:N, t=1:T] >= 0)  # state of charge of storage
-    @variable(model, ch[r=1:R, i=1:N, t=1:T] >= 0)  # charging of storage
-    @variable(model, dis[r=1:R, i=1:N, t=1:T] >= 0)  # discharging of storage
+    @variable(jump_model, ue[r=1:R, i=1:N, t=1:T] >= 0)  # under-served energy at bus
+    @variable(jump_model, s_energy[i=1:N] >= 0)  # energy rating of storage
+    @variable(jump_model, soc[r=1:R, i=1:N, t=1:T] >= 0)  # state of charge of storage
+    @variable(jump_model, ch[r=1:R, i=1:N, t=1:T] >= 0)  # charging of storage
+    @variable(jump_model, dis[r=1:R, i=1:N, t=1:T] >= 0)  # discharging of storage
 
     #
     #   II. Constraints
     #
     
     # Global power balance
-    @constraint(model, 
+    @constraint(jump_model, 
         power_balance[r in 1:R, t in 1:T],
         sum(pg[r,g,t] for g in 1:G)
         - sum(data["bus"]["$i"]["load"]["$r"][t] for i in 1:N)
@@ -143,77 +161,51 @@ function create_base_model(data::Dict{String, Any}, optimizer)
         == 0
     )
 
-    # Check if previous investments exist (for minimum constraints)
-    if haskey(data["param"], "previous_investment_dir")
-        prev_dir = data["param"]["previous_investment_dir"]
-        gamma_min, s_energy_min = load_investments_from_dir(
-            prev_dir, 
-            data, 
-            E=model.E, 
-            N=model.N, 
-            allow_missing=false  # Use zeros for missing files
-        )
-        set_previous_investments!(model, gamma_min, s_energy_min)
-    end
-
-    # Check if current investments to test (for fixing constraints)
-    if haskey(data["param"], "current_investment_dir")
-        cur_dir = data["param"]["current_investment_dir"]
-        gamma_val, s_energy_val = load_investments_from_dir(
-            cur_dir, 
-            data, 
-            E=model.E, 
-            N=model.N, 
-            allow_missing=true  # Use nothing for missing files
-        )
-        fix_investments!(model, gamma_val, s_energy_val)
-    end
-
     # If rate a is zero (unlimited), then don't allow upgrades
-    @constraint(model, 
+    @constraint(jump_model, 
         rate_a_zero_line_upgrade[a in rate_a_zero],
         gamma[a] == 0
     )
 
     # SOC over time constraint
-    @constraint(model, 
+    @constraint(jump_model, 
         soc_over_time[r in 1:R, i in 1:N, t in 2:T],
         soc[r,i,t] == soc[r,i,t-1] + ch[r,i,t] * data["param"]["bess_efficiency"] - 
                       dis[r,i,t] / data["param"]["bess_efficiency"]
     )
 
     # SOC init and end constraint
-    @constraint(model,
+    @constraint(jump_model,
         soc_start[r in 1:R, i in 1:N],
-        soc[r,i,1] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy[i] + 
+        soc[r,i,1] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy[i] * data["param"]["storage_energy_size"] + 
                       ch[r,i,1] * data["param"]["bess_efficiency"] - 
                       dis[r,i,1] / data["param"]["bess_efficiency"]
     )
-    @constraint(model,
+    @constraint(jump_model,
         soc_end[r in 1:R, i in 1:N],
-        soc[r,i,T] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy[i]
+        soc[r,i,T] == get(data["param"], "soc_init_end_ratio", 0.5) * s_energy[i] * data["param"]["storage_energy_size"]
     )
 
     # SOC energy rating constraint
-    @constraint(model, 
+    @constraint(jump_model, 
         soc_energy_ub[r in 1:R, i in 1:N, t in 1:T],
-        soc[r,i,t] <= s_energy[i]
+        soc[r,i,t] <= s_energy[i] * data["param"]["storage_energy_size"]
     )
 
     # Energy rating only if storage installed
-    @constraint(model, 
+    @constraint(jump_model, 
         installed_energy_ub[i in 1:N],
-        s_energy[i] <= data["param"]["max_energy_rating"]
+        s_energy[i] * data["param"]["storage_energy_size"] <= data["param"]["max_energy_rating"]
     )
 
     # Charge/discharge must be constrained by power rating
-    @constraint(model,
+    @constraint(jump_model,
         charge_discharge_lb[r in 1:R, i in 1:N, t in 1:T],
-        dis[r,i,t] <= s_energy[i] / 4
+        dis[r,i,t] <= s_energy[i] * data["param"]["storage_energy_size"] / 4
     )
-    @constraint(model,
+    @constraint(jump_model,
         charge_discharge_ub[r in 1:R, i in 1:N, t in 1:T],
-        ch[r,i,t] <= s_energy[i] / 4
+        ch[r,i,t] <= s_energy[i] * data["param"]["storage_energy_size"] / 4
     )
 
     # OPTIONAL: precompute maximum nodal injections
@@ -229,9 +221,9 @@ function create_base_model(data::Dict{String, Any}, optimizer)
             nodal_caps[i] = max_outflow + max_charge                
         end
 
-        @constraint(model,
+        @constraint(jump_model,
             nodal_injection_cap[r in 1:R, i in 1:N, t in 1:T],
-            sum(model[:pg][r, g, t] for g in 1:G if gen_bus_map[g] == i) <=
+            sum(jump_model[:pg][r, g, t] for g in 1:G if gen_bus_map[g] == i) <=
             data["bus"]["$i"]["load"]["$r"][t] + nodal_caps[i]
         )
     end
@@ -243,7 +235,7 @@ function create_base_model(data::Dict{String, Any}, optimizer)
     operational_weight = get(data["param"], "operational_weight", 1)
 
     objective_expr = (
-        sum(s_energy[i] * data["param"]["bess_energy_cost"] for i in 1:N) +
+        sum(s_energy[i] * data["param"]["storage_energy_size"] * data["param"]["bess_energy_cost"] for i in 1:N) +
         sum(data["param"]["cap_upgrade_cost"] * get_capacity_increment(data, a) * 
             data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
         sum(
@@ -257,7 +249,7 @@ function create_base_model(data::Dict{String, Any}, optimizer)
     )
 
     if haskey(data["param"], "only_feasibility") && data["param"]["only_feasibility"]
-        @objective(model, Min, objective_expr)
+        @objective(jump_model, Min, objective_expr)
     else
         objective_expr += sum(
             data["param"]["representative_prob"][r] *
@@ -269,10 +261,10 @@ function create_base_model(data::Dict{String, Any}, optimizer)
                 for t in 1:T)
             )
         for r in 1:R) * operational_weight
-        @objective(model, Min, objective_expr)
+        @objective(jump_model, Min, objective_expr)
     end
     
-    return model
+    return jump_model
 end
 
 # Warm-start from saved constraints

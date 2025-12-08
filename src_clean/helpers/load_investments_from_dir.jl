@@ -61,14 +61,7 @@ function load_investments_from_dir(
     if isfile(storage_file)
         try
             storage_df = CSV.read(storage_file, DataFrame)
-            s_energy_raw = storage_df[:, :Storage_Energy]
-            
-            # Apply scaling if needed
-            if get(data["param"], "storage_needs_scaling", false)
-                s_energy = s_energy_raw .* data["param"]["storage_energy_size"]
-            else
-                s_energy = s_energy_raw
-            end
+            s_energy = storage_df[:, :Storage_Energy]
             
             # Validate length
             if length(s_energy) != N

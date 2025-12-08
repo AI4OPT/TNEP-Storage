@@ -4,7 +4,7 @@ function benders_ptdf_write_to_csv(output_dir, y_val, master_obj, theta_val, phi
     filename = joinpath(output_dir, "output", "benders_progress.csv")
 
     # Decompose y_val
-    gamma_val, s_energy_int_val = y_val
+    gamma_val, s_energy_val = y_val
 
     # Prepare the base data row
     data_dict = OrderedDict(
@@ -15,8 +15,8 @@ function benders_ptdf_write_to_csv(output_dir, y_val, master_obj, theta_val, phi
         "total_ue" => total_ue,
         "total_line_upgrades" => count(x -> x >=0.015, gamma_val),
         "sum_line_upgrades" => sum(gamma_val),
-        "total_storage_energy" => sum(s_energy_int_val),
-        "total_storage_count" => count(x -> x >=0.015, s_energy_int_val)
+        "total_storage_energy" => sum(s_energy_val),
+        "total_storage_count" => count(x -> x >=0.015, s_energy_val)
     )
 
     # Create DataFrame from dictionary

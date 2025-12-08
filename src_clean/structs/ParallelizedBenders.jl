@@ -221,8 +221,8 @@ function solve_subproblems_parallel!(benders::ParallelizedBenders, y_val::Tuple)
     """
     Dispatch investment decisions to all workers and collect results in parallel.
     """
-    gamma_val, s_energy_int_val = y_val
-    y_vec = [gamma_val, s_energy_int_val]
+    gamma_val, s_energy_val = y_val
+    y_vec = [gamma_val, s_energy_val]
     
     # Send work to all workers (concurrent dispatch)
     for worker in benders.workers
@@ -241,7 +241,7 @@ end
 
 # Add all Benders cuts from parallel results
 function add_all_cuts!(benders::ParallelizedBenders, 
-                      theta_val::Vector{Float64},
+                      theta_val::DenseAxisArray{Float64, 1},
                       all_results::Vector,
                       y_val::Tuple)
     """
@@ -384,15 +384,15 @@ function solve!(benders::ParallelizedBenders)
             println("[DEBUG] Master solve time: $(round(master_time, digits=2))s")
             
             # Get master solution
-            gamma_val, s_energy_int_val = get_investments(master)
+            gamma_val, s_energy_val = get_investments(master)
             theta_val = get_theta_values(master)
             master_obj = get_objective_value(master)
-            y_val = (gamma_val, s_energy_int_val)
+            y_val = (gamma_val, s_energy_val)
             
             println("[DEBUG] Master objective: $(round(master_obj, digits=2))")
             
             # Export investments
-            export_investments_csv(master.data, gamma_val, s_energy_int_val,
+            export_investments_csv(master.data, gamma_val, s_energy_val,
                                  output_dir=joinpath(benders.superdir, "benders_output"),
                                  file_suffix="$(master.iter)")
             
@@ -506,10 +506,10 @@ function export_results(benders::ParallelizedBenders)
     """
     Export final investment decisions and statistics.
     """
-    gamma_val, s_energy_int_val = benders.master.y_trust[end]
+    gamma_val, s_energy_val = benders.master.y_trust[end]
     
     # Export investments
-    export_investments_csv(benders.master.data, gamma_val, s_energy_int_val,
+    export_investments_csv(benders.master.data, gamma_val, s_energy_val,
                           output_dir=joinpath(benders.superdir, "output"))
     
     # Export convergence statistics
