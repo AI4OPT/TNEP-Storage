@@ -54,8 +54,10 @@ function compute_superset_core_point(superdir)
     # has rep day optimal investments
     initial_optima_dir = toml_data["initial_optima_dir"]
 
-    dates = toml_data["dates"]
-
+    og_dates = toml_data["dates"]
+    year = toml_data["decarbonization_year"]
+    dates = [string(year) * a_date[5:end] for a_date in og_dates]
+    
     csv_trans_files = [joinpath(initial_optima_dir, a_date, "output", "line_investments.csv") for a_date in dates]
     csv_stor_files = [joinpath(initial_optima_dir, a_date, "output", "storage_investments.csv") for a_date in dates]
 

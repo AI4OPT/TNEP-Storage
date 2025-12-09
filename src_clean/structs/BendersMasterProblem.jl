@@ -195,17 +195,20 @@ function add_prev_upgrades_internal!(superdir, model::JuMP.Model, data, prev_dir
     storage_file = joinpath(prev_dir, "storage_investments.csv")
     trans_df = CSV.read(trans_file, DataFrame)
     storage_df = CSV.read(storage_file, DataFrame)
+
+    gamma_min = trans_df[:, :Upgrade_Lvl]
+    s_energy_min = storage_df[:, :Storage_Energy]
     
-    nonzero_trans_indices = findall(x -> x > 0, trans_df[:, :Upgrade_Lvl])
-    nonzero_storage_indices = findall(x -> x > 0, storage_df[:, :Storage_Energy])
+    nonzero_trans_indices = findall(x -> x > 0, gamma_min)
+    nonzero_storage_indices = findall(x -> x > 0, s_energy_min)
     
     @constraint(model,
         old_gamma[a in nonzero_trans_indices],
-        gamma[a] >= trans_df[a, :Upgrade_Lvl]
+        gamma[a] >= gamma_min[a]
     )
     @constraint(model,
         old_s_energy[i in nonzero_storage_indices],
-        s_energy[i] >= storage_df[i, :Storage_Energy]
+        s_energy[i] >= s_energy_min[i]
     )
 
     # Export previous upgrades if requested
