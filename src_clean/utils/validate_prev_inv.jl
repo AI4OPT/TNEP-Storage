@@ -50,7 +50,7 @@ function compare_storage_investment_growth(
     return all(df2.Storage_Energy .>= df1.Storage_Energy .- tolerance)
 end
 
-function validate_prev(simdir)
+function validate_prev_inv(simdir)
     line_file_2 = joinpath(simdir, "output", "line_investments.csv")
     storage_file_2 = joinpath(simdir, "output", "storage_investments.csv")
 
