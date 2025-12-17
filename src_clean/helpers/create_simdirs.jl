@@ -7,7 +7,8 @@ function create_simdirs(superdir::String, toml_data::Dict; only_feasibility=noth
     for rep in toml_data["dates"]
         simdir = joinpath(superdir, string(year) * rep[5:end])
         
-        # Create directory if needed
+        # Create directory if needed and check if it was created
+        dir_existed = isdir(simdir)
         mkpath(simdir)
         
         # Create modified config
@@ -15,7 +16,7 @@ function create_simdirs(superdir::String, toml_data::Dict; only_feasibility=noth
         config["dates"] = [rep]
         config["representative_prob"] = [1.0]
         config["num_representatives"] = 1
-
+        
         if !isnothing(only_feasibility)
             config["only_feasibility"] = only_feasibility
         end
@@ -26,7 +27,11 @@ function create_simdirs(superdir::String, toml_data::Dict; only_feasibility=noth
         end
         
         push!(simdirs, simdir)
-        println("Created simulation directory: $simdir")
+        
+        # Only print if directory was actually created
+        if !dir_existed
+            println("Created simulation directory: $simdir")
+        end
     end
     
     return simdirs

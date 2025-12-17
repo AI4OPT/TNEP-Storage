@@ -2,11 +2,11 @@ function write_summary_to_csv(simdir, model, data)
 
     # Get number of line investments
     df_line_investments = CSV.read(joinpath(simdir, "output", "line_investments.csv"), DataFrame)
-    num_line_investments = count(!=(0), df_line_investments[!, :Upgrade_Lvl])
+    num_line_investments = count(x -> abs(x) > 1e-5, df_line_investments[!, :Upgrade_Lvl])
 
     # Get number of storage investments
     df_storage_investments = CSV.read(joinpath(simdir, "output", "storage_investments.csv"), DataFrame)
-    num_storage_investments = count(!=(0), df_storage_investments[!, :Storage_Energy])
+    num_storage_investments = count(x -> abs(x) > 1e-5, df_storage_investments[!, :Storage_Energy])
 
     # Total storage capacity
     total_storage_capacity = sum(df_storage_investments[!, :Storage_Energy])

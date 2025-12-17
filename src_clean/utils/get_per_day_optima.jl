@@ -4,17 +4,69 @@ using DataFrames
 
 include("../structs/ExpansionPlanner.jl")
 
-function get_per_day_optima(superdir::String; submit_jobs::Bool=true)
+function get_per_day_optima(superdir::String; submit_jobs::Bool=true, force::Bool=false)
     # Load and validate config
     config_file = joinpath(superdir, "config.toml")
     !isfile(config_file) && error("Config file not found: $config_file")
     toml_data = TOML.parsefile(config_file)
 
     simdirs = create_simdirs(superdir, toml_data)
+    n_submitted_jobs = 0
 
     for simdir in simdirs
-        create_per_day_sbatch_file(simdir, submit_jobs=submit_jobs)
+        if !isfile(joinpath(simdir, "output", "summary_data.csv")) || force
+            create_per_day_sbatch_file(simdir, submit_jobs=submit_jobs)
+            n_submitted_jobs += 1
+        end
     end
+
+    if n_submitted_jobs == 0
+        compute_avg_summary(superdir, toml_data)
+    end
+    
+end
+
+function compute_avg_summary(superdir, toml_data)
+    mkpath(joinpath(superdir, "output"))
+    year = toml_data["decarbonization_year"]
+    probs = toml_data["representative_prob"]
+    weighted_sums = Dict{String, Float64}()
+    
+    for (i, rep) in enumerate(toml_data["dates"])
+        simdir = joinpath(superdir, string(year) * rep[5:end])
+        filepath = joinpath(simdir, "output", "summary_data.csv")
+        df = CSV.read(filepath, DataFrame)
+        
+        # Get the weight for this representative day
+        weight = probs[i]
+        
+        # Accumulate weighted values
+        for row in eachrow(df)
+            var_name = row.Variable
+            value = row.Value
+            
+            # Skip NaN values
+            if !isnan(value)
+                if haskey(weighted_sums, var_name)
+                    weighted_sums[var_name] += value * weight
+                else
+                    weighted_sums[var_name] = value * weight
+                end
+            end
+        end
+    end
+    
+    avg_df = DataFrame(
+        Variable = collect(keys(weighted_sums)),
+        Value = collect(values(weighted_sums))
+    )
+    sort!(avg_df, :Variable)
+    
+    CSV.write(joinpath(superdir, "output", "summary.csv"), avg_df)
+    
+    # Print sum of all cost variables
+    total_costs = sum(row.Value for row in eachrow(avg_df) if endswith(row.Variable, "costs"))
+    println("Total costs: $total_costs")
 end
 
 function create_per_day_sbatch_file(simdir::String; submit_jobs::Bool=true)
