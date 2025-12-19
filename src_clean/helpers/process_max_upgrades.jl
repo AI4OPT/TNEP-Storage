@@ -44,44 +44,85 @@ function process_csv_max_storage(csv_files::Vector{String}, output_file::String)
     return result_df
 end
 
-# This function will get the initial core point for the benders (an over-invested first stage)
-function compute_superset_core_point(superdir)
+function compute_superset_core_point(superdir; is_multistage::Bool=false)
     # Read the full config file
     config_file = joinpath(superdir, "config.toml")
     toml_data = TOML.parsefile(config_file)
-
-    # Get the initial core points (solved without benders)
-    # has rep day optimal investments
-    initial_optima_dir = toml_data["initial_optima_dir"]
-
-    og_dates = toml_data["dates"]
-    year = toml_data["decarbonization_year"]
-    dates = [string(year) * a_date[5:end] for a_date in og_dates]
     
-    csv_trans_files = [joinpath(initial_optima_dir, a_date, "output", "line_investments.csv") for a_date in dates]
-    csv_stor_files = [joinpath(initial_optima_dir, a_date, "output", "storage_investments.csv") for a_date in dates]
-
-    trans_df = process_csv_max_upgrade(csv_trans_files, joinpath(superdir, "line_investments.csv"))
-    stor_df = process_csv_max_storage(csv_stor_files, joinpath(superdir, "storage_investments.csv"))
-
-    gamma_val = trans_df[:, :Upgrade_Lvl]
-    s_energy_val = stor_df[:, :Storage_Energy]
-    gamma_val = safe_ceil.(gamma_val)
-    s_energy_val = safe_ceil.(s_energy_val)
-
-    if haskey(toml_data, "inv_dir")
-        inv_dir = toml_data["inv_dir"]
-        trans_file = joinpath(inv_dir, "line_investments.csv")
-        stor_file = joinpath(inv_dir, "storage_investments.csv")
-
-        trans_df = CSV.read(trans_file, DataFrame)
-        stor_df = CSV.read(stor_file, DataFrame)
-
+    if is_multistage
+        # Multistage: return Dict{Int => Tuple{Vector, Vector}}
+        years = get(toml_data, "years", [toml_data["decarbonization_year"]])
+        initial_optima_dirs = toml_data["initial_optima_dir"]  # Array of directories
+        
+        @assert length(initial_optima_dirs) == length(years) "Number of initial_optima_dirs must match number of years"
+        
+        result = Dict{Int, Tuple{Vector{Float64}, Vector{Float64}}}()
+        
+        for (year, initial_optima_dir) in zip(years, initial_optima_dirs)
+            og_dates = toml_data["dates"]
+            dates = [string(year) * a_date[5:end] for a_date in og_dates]
+            
+            csv_trans_files = [joinpath(initial_optima_dir, a_date, "output", "line_investments.csv") for a_date in dates]
+            csv_stor_files = [joinpath(initial_optima_dir, a_date, "output", "storage_investments.csv") for a_date in dates]
+            
+            trans_df = process_csv_max_upgrade(csv_trans_files, joinpath(superdir, "line_investments_$(year).csv"))
+            stor_df = process_csv_max_storage(csv_stor_files, joinpath(superdir, "storage_investments_$(year).csv"))
+            
+            gamma_val = trans_df[:, :Upgrade_Lvl]
+            s_energy_val = stor_df[:, :Storage_Energy]
+            gamma_val = safe_ceil.(gamma_val)
+            s_energy_val = safe_ceil.(s_energy_val)
+            
+            # Check for manual override for this year
+            if haskey(toml_data, "inv_dir")
+                inv_dir = toml_data["inv_dir"]
+                # Try year-specific file first, then fall back to generic
+                trans_file = joinpath(inv_dir, "line_investments_$(year).csv")
+                stor_file = joinpath(inv_dir, "storage_investments_$(year).csv")
+                
+                if isfile(trans_file) && isfile(stor_file)
+                    trans_df = CSV.read(trans_file, DataFrame)
+                    stor_df = CSV.read(stor_file, DataFrame)
+                    gamma_val = trans_df[:, :Upgrade_Lvl]
+                    s_energy_val = stor_df[:, :Storage_Energy]
+                end
+            end
+            
+            result[year] = (gamma_val, s_energy_val)
+        end
+        
+        return result
+        
+    else
+        # Single-stage: return Tuple{Vector, Vector} (existing logic)
+        initial_optima_dir = toml_data["initial_optima_dir"]  # Single directory
+        og_dates = toml_data["dates"]
+        year = toml_data["decarbonization_year"]
+        dates = [string(year) * a_date[5:end] for a_date in og_dates]
+        
+        csv_trans_files = [joinpath(initial_optima_dir, a_date, "output", "line_investments.csv") for a_date in dates]
+        csv_stor_files = [joinpath(initial_optima_dir, a_date, "output", "storage_investments.csv") for a_date in dates]
+        
+        trans_df = process_csv_max_upgrade(csv_trans_files, joinpath(superdir, "line_investments.csv"))
+        stor_df = process_csv_max_storage(csv_stor_files, joinpath(superdir, "storage_investments.csv"))
+        
         gamma_val = trans_df[:, :Upgrade_Lvl]
         s_energy_val = stor_df[:, :Storage_Energy]
+        gamma_val = safe_ceil.(gamma_val)
+        s_energy_val = safe_ceil.(s_energy_val)
+        
+        if haskey(toml_data, "inv_dir")
+            inv_dir = toml_data["inv_dir"]
+            trans_file = joinpath(inv_dir, "line_investments.csv")
+            stor_file = joinpath(inv_dir, "storage_investments.csv")
+            trans_df = CSV.read(trans_file, DataFrame)
+            stor_df = CSV.read(stor_file, DataFrame)
+            gamma_val = trans_df[:, :Upgrade_Lvl]
+            s_energy_val = stor_df[:, :Storage_Energy]
+        end
+        
+        return (gamma_val, s_energy_val)
     end
-
-    return gamma_val, s_energy_val
 end
 
 function safe_ceil(x, tolerance=1e-8)
