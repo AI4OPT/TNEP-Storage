@@ -52,16 +52,21 @@ mutable struct ParallelizedBenders
         toml_data = TOML.parsefile(config_file)
         dates = toml_data["dates"]
         rep_prob = toml_data["representative_prob"]
-        years = get(master_data["param"], "years", [master_data["param"]["decarbonization_year"]])
+        years = get(toml_data, "years", [toml_data["decarbonization_year"]])
 
-        is_multistage = (length(years) > 1)
+        # TODO deprecate this?
+        is_multistage = true
 
         # Create date_weights mapping
         date_weights = Dict{String, Float64}()
         for i in 1:length(dates)
             date_weights[dates[i][6:end]] = rep_prob[i]
         end
-        
+
+        # If old benders_output and output exists, delete files first
+        clear_directory(joinpath(superdir, "benders_output"))
+        clear_directory(joinpath(superdir, "output"))
+
         # Set up directories and data
         simdirs = create_simdirs(superdir, toml_data)
         master_data = set_up_data(superdir)
@@ -85,7 +90,7 @@ mutable struct ParallelizedBenders
             workers, 
             superdir, 
             date_weights,
-            multistage,  # is_multistage
+            is_multistage,  # is_multistage
             years,       # years
             max_iterations, 
             tolerance, 
@@ -237,21 +242,16 @@ function solve_subproblems_parallel!(benders::ParallelizedBenders, y_val)
                   Send year-specific investments to each worker based on worker.year
     """
     if benders.is_multistage
-        # TODO: Implement multistage dispatch
-        # For each worker, send investments[worker.year]
-        error("Multistage dispatch not yet implemented")
-        
-        # Pseudocode:
-        # for worker in benders.workers
-        #     year_investments = y_val[worker.year]  # Get investments for this worker's year
-        #     y_vec = [year_investments[1], year_investments[2]]
-        #     put!(worker.work_channel, copy(y_vec))
-        # end
+        # Multi-stage: send year-specific investments to all workers
+        for worker in benders.workers
+            date = worker.date
+            year = parse(Int, date[begin:4])
+            y_vec = collect(y_val[year])
+            put!(worker.work_channel, copy(y_vec))
+        end
     else
         # Single-stage: send same investments to all workers
-        gamma_val, s_energy_val = y_val
-        y_vec = [gamma_val, s_energy_val]
-        
+        y_vec = collect(y_val)
         # Send work to all workers (concurrent dispatch)
         for worker in benders.workers
             put!(worker.work_channel, copy(y_vec))
@@ -270,20 +270,12 @@ end
 
 # Add all Benders cuts from parallel results
 function add_all_cuts!(benders::ParallelizedBenders, 
-                      theta_val,  # TODO: Type changes based on is_multistage
+                      theta_val,
                       all_results::Vector,
-                      y_val)  # TODO: Type changes based on is_multistage
+                      y_val)  # Type changes based on is_multistage
     """
     Add all Benders cuts from parallel subproblem solves.
     Returns aggregate statistics for convergence checking.
-    
-    TODO: REFACTOR - Handle multistage cuts
-    
-    Single-stage: theta_val is DenseAxisArray{Float64, 1} indexed by date
-                  add_benders_cut!(master, date, duals, y_val, phi_val)
-    
-    Multistage:   theta_val is DenseAxisArray{Float64, 2} indexed by (date, year)
-                  add_benders_cut!(master, date, year, duals, y_val, phi_val)
     """
     master = benders.master
     master_obj = get_objective_value(master)
@@ -292,27 +284,20 @@ function add_all_cuts!(benders::ParallelizedBenders,
     total_phi_val = 0.0
     total_ue = 0.0
     
-    # TODO: REFACTOR - For multistage, need to track per-year statistics
-    # May want: Dict{year => (theta, phi, ue)} for detailed tracking
-    
     for result in all_results
         ue = result[:total_ue]
         phi_val = result[:phi_val]
         duals = result[:duals]
         is_feasibility_cut = result[:is_feasibility_cut]
         date = result[:date]
-        year = result[:year]  # TODO: NEW FIELD - use year for multistage cuts
+        year = parse(Int, date[begin:4])
         
         if benders.is_multistage
-            # TODO: Implement multistage cut addition
-            # Need to get y_val for specific year
-            # year_y_val = y_val[year]
-            # if is_feasibility_cut
-            #     add_feasibility_cut!(master, year, duals, year_y_val, ue)
-            # else
-            #     add_benders_cut!(master, date, year, duals, year_y_val, phi_val)
-            # end
-            error("Multistage cut addition not yet implemented")
+            if is_feasibility_cut
+                add_feasibility_cut!(master, year, duals, y_val[year], ue)
+            else
+                add_benders_cut!(master, date, year, duals, y_val[year], phi_val)
+            end
         else
             # Single-stage cut addition
             if is_feasibility_cut
@@ -324,16 +309,11 @@ function add_all_cuts!(benders::ParallelizedBenders,
             end
         end
         
-        # TODO: REFACTOR - Output directory structure for multistage
-        # May want: superdir/year/date/ structure
         # Create rep-day specific log
         output_dir = joinpath(benders.superdir, date)
         if benders.is_multistage
-            # TODO: Implement multistage output structure
-            # output_dir = joinpath(benders.superdir, string(year), date)
-            # year_y_val = y_val[year]
-            # year_theta_val = theta_val[date, year]
-            error("Multistage output not yet implemented")
+            benders_ptdf_write_to_csv(output_dir, y_val[year], master_obj, 
+                                     theta_val[date], phi_val, ue)
         else
             benders_ptdf_write_to_csv(output_dir, y_val, master_obj, 
                                      theta_val[date], phi_val, ue)
@@ -341,11 +321,10 @@ function add_all_cuts!(benders::ParallelizedBenders,
         
         # Accumulate for aggregate statistics
         weight = benders.date_weights[date[6:end]]
+        disc_factors = master.disc_factors
         
         if benders.is_multistage
-            # TODO: Get theta for this specific (date, year) combination
-            # total_theta_val += theta_val[date, year] * weight
-            error("Multistage theta aggregation not yet implemented")
+            total_theta_val += disc_factors[year] * theta_val[date] * weight
         else
             total_theta_val += theta_val[date] * weight
         end
@@ -353,9 +332,7 @@ function add_all_cuts!(benders::ParallelizedBenders,
         if is_feasibility_cut
             penalty = master.data["param"]["under_served_penalty"]
             if benders.is_multistage
-                # TODO: Get theta for specific (date, year)
-                # total_phi_val += (theta_val[date, year] + penalty * ue) * weight
-                error("Multistage penalty aggregation not yet implemented")
+                total_phi_val += disc_factors[year] * (theta_val[date] + penalty * ue) * weight
             else
                 total_phi_val += (theta_val[date] + penalty * ue) * weight
             end
@@ -366,12 +343,13 @@ function add_all_cuts!(benders::ParallelizedBenders,
         total_ue += ue * weight
     end
     
-    # TODO: REFACTOR - Aggregate output for multistage
-    # May want separate aggregate log per year
-    # Write aggregate log
-    benders_ptdf_write_to_csv(benders.superdir, y_val, master_obj, 
+    if benders.is_multistage
+        benders_ptdf_write_to_csv(benders.superdir, y_val[master.years[1]], master_obj, 
                              total_theta_val, total_phi_val, total_ue)
-    
+    else
+        benders_ptdf_write_to_csv(benders.superdir, y_val, master_obj, 
+                             total_theta_val, total_phi_val, total_ue)
+    end
     current_obj = master_obj + total_phi_val - total_theta_val
     
     return current_obj, total_phi_val, total_theta_val, total_ue
@@ -379,7 +357,7 @@ end
 
 # Update trust region based on iteration results
 function update_trust_region!(benders::ParallelizedBenders,
-                             y_val,  # TODO: Type changes based on is_multistage
+                             y_val,  # Type changes based on is_multistage
                              current_obj::Float64,
                              total_theta_val::Float64,
                              total_phi_val::Float64,
@@ -387,10 +365,6 @@ function update_trust_region!(benders::ParallelizedBenders,
     """
     Update trust region constraints based on iteration results.
     Implements serious step vs null step logic.
-    
-    TODO: REFACTOR - Trust region for multistage
-    For multistage, may need per-year trust regions or aggregate trajectory comparison
-    This is complex and may need significant rework
     """
     master = benders.master
     
@@ -399,12 +373,30 @@ function update_trust_region!(benders::ParallelizedBenders,
     end
     
     if benders.is_multistage
-        # TODO: Implement multistage trust region updates
-        # This is complex - may need:
-        # - Per-year trust regions with separate radii
-        # - Trajectory-based comparison
-        # - Year-specific serious/null step decisions
-        @warn "Multistage trust region not yet implemented"
+        if total_ue < 1e-6
+            if current_obj < master.upper_bound # Actual improvement - serious step
+                println("[DEBUG] Serious step: objective improved from $(master.total_obj[end]) to $current_obj")
+                push!(master.y_trust, y_val)
+                master.upper_bound = current_obj
+
+                # Reset l1 radius
+                println("[DEBUG] Resetting l1_radius to 1")
+                master.jump_model.ext[:l1_radius] = 
+                    vcat(get(master.jump_model.ext, :l1_radius, Int[]), [1])
+                
+                # Add level set
+                add_level_set!(master, current_obj)
+            else # no improvement, null step
+                if isapprox(y_val, master.y_trust[end]) # Stuck in local region - expand trust region
+                    current_radius = get(master.jump_model.ext, :l1_radius, [0])[end]
+                    new_radius = current_radius + 1
+                    println("[DEBUG] Null step: expanding l1_radius from $current_radius to $new_radius")
+                    master.jump_model.ext[:l1_radius] = 
+                        vcat(get(master.jump_model.ext, :l1_radius, Int[]), [new_radius])
+                end
+            end
+        end
+
         return
     end
     
@@ -459,12 +451,6 @@ end
 function solve!(benders::ParallelizedBenders)
     """
     Execute the Benders decomposition algorithm.
-    
-    TODO: Main loop should work for both single-stage and multistage
-    Most logic is the same, key differences are:
-    - y_val type (Tuple vs Dict)
-    - theta_val type (1D vs 2D array)
-    - Cut generation (needs year parameter)
     """
     master = benders.master
     
@@ -480,24 +466,25 @@ function solve!(benders::ParallelizedBenders)
             println("[DEBUG] Solving master problem...")
             add_trust_region!(master)
             master_start = time()
-            solve!(master)
+            result = solve!(master)
+            if result !== nothing  # Error case returns model
+                @error "Master infeasible - returning for debugging"
+                return (converged=false, master=master)
+            end
             master_time = time() - master_start
             push!(benders.master_times, master_time)
             println("[DEBUG] Master solve time: $(round(master_time, digits=2))s")
             
-            # TODO: REFACTOR - Get master solution (different types for multistage)
-            # Single-stage: gamma_val, s_energy_val = get_investments(master)
-            #               y_val = (gamma_val, s_energy_val)
-            # Multistage:   y_val = get_investments(master)  # Returns Dict{year => (gamma, s_energy)}
             if benders.is_multistage
-                y_val = get_investments(master)  # Dict{Int => Tuple}
-                # TODO: Export investments for all years
-                @warn "Multistage investment export not yet implemented"
+                y_val = get_investments(master)  # Dict{year => (gamma, s_energy)}
+                for year in master.years
+                    export_investments_csv(master.data, y_val[year][1], y_val[year][2],
+                                     output_dir=joinpath(benders.superdir, "benders_output"),
+                                     file_suffix="$(master.iter)_$(year)")
+                end
             else
                 gamma_val, s_energy_val = get_investments(master)
                 y_val = (gamma_val, s_energy_val)
-                
-                # Export investments
                 export_investments_csv(master.data, gamma_val, s_energy_val,
                                      output_dir=joinpath(benders.superdir, "benders_output"),
                                      file_suffix="$(master.iter)")
@@ -530,14 +517,7 @@ function solve!(benders::ParallelizedBenders)
             update_trust_region!(benders, y_val, current_obj, 
                                total_theta_val, total_phi_val, total_ue)
             
-            # TODO: REFACTOR - Update tracking for multistage
-            # Single-stage: update_tracking!(master, y_val, total_ue, current_obj)
-            # Multistage:   update_tracking!(master, y_val::Dict, total_ue, current_obj)
-            if benders.is_multistage
-                update_tracking!(master, y_val, total_ue, current_obj)  # Already handles Dict
-            else
-                update_tracking!(master, y_val, total_ue, current_obj)
-            end
+            update_tracking!(master, y_val, total_ue, current_obj)
             
             # Record iteration time
             iter_time = time() - iter_start
@@ -575,16 +555,8 @@ function solve!(benders::ParallelizedBenders)
         # Clean shutdown of workers
         shutdown!(benders)
     end
-    
-    # TODO: REFACTOR - Return final solution (type depends on single/multistage)
-    # Return final solution
-    if benders.is_multistage
-        # TODO: Return multistage solution - may need to extract from master.y_trust differently
-        @warn "Multistage solution return not yet implemented"
-        return nothing
-    else
-        return master.y_trust[end]
-    end
+
+    return master.y_trust[end]
 end
 
 function calculate_gap(benders::ParallelizedBenders, master_obj, total_phi_val, total_theta_val)
@@ -630,28 +602,22 @@ end
 function export_results(benders::ParallelizedBenders)
     """
     Export final investment decisions and statistics.
-    
-    TODO: REFACTOR - Export multistage results
-    Need to export investments for all years, possibly in separate files or structured format
     """
     if benders.is_multistage
-        # TODO: Implement multistage export
-        # May want:
-        # - output/investments_2030.csv
-        # - output/investments_2035.csv
-        # - output/investments_2040.csv
-        # OR
-        # - output/investments_trajectory.csv with year column
-        @warn "Multistage results export not yet fully implemented"
-        return
+        y_val = benders.master.y_trust[end]
+        for year in benders.master.years
+            ans = y_val[year]
+            export_investments_csv(benders.master.data, ans[1], ans[2],
+                          output_dir=joinpath(benders.superdir, "output"), file_suffix="$(year)")
+        end
+    else
+        # Single-stage export
+        gamma_val, s_energy_val = benders.master.y_trust[end]
+        
+        # Export investments
+        export_investments_csv(benders.master.data, gamma_val, s_energy_val,
+                            output_dir=joinpath(benders.superdir, "output"))
     end
-    
-    # Single-stage export
-    gamma_val, s_energy_val = benders.master.y_trust[end]
-    
-    # Export investments
-    export_investments_csv(benders.master.data, gamma_val, s_energy_val,
-                          output_dir=joinpath(benders.superdir, "output"))
     
     # Export convergence statistics
     stats_df = DataFrame(
@@ -673,13 +639,8 @@ function parallelized_ptdf_benders(superdir::String;
                                   tolerance::Float64=0.005,
                                   lower_bound::Float64=0.0)
     """
-    Main entry point for parallelized Benders decomposition.
-    
-    TODO: Add multistage parameter and pass through to constructor
+    Main entry point for parallelized Benders decomposition.    
     """
-    # TODO: make a wrapper function in main.jl
-    # println("[DEBUG] Computing global lower bound...")
-    # lb_value = compute_benders_lb(superdir, force_lb=force_lb)
 
     # Create Benders decomposition
     benders = ParallelizedBenders(superdir; 
@@ -688,7 +649,13 @@ function parallelized_ptdf_benders(superdir::String;
                                  lower_bound=lower_bound)
     
     # Solve
-    solve!(benders)
+    result = solve!(benders)
+
+    # Check if we returned early due to infeasibility
+    if result isa NamedTuple && haskey(result, :converged) && !result.converged
+        @warn "Returning early due to master infeasibility"
+        return result  # Returns (converged=false, master=master)
+    end
         
     return benders
 end

@@ -43,7 +43,7 @@ mutable struct MultistageBendersMasterProblem
     years::Vector{Int}  # list of years
 
     # Discount factors by year e.g. disc_factors[2035] = 0.78
-    disc_factors::Dict{Int, Float64}()
+    disc_factors::Dict{Int, Float64}
     
     # Inner constructor
     function MultistageBendersMasterProblem(superdir::String, data::Dict{String, Any}, 
@@ -107,22 +107,16 @@ mutable struct MultistageBendersMasterProblem
         #
 
         # Monotonicity constraints: investments can only increase over time
-        if Y > 1
+        if length(years) > 1
             years = sort(years)
-            for year_idx in 2:length(years)
-                y_curr = years[year_idx]
-                y_prev = years[year_idx - 1]
-                
-                @constraint(jump_model,
-                    monotone_gamma[a=1:E],
-                    gamma[a, y_curr] >= gamma[a, y_prev]
-                )
-                
-                @constraint(jump_model,
-                    monotone_storage[i=1:N],
-                    s_energy[i, y_curr] >= s_energy[i, y_prev]
-                )
-            end
+            @constraint(jump_model,
+                monotone_gamma[a=1:E, year_idx=2:length(years)],
+                gamma[a, years[year_idx]] >= gamma[a, years[year_idx - 1]]
+            )
+            @constraint(jump_model,
+                monotone_storage[i=1:N, year_idx=2:length(years)],
+                s_energy[i, years[year_idx]] >= s_energy[i, years[year_idx - 1]]
+            )
         end
         
         if warmstart
@@ -154,12 +148,12 @@ mutable struct MultistageBendersMasterProblem
         warmstart_dir = joinpath(superdir, "warmstart")
         mkpath(warmstart_dir)
         for year in years
-            export_investments_csv(data, over_invested_points[year][1], over_invested_point[year][2], output_dir=joinpath(warmstart_dir, string(year)))
+            export_investments_csv(data, over_invested_point[year][1], over_invested_point[year][2], output_dir=warmstart_dir, file_suffix="$(year)")
         end
 
         # Storage candidates 
         if get(data["param"], "storage_cand", false)
-            storage_upgrades = over_invested_points[years[end]][2]
+            storage_upgrades = over_invested_point[years[end]][2]
             storage_non_indices = findall(x -> x == 0, storage_upgrades)
             
             @constraint(jump_model, 
@@ -170,7 +164,7 @@ mutable struct MultistageBendersMasterProblem
         
         # Line candidates
         if get(data["param"], "line_cand", false)
-            line_upgrades = over_invested_points[years[end]][1]
+            line_upgrades = over_invested_point[years[end]][1]
             line_non_indices = findall(x -> x == 0, line_upgrades)
             
             @constraint(jump_model, 
@@ -201,7 +195,7 @@ mutable struct MultistageBendersMasterProblem
 
         # Subsequent stages: sum over y=2..Y of d^(y-1) * c^T (x_y - x_{y-1})
         incremental_costs = AffExpr(0.0)
-        if Y > 1
+        if length(years) > 1
             for year_idx in 2:length(years)
                 y_curr = years[year_idx]
                 y_prev = years[year_idx - 1]
@@ -222,8 +216,8 @@ mutable struct MultistageBendersMasterProblem
 
         # Operational costs: sum over years of dates of (theta_{1,s} + d*theta_{2,s} + d^2*...)
         operational_costs = sum(
-            disc_factors[y] * theta[date, y] * date_weights[date[6:end]] 
-            for y in years, date in dates
+            disc_factors[parse(Int, date[1:4])] * theta[date] * date_weights[date[6:end]] 
+            for date in dates
         )
 
         obj_expr = (
@@ -264,17 +258,31 @@ function solve!(master::MultistageBendersMasterProblem)
     Optimize the Benders master problem.
     """
     optimize!(master.jump_model)
+    
+    # Check feasibility
+    status = termination_status(master.jump_model)
+    if status != MOI.OPTIMAL && status != MOI.LOCALLY_SOLVED
+        @error "Master problem is infeasible or did not solve optimally!" status iteration=master.iter
+        return master.jump_model  # Return model for debugging
+    end
+    
+    return nothing  # Feasible case
 end
 
 # Helper function to get investments for a specific year
-function get_investments(master::MultistageBendersMasterProblem, year::Int)
+function get_investments(master::MultistageBendersMasterProblem)
     """
     Get investment decision values for a specific year.
-    Returns (gamma_val, s_energy_val)
+    Returns {year => [gamma_val, s_energy_val]}
     """
-    gamma_val = [value(master.gamma[a, year]) for a in 1:master.E]
-    s_energy_val = [value(master.s_energy[i, year]) for i in 1:master.N]
-    return (gamma_val, s_energy_val)
+    y_val = Dict{Int, Vector{Vector{Float64}}}()
+    for year in master.years
+        gamma_val = [value(master.gamma[a, year]) for a in 1:master.E]
+        s_energy_val = [value(master.s_energy[i, year]) for i in 1:master.N]
+        y_val[year] = [gamma_val, s_energy_val]
+    end
+
+    return y_val
 end
 
 # Get objective value
@@ -289,7 +297,7 @@ end
 
 # Add Benders cut
 function add_benders_cut!(master::MultistageBendersMasterProblem, date::String, year::Int,
-                         duals::Tuple, y_val::Tuple, phi_val::Float64)
+                         duals::Tuple, y_val, phi_val::Float64)
     """
     Add a Benders optimality cut for a specific representative period and year.
     """
@@ -305,7 +313,7 @@ end
 
 # Add feasibility cut
 function add_feasibility_cut!(master::MultistageBendersMasterProblem, year::Int,
-                             duals::Tuple, y_val::Tuple, ue_val::Float64)
+                             duals::Tuple, y_val, ue_val::Float64)
     """
     Add a Benders feasibility cut for a specific year.
     
@@ -348,69 +356,96 @@ function add_trust_region!(master::MultistageBendersMasterProblem)
         push!(master.y_trust, y_core)
         master.jump_model.ext[:l1_radius] = [1]
         
-        # Add constraints for each year
+        # Add constraints for all years
         y_trust = master.y_trust[end]
         abs_diff = master.jump_model[:abs_diff]
         trans_abs_diff = master.jump_model[:trans_abs_diff]
         
-        for year in years
-            gamma_trust, s_energy_trust = y_trust[year]
-            
-            @constraint(master.jump_model,
-                trans_abs_diff_ub[a in 1:master.E, y=year],
-                trans_abs_diff[a, y] >= master.gamma[a, y] - gamma_trust[a])
-            @constraint(master.jump_model,
-                trans_abs_diff_lb[a in 1:master.E, y=year],
-                trans_abs_diff[a, y] >= gamma_trust[a] - master.gamma[a, y])
-            
-            @constraint(master.jump_model,
-                abs_diff_ub[i in 1:master.N, y=year],
-                abs_diff[i, y] >= master.s_energy[i, y] - s_energy_trust[i])
-            @constraint(master.jump_model,
-                abs_diff_lb[i in 1:master.N, y=year],
-                abs_diff[i, y] >= s_energy_trust[i] - master.s_energy[i, y])
-            
-            # Initialize with zero radius for first iteration
-            @constraint(master.jump_model,
-                trans_abs_diff_total[y=year],
-                sum(trans_abs_diff[a, y] for a in 1:master.E) == 0)
-            @constraint(master.jump_model,
-                abs_diff_total[y=year],
-                sum(abs_diff[i, y] for i in 1:master.N) == 0)
-        end
+        @constraint(master.jump_model,
+            trans_abs_diff_ub[a in 1:master.E, year in years],
+            trans_abs_diff[a, year] >= master.gamma[a, year] - y_trust[year][1][a])
+        @constraint(master.jump_model,
+            trans_abs_diff_lb[a in 1:master.E, year in years],
+            trans_abs_diff[a, year] >= y_trust[year][1][a] - master.gamma[a, year])
+        @constraint(master.jump_model,
+            abs_diff_ub[i in 1:master.N, year in years],
+            abs_diff[i, year] >= master.s_energy[i, year] - y_trust[year][2][i])
+        @constraint(master.jump_model,
+            abs_diff_lb[i in 1:master.N, year in years],
+            abs_diff[i, year] >= y_trust[year][2][i] - master.s_energy[i, year])
+        @constraint(master.jump_model,
+            trans_abs_diff_total[year in years],
+            sum(trans_abs_diff[a, year] for a in 1:master.E) == 0)
+        @constraint(master.jump_model,
+            abs_diff_total[year in years],
+            sum(abs_diff[i, year] for i in 1:master.N) == 0)
+        
         return
     else
         remove_trust_region!(master)
     end
     
-    # Add constraints for each year with proper radius
+    # Add constraints for subsequent iterations
     y_trust = master.y_trust[end]
     abs_diff = master.jump_model[:abs_diff]
     trans_abs_diff = master.jump_model[:trans_abs_diff]
     
-    for year in years
-        gamma_trust, s_energy_trust = y_trust[year]
-        
-        @constraint(master.jump_model,
-            trans_abs_diff_ub[a in 1:master.E, y=year],
-            trans_abs_diff[a, y] >= master.gamma[a, y] - gamma_trust[a])
-        @constraint(master.jump_model,
-            trans_abs_diff_lb[a in 1:master.E, y=year],
-            trans_abs_diff[a, y] >= gamma_trust[a] - master.gamma[a, y])
-        
-        @constraint(master.jump_model,
-            abs_diff_ub[i in 1:master.N, y=year],
-            abs_diff[i, y] >= master.s_energy[i, y] - s_energy_trust[i])
-        @constraint(master.jump_model,
-            abs_diff_lb[i in 1:master.N, y=year],
-            abs_diff[i, y] >= s_energy_trust[i] - master.s_energy[i, y])
-        
-        @constraint(master.jump_model,
-            trans_abs_diff_total[y=year],
-            sum(trans_abs_diff[a, y] for a in 1:master.E) <= master.jump_model.ext[:l1_radius][end])
-        @constraint(master.jump_model,
-            abs_diff_total[y=year],
-            sum(abs_diff[i, y] for i in 1:master.N) <= master.jump_model.ext[:l1_radius][end])
+    @constraint(master.jump_model,
+        trans_abs_diff_ub[a in 1:master.E, year in years],
+        trans_abs_diff[a, year] >= master.gamma[a, year] - y_trust[year][1][a])
+    @constraint(master.jump_model,
+        trans_abs_diff_lb[a in 1:master.E, year in years],
+        trans_abs_diff[a, year] >= y_trust[year][1][a] - master.gamma[a, year])
+    @constraint(master.jump_model,
+        abs_diff_ub[i in 1:master.N, year in years],
+        abs_diff[i, year] >= master.s_energy[i, year] - y_trust[year][2][i])
+    @constraint(master.jump_model,
+        abs_diff_lb[i in 1:master.N, year in years],
+        abs_diff[i, year] >= y_trust[year][2][i] - master.s_energy[i, year])
+    @constraint(master.jump_model,
+        trans_abs_diff_total[year in years],
+        sum(trans_abs_diff[a, year] for a in 1:master.E) <= master.jump_model.ext[:l1_radius][end])
+    @constraint(master.jump_model,
+        abs_diff_total[year in years],
+        sum(abs_diff[i, year] for i in 1:master.N) <= 2)
+end
+
+function remove_trust_region!(master::MultistageBendersMasterProblem)
+    """
+    Remove trust region constraints for all years.
+    """
+    if master.stabilization == "trust_region"
+        constraint_names = [
+            :trans_abs_diff_ub, :trans_abs_diff_lb, :abs_diff_ub, :abs_diff_lb, 
+            :abs_diff_total, :trans_abs_diff_total
+        ]
+    else
+        return
+    end
+    
+    obj_dict = object_dictionary(master.jump_model)
+    
+    for name in constraint_names
+        if haskey(obj_dict, name)
+            try
+                constraint_obj = obj_dict[name]
+                # Handle both single constraints and containers
+                if constraint_obj isa JuMP.ConstraintRef
+                    JuMP.delete(master.jump_model, constraint_obj)
+                else
+                    # It's a container - delete all constraints in it
+                    JuMP.delete.(master.jump_model, constraint_obj)
+                end
+                JuMP.unregister(master.jump_model, name)
+                println("Removed constraint: $name")
+            catch e
+                println("Warning: Could not remove $name: $e")
+                try
+                    JuMP.unregister(master.jump_model, name)
+                catch
+                end
+            end
+        end
     end
 end
 

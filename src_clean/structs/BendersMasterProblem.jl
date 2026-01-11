@@ -359,7 +359,7 @@ function add_trust_region!(master::BendersMasterProblem)
         sum(trans_abs_diff[a] for a in 1:master.E) <= master.jump_model.ext[:l1_radius][end])
     @constraint(master.jump_model,
         abs_diff_total,
-        sum(abs_diff[i] for i in 1:master.N) == 2)
+        sum(abs_diff[i] for i in 1:master.N) <= 2)
 end
 
 function remove_trust_region!(master::BendersMasterProblem)

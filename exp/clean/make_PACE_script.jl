@@ -1,13 +1,18 @@
 function write_parallelizedbenders_sbatch_file(simdir; threads=1, hours=24, submit=true)
     pace_dir = "PACE/r1/PowerUp/parallelizedbenders"
     job_name = basename(simdir)
+
+    n_nodes = 1
+    if threads > 24
+        threads = 24
+    end
     
     # Create the SBATCH content
     sbatch_content = """#!/bin/bash
     #SBATCH -J$job_name
     #SBATCH -qinferno
     #SBATCH --account=gts-phentenryck3-coda20
-    #SBATCH -N1 --ntasks-per-node=$threads
+    #SBATCH -N$n_nodes --ntasks-per-node=$threads
     #SBATCH --mem-per-cpu=12G
     #SBATCH -t$hours:00:00
     #SBATCH -o/storage/home/hcoda1/1/kwu381/TNEP-Storage/PACE/logs/$job_name.out

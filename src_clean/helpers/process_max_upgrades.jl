@@ -56,12 +56,11 @@ function compute_superset_core_point(superdir; is_multistage::Bool=false)
         
         @assert length(initial_optima_dirs) == length(years) "Number of initial_optima_dirs must match number of years"
         
-        result = Dict{Int, Tuple{Vector{Float64}, Vector{Float64}}}()
+        result = Dict{Int, Vector{Vector{Float64}}}()
         
         for (year, initial_optima_dir) in zip(years, initial_optima_dirs)
             og_dates = toml_data["dates"]
             dates = [string(year) * a_date[5:end] for a_date in og_dates]
-            
             csv_trans_files = [joinpath(initial_optima_dir, a_date, "output", "line_investments.csv") for a_date in dates]
             csv_stor_files = [joinpath(initial_optima_dir, a_date, "output", "storage_investments.csv") for a_date in dates]
             
@@ -70,6 +69,7 @@ function compute_superset_core_point(superdir; is_multistage::Bool=false)
             
             gamma_val = trans_df[:, :Upgrade_Lvl]
             s_energy_val = stor_df[:, :Storage_Energy]
+            
             gamma_val = safe_ceil.(gamma_val)
             s_energy_val = safe_ceil.(s_energy_val)
             
@@ -88,11 +88,27 @@ function compute_superset_core_point(superdir; is_multistage::Bool=false)
                 end
             end
             
-            result[year] = (gamma_val, s_energy_val)
+            result[year] = [gamma_val, s_energy_val]
+        end
+        
+        # Enforce monotonicity: later years >= earlier years
+        sorted_years = sort(collect(keys(result)))
+        for i in 2:length(sorted_years)
+            prev_year = sorted_years[i-1]
+            curr_year = sorted_years[i]
+            
+            # Enforce monotonicity for transmission investments (gamma)
+            prev_gamma = result[prev_year][1]
+            curr_gamma = result[curr_year][1]
+            result[curr_year][1] = max.(curr_gamma, prev_gamma)
+            
+            # Enforce monotonicity for storage investments (s_energy)
+            prev_storage = result[prev_year][2]
+            curr_storage = result[curr_year][2]
+            result[curr_year][2] = max.(curr_storage, prev_storage)
         end
         
         return result
-        
     else
         # Single-stage: return Tuple{Vector, Vector} (existing logic)
         initial_optima_dir = toml_data["initial_optima_dir"]  # Single directory

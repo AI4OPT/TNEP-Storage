@@ -2,7 +2,7 @@ using TOML
 
 function create_simdirs(superdir::String, toml_data::Dict; only_feasibility=nothing)
     simdirs = String[]
-    years = get(master_data["param"], "years", [master_data["param"]["decarbonization_year"]])
+    years = get(toml_data, "years", [toml_data["decarbonization_year"]])
     
     for rep in toml_data["dates"]
         for year in years
@@ -38,4 +38,15 @@ function create_simdirs(superdir::String, toml_data::Dict; only_feasibility=noth
     end
     
     return simdirs
+end
+
+function clear_directory(dirpath::String)
+    """Clear all files in a directory if it exists."""
+    if isdir(dirpath)
+        for file in readdir(dirpath, join=true)
+            if isfile(file)
+                rm(file)
+            end
+        end
+    end
 end
