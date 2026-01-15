@@ -414,43 +414,52 @@ function add_trust_region_constraints!(master::MultistageBendersMasterProblem,
     
     # Subsequent years: incremental trust region |(x_y - x_{y-1}) - (x̌_y - x̌_{y-1})| <= r
     if length(years) > 1
-        for year_idx in 2:length(years)
-            y_curr = years[year_idx]
-            y_prev = years[year_idx - 1]
-            
-            # Incremental transmission upgrades: (γ_y - γ_{y-1}) - (γ̌_y - γ̌_{y-1})
-            @constraint(master.jump_model,
-                trans_abs_diff_incr_ub[a in 1:master.E, y=y_curr],
-                trans_abs_diff[a, y] >= 
-                    (master.gamma[a, y_curr] - master.gamma[a, y_prev]) - 
-                    (y_trust[y_curr][1][a] - y_trust[y_prev][1][a]))
-            @constraint(master.jump_model,
-                trans_abs_diff_incr_lb[a in 1:master.E, y=y_curr],
-                trans_abs_diff[a, y] >= 
-                    (y_trust[y_curr][1][a] - y_trust[y_prev][1][a]) - 
-                    (master.gamma[a, y_curr] - master.gamma[a, y_prev]))
-            
-            # Incremental storage energy: (s_y - s_{y-1}) - (š_y - š_{y-1})
-            @constraint(master.jump_model,
-                abs_diff_incr_ub[i in 1:master.N, y=y_curr],
-                abs_diff[i, y] >= 
-                    (master.s_energy[i, y_curr] - master.s_energy[i, y_prev]) - 
-                    (y_trust[y_curr][2][i] - y_trust[y_prev][2][i]))
-            @constraint(master.jump_model,
-                abs_diff_incr_lb[i in 1:master.N, y=y_curr],
-                abs_diff[i, y] >= 
-                    (y_trust[y_curr][2][i] - y_trust[y_prev][2][i]) - 
-                    (master.s_energy[i, y_curr] - master.s_energy[i, y_prev]))
-            
-            # L1 norm constraints for incremental changes
-            # Transmission lines use trans_radius, storage uses storage_radius
-            @constraint(master.jump_model,
-                trans_abs_diff_total_incr[y=y_curr],
-                sum(trans_abs_diff[a, y] for a in 1:master.E) <= trans_radius)
-            @constraint(master.jump_model,
-                abs_diff_total_incr[y=y_curr],
-                sum(abs_diff[i, y] for i in 1:master.N) <= storage_radius)
-        end
+        K = 2:length(years)  # indices for "current year" positions
+
+        # Incremental transmission upgrades:
+        # trans_abs_diff[a, y_curr] >=  (γ_y - γ_{y-1}) - (γ̌_y - γ̌_{y-1})
+        @constraint(master.jump_model,
+            trans_abs_diff_incr_ub[a in 1:master.E, k in K],
+            trans_abs_diff[a, years[k]] >=
+                (master.gamma[a, years[k]] - master.gamma[a, years[k-1]]) -
+                (y_trust[years[k]][1][a] - y_trust[years[k-1]][1][a])
+        )
+
+        # trans_abs_diff[a, y_curr] >= -( (γ_y - γ_{y-1}) - (γ̌_y - γ̌_{y-1}) )
+        @constraint(master.jump_model,
+            trans_abs_diff_incr_lb[a in 1:master.E, k in K],
+            trans_abs_diff[a, years[k]] >=
+                (y_trust[years[k]][1][a] - y_trust[years[k-1]][1][a]) -
+                (master.gamma[a, years[k]] - master.gamma[a, years[k-1]])
+        )
+
+        # Incremental storage energy:
+        # abs_diff[i, y_curr] >= (s_y - s_{y-1}) - (š_y - š_{y-1})
+        @constraint(master.jump_model,
+            abs_diff_incr_ub[i in 1:master.N, k in K],
+            abs_diff[i, years[k]] >=
+                (master.s_energy[i, years[k]] - master.s_energy[i, years[k-1]]) -
+                (y_trust[years[k]][2][i] - y_trust[years[k-1]][2][i])
+        )
+
+        # abs_diff[i, y_curr] >= -( (s_y - s_{y-1}) - (š_y - š_{y-1}) )
+        @constraint(master.jump_model,
+            abs_diff_incr_lb[i in 1:master.N, k in K],
+            abs_diff[i, years[k]] >=
+                (y_trust[years[k]][2][i] - y_trust[years[k-1]][2][i]) -
+                (master.s_energy[i, years[k]] - master.s_energy[i, years[k-1]])
+        )
+
+        # L1 norm constraints for incremental changes (per current year)
+        @constraint(master.jump_model,
+            trans_abs_diff_total_incr[k in K],
+            sum(trans_abs_diff[a, years[k]] for a in 1:master.E) <= trans_radius
+        )
+
+        @constraint(master.jump_model,
+            abs_diff_total_incr[k in K],
+            sum(abs_diff[i, years[k]] for i in 1:master.N) <= storage_radius
+        )
     end
 end
 
