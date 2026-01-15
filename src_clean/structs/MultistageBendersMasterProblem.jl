@@ -389,6 +389,10 @@ function add_trust_region!(master::MultistageBendersMasterProblem)
     y_trust = master.y_trust[end]
     abs_diff = master.jump_model[:abs_diff]
     trans_abs_diff = master.jump_model[:trans_abs_diff]
+
+    if get(master.data["param"], "last_tr_only", false)
+        years = [years[end]]
+    end
     
     @constraint(master.jump_model,
         trans_abs_diff_ub[a in 1:master.E, year in years],

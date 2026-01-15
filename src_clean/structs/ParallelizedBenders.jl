@@ -45,7 +45,7 @@ mutable struct ParallelizedBenders
     function ParallelizedBenders(superdir::String; 
                                 max_iterations::Int=100000,
                                 tolerance::Float64=0.005,
-                                lower_bound::Float64=0.0)
+                                lb::Float64=0.0)
         
         # Read configuration
         config_file = joinpath(superdir, "config.toml")
@@ -79,7 +79,7 @@ mutable struct ParallelizedBenders
             master = BendersMasterProblem(superdir, master_data, date_weights)
         end
         
-        master.lower_bound = lower_bound
+        master.lower_bound = lb
         
         workers = create_persistent_workers(superdir, simdirs, date_weights)
         
@@ -238,7 +238,7 @@ function solve_subproblems_parallel!(benders::ParallelizedBenders, y_val)
     Single-stage: y_val is Tuple{Vector, Vector}
                   Send same investments to all workers
     
-    Multistage:   y_val is Dict{Int => Tuple{Vector, Vector}}
+    Multistage:   y_val is Dict{Int => Vector{Vector, Vector}}
                   Send year-specific investments to each worker based on worker.year
     """
     if benders.is_multistage
@@ -387,10 +387,11 @@ function update_trust_region!(benders::ParallelizedBenders,
                 # Add level set
                 add_level_set!(master, current_obj)
             else # no improvement, null step
-                if isapprox(y_val, master.y_trust[end]) # Stuck in local region - expand trust region
+                println("[DEBUG] Null step")
+                if all(compare_y_vals(y_val[k], master.last_y_val[k]) == 0 for k in keys(y_val)) # Stuck in local region - expand trust region
                     current_radius = get(master.jump_model.ext, :l1_radius, [0])[end]
                     new_radius = current_radius + 1
-                    println("[DEBUG] Null step: expanding l1_radius from $current_radius to $new_radius")
+                    println("[DEBUG] Repeat solution: expanding l1_radius from $current_radius to $new_radius")
                     master.jump_model.ext[:l1_radius] = 
                         vcat(get(master.jump_model.ext, :l1_radius, Int[]), [new_radius])
                 end
@@ -637,7 +638,7 @@ end
 function parallelized_ptdf_benders(superdir::String; 
                                   max_iterations::Int=100000,
                                   tolerance::Float64=0.005,
-                                  lower_bound::Float64=0.0)
+                                  lb::Float64=0.0)
     """
     Main entry point for parallelized Benders decomposition.    
     """
@@ -646,7 +647,7 @@ function parallelized_ptdf_benders(superdir::String;
     benders = ParallelizedBenders(superdir; 
                                  max_iterations=max_iterations,
                                  tolerance=tolerance,
-                                 lower_bound=lower_bound)
+                                 lb=lb)
     
     # Solve
     result = solve!(benders)
