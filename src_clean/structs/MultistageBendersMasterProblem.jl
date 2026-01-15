@@ -330,17 +330,22 @@ function add_feasibility_cut!(master::MultistageBendersMasterProblem, year::Int,
     )
 end
 
-# Trust region management # TODO year-dependent l1 radii updates potentially needed
+# Trust region management with incremental changes for multistage optimization
 function add_trust_region!(master::MultistageBendersMasterProblem)
     """
     Add trust region constraints for stabilization.
-    Year-specific trust regions |x_y - x̌_y| <= r_y for each year
+    
+    First year: |x_1 - x̌_1| <= r
+    Subsequent years: |(x_y - x_{y-1}) - (x̌_y - x̌_{y-1})| <= r
+    
+    All years share the same radius r. In the first iteration, r=0 to force
+    investment at the over-invested point.
     """
     if master.stabilization != "trust_region"
         return
     end
     
-    years = master.years
+    years = sort(master.years)
     
     if master.iter == 1
         # Initialize trust region at over-invested point for each year
@@ -354,78 +359,120 @@ function add_trust_region!(master::MultistageBendersMasterProblem)
             y_core[year] = [gamma_core, s_energy_core]
         end
         push!(master.y_trust, y_core)
-        master.jump_model.ext[:l1_radius] = [1]
         
-        # Add constraints for all years
-        y_trust = master.y_trust[end]
-        abs_diff = master.jump_model[:abs_diff]
-        trans_abs_diff = master.jump_model[:trans_abs_diff]
+        # Initialize L1 radius to 0 for first iteration (forces over-invested point)
+        master.jump_model.ext[:l1_radius] = [0.0]
         
-        @constraint(master.jump_model,
-            trans_abs_diff_ub[a in 1:master.E, year in years],
-            trans_abs_diff[a, year] >= master.gamma[a, year] - y_trust[year][1][a])
-        @constraint(master.jump_model,
-            trans_abs_diff_lb[a in 1:master.E, year in years],
-            trans_abs_diff[a, year] >= y_trust[year][1][a] - master.gamma[a, year])
-        @constraint(master.jump_model,
-            abs_diff_ub[i in 1:master.N, year in years],
-            abs_diff[i, year] >= master.s_energy[i, year] - y_trust[year][2][i])
-        @constraint(master.jump_model,
-            abs_diff_lb[i in 1:master.N, year in years],
-            abs_diff[i, year] >= y_trust[year][2][i] - master.s_energy[i, year])
-        @constraint(master.jump_model,
-            trans_abs_diff_total[year in years],
-            sum(trans_abs_diff[a, year] for a in 1:master.E) == 0)
-        @constraint(master.jump_model,
-            abs_diff_total[year in years],
-            sum(abs_diff[i, year] for i in 1:master.N) == 0)
+        # Add constraints
+        add_trust_region_constraints!(master, y_core, years)
         
         return
     else
         remove_trust_region!(master)
+        # Add constraints with updated trust center
+        y_trust = master.y_trust[end]
+        add_trust_region_constraints!(master, y_trust, years)
     end
+end
+
+function add_trust_region_constraints!(master::MultistageBendersMasterProblem, 
+                                       y_trust::Dict{Int, Vector{Vector{Float64}}},
+                                       years::Vector{Int})
+    """
+    Helper function to add trust region constraints.
+    Handles both absolute (first year) and incremental (subsequent years) constraints.
     
-    # Add constraints for subsequent iterations
-    y_trust = master.y_trust[end]
+    Transmission lines use radius from l1_radius[end]
+    Storage uses constant radius of 2 (except first iteration where it's 0)
+    """
     abs_diff = master.jump_model[:abs_diff]
     trans_abs_diff = master.jump_model[:trans_abs_diff]
-
-    if get(master.data["param"], "last_tr_only", false)
-        years = [years[end]]
-    end
+    trans_radius = master.jump_model.ext[:l1_radius][end]
+    storage_radius = master.iter == 1 ? 0.0 : 2.0
     
+    first_year = years[1]
+    
+    # First year: absolute trust region |x_1 - x̌_1| <= r
     @constraint(master.jump_model,
-        trans_abs_diff_ub[a in 1:master.E, year in years],
-        trans_abs_diff[a, year] >= master.gamma[a, year] - y_trust[year][1][a])
+        trans_abs_diff_ub_y1[a in 1:master.E],
+        trans_abs_diff[a, first_year] >= master.gamma[a, first_year] - y_trust[first_year][1][a])
     @constraint(master.jump_model,
-        trans_abs_diff_lb[a in 1:master.E, year in years],
-        trans_abs_diff[a, year] >= y_trust[year][1][a] - master.gamma[a, year])
+        trans_abs_diff_lb_y1[a in 1:master.E],
+        trans_abs_diff[a, first_year] >= y_trust[first_year][1][a] - master.gamma[a, first_year])
     @constraint(master.jump_model,
-        abs_diff_ub[i in 1:master.N, year in years],
-        abs_diff[i, year] >= master.s_energy[i, year] - y_trust[year][2][i])
+        abs_diff_ub_y1[i in 1:master.N],
+        abs_diff[i, first_year] >= master.s_energy[i, first_year] - y_trust[first_year][2][i])
     @constraint(master.jump_model,
-        abs_diff_lb[i in 1:master.N, year in years],
-        abs_diff[i, year] >= y_trust[year][2][i] - master.s_energy[i, year])
+        abs_diff_lb_y1[i in 1:master.N],
+        abs_diff[i, first_year] >= y_trust[first_year][2][i] - master.s_energy[i, first_year])
     @constraint(master.jump_model,
-        trans_abs_diff_total[year in years],
-        sum(trans_abs_diff[a, year] for a in 1:master.E) <= master.jump_model.ext[:l1_radius][end])
+        trans_abs_diff_total_y1,
+        sum(trans_abs_diff[a, first_year] for a in 1:master.E) <= trans_radius)
     @constraint(master.jump_model,
-        abs_diff_total[year in years],
-        sum(abs_diff[i, year] for i in 1:master.N) <= 2)
+        abs_diff_total_y1,
+        sum(abs_diff[i, first_year] for i in 1:master.N) <= storage_radius)
+    
+    # Subsequent years: incremental trust region |(x_y - x_{y-1}) - (x̌_y - x̌_{y-1})| <= r
+    if length(years) > 1
+        for year_idx in 2:length(years)
+            y_curr = years[year_idx]
+            y_prev = years[year_idx - 1]
+            
+            # Incremental transmission upgrades: (γ_y - γ_{y-1}) - (γ̌_y - γ̌_{y-1})
+            @constraint(master.jump_model,
+                trans_abs_diff_incr_ub[a in 1:master.E, y=y_curr],
+                trans_abs_diff[a, y] >= 
+                    (master.gamma[a, y_curr] - master.gamma[a, y_prev]) - 
+                    (y_trust[y_curr][1][a] - y_trust[y_prev][1][a]))
+            @constraint(master.jump_model,
+                trans_abs_diff_incr_lb[a in 1:master.E, y=y_curr],
+                trans_abs_diff[a, y] >= 
+                    (y_trust[y_curr][1][a] - y_trust[y_prev][1][a]) - 
+                    (master.gamma[a, y_curr] - master.gamma[a, y_prev]))
+            
+            # Incremental storage energy: (s_y - s_{y-1}) - (š_y - š_{y-1})
+            @constraint(master.jump_model,
+                abs_diff_incr_ub[i in 1:master.N, y=y_curr],
+                abs_diff[i, y] >= 
+                    (master.s_energy[i, y_curr] - master.s_energy[i, y_prev]) - 
+                    (y_trust[y_curr][2][i] - y_trust[y_prev][2][i]))
+            @constraint(master.jump_model,
+                abs_diff_incr_lb[i in 1:master.N, y=y_curr],
+                abs_diff[i, y] >= 
+                    (y_trust[y_curr][2][i] - y_trust[y_prev][2][i]) - 
+                    (master.s_energy[i, y_curr] - master.s_energy[i, y_prev]))
+            
+            # L1 norm constraints for incremental changes
+            # Transmission lines use trans_radius, storage uses storage_radius
+            @constraint(master.jump_model,
+                trans_abs_diff_total_incr[y=y_curr],
+                sum(trans_abs_diff[a, y] for a in 1:master.E) <= trans_radius)
+            @constraint(master.jump_model,
+                abs_diff_total_incr[y=y_curr],
+                sum(abs_diff[i, y] for i in 1:master.N) <= storage_radius)
+        end
+    end
 end
 
 function remove_trust_region!(master::MultistageBendersMasterProblem)
     """
     Remove trust region constraints for all years.
+    Handles both first-year absolute and subsequent incremental constraints.
     """
-    if master.stabilization == "trust_region"
-        constraint_names = [
-            :trans_abs_diff_ub, :trans_abs_diff_lb, :abs_diff_ub, :abs_diff_lb, 
-            :abs_diff_total, :trans_abs_diff_total
-        ]
-    else
+    if master.stabilization != "trust_region"
         return
     end
+    
+    constraint_names = [
+        # First year absolute constraints
+        :trans_abs_diff_ub_y1, :trans_abs_diff_lb_y1, 
+        :abs_diff_ub_y1, :abs_diff_lb_y1,
+        :abs_diff_total_y1, :trans_abs_diff_total_y1,
+        # Incremental constraints for subsequent years
+        :trans_abs_diff_incr_ub, :trans_abs_diff_incr_lb,
+        :abs_diff_incr_ub, :abs_diff_incr_lb,
+        :abs_diff_total_incr, :trans_abs_diff_total_incr
+    ]
     
     obj_dict = object_dictionary(master.jump_model)
     
