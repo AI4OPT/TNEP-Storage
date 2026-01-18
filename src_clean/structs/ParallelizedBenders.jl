@@ -384,9 +384,9 @@ function update_trust_region!(benders::ParallelizedBenders,
                 master.upper_bound = current_obj
 
                 # Reset l1 radius
-                println("[DEBUG] Resetting l1_radius to 1")
+                println("[DEBUG] Resetting l1_radius to 2")
                 master.jump_model.ext[:l1_radius] = 
-                    vcat(get(master.jump_model.ext, :l1_radius, Int[]), [1])
+                    vcat(get(master.jump_model.ext, :l1_radius, Int[]), [2])
                 
                 # Add level set
                 add_level_set!(master, current_obj)

@@ -145,7 +145,11 @@ mutable struct MultistageBendersMasterProblem
         )
         
         # Compute over-invested point
-        over_invested_point = compute_superset_core_point(superdir, is_multistage=true)
+        if get(data["param"], "warmstart_from_benders", false)
+            over_invested_point = warmstart_from_benders(data, E=E, N=N)
+        else
+            over_invested_point = compute_superset_core_point(superdir, is_multistage=true)
+        end
         warmstart_dir = joinpath(superdir, "warmstart")
         mkpath(warmstart_dir)
         for year in years
@@ -386,4 +390,19 @@ function update_tracking!(master::MultistageBendersMasterProblem, y_val::Dict{In
     master.last_y_val = y_val
     push!(master.total_ue, total_ue)
     push!(master.total_obj, total_obj)
+end
+
+function warmstart_from_benders(data; E::Int, N::Int)
+    years = data["param"]["years"]
+    initial_optima_dirs = data["param"]["initial_optima_dir"]
+
+    @assert length(initial_optima_dirs) == length(years) "Number of initial_optima_dirs must match number of years"
+        
+    result = Dict{Int, Vector{Vector{Float64}}}()
+
+    for (year, initial_optima_dir) in zip(years, initial_optima_dirs)
+        result[year] = load_investments_from_dir(joinpath(initial_optima_dir, "output"), data, E=E, N=N)
+    end
+
+    return result
 end

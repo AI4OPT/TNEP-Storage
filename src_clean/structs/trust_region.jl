@@ -61,6 +61,7 @@ function add_trust_region_constraints_abs!(master, y_trust, years)
     trans_abs_diff = master.jump_model[:trans_abs_diff]
     trans_radius = master.jump_model.ext[:l1_radius][end]
     storage_radius = master.iter == 1 ? 0.0 : 2.0
+    # storage_radius = master.iter == 1 ? 0.0 : (trans_radius + 1)
     
     # Apply absolute trust region to ALL years: |x_y - x̌_y| <= r
     @constraint(master.jump_model,

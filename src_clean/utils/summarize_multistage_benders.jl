@@ -1,6 +1,49 @@
 using CSV, DataFrames, SHA
 
-function summarize_multistage_trans(superdir)
+function compare_y_vals(y_val_1, y_val_2; atol=1e-10)
+    gamma1 = y_val_1[1]
+    gamma2 = y_val_2[1]
+    s_energy_1 = y_val_1[2]
+    s_energy_2 = y_val_2[2]
+    
+    total_diff = sum(abs.(gamma1 .- gamma2)) + sum(abs.(s_energy_1 .- s_energy_2))
+    
+    return total_diff < atol ? 0.0 : total_diff
+end
+
+function compare_configs(config1, config2; atol=1e-10)
+    # Check if same length
+    if length(config1) != length(config2)
+        return false
+    end
+    
+    # Extract indices and values separately
+    if length(config1) == 0
+        return true  # Both empty configs are equal
+    end
+    
+    # Get indices and values
+    indices1 = [c[1] for c in config1]
+    indices2 = [c[2] for c in config2]
+    values1 = [c[2] for c in config1]
+    values2 = [c[2] for c in config2]
+    
+    # Indices must match exactly
+    if indices1 != indices2
+        return false
+    end
+    
+    # Use compare_y_vals logic for values
+    # Create y_val format: ([values], [])  - we only care about first component
+    y_val_1 = (values1, [])
+    y_val_2 = (values2, [])
+    
+    diff = compare_y_vals(y_val_1, y_val_2; atol=atol)
+    
+    return diff == 0.0
+end
+
+function summarize_multistage_trans(superdir; atol=1e-10)
     dir_path = joinpath(superdir, "benders_output")
     files = filter(f -> startswith(f, "line_investments_") && endswith(f, ".csv"), 
                    readdir(dir_path))
@@ -19,8 +62,7 @@ function summarize_multistage_trans(superdir)
         data[(iter, year)] = sum(df.Upgrade_Lvl)
         
         # Store configuration as a sorted tuple of (Branch_Index, Upgrade_Lvl) for non-zero upgrades
-        # This creates a unique fingerprint of the configuration
-        upgrades = [(row.Branch_Index, row.Upgrade_Lvl) for row in eachrow(df) if row.Upgrade_Lvl > 0]
+        upgrades = [(row.Branch_Index, row.Upgrade_Lvl) for row in eachrow(df) if row.Upgrade_Lvl > atol]
         sort!(upgrades)
         config_data[(iter, year)] = upgrades
     end
@@ -37,7 +79,6 @@ function summarize_multistage_trans(superdir)
     end
     
     # Add configuration match columns for each year
-    # These show if the configuration matches the previous iteration
     for year in years
         match_col = Symbol("$(year)_Match")
         matches = String[]
@@ -45,23 +86,16 @@ function summarize_multistage_trans(superdir)
         for i in 1:length(iters)
             iter = iters[i]
             if i == 1
-                push!(matches, "-")  # First iteration has nothing to compare to
+                push!(matches, "-")
             else
                 prev_iter = iters[i-1]
                 current_config = get(config_data, (iter, year), [])
                 prev_config = get(config_data, (prev_iter, year), [])
                 
-                if current_config == prev_config
-                    push!(matches, "✓")  # Exact match
+                if compare_configs(current_config, prev_config; atol=atol)
+                    push!(matches, "✓")
                 else
-                    # Check if it's a subset or superset
-                    if issubset(Set(current_config), Set(prev_config))
-                        push!(matches, "⊂")  # Subset
-                    elseif issubset(Set(prev_config), Set(current_config))
-                        push!(matches, "⊃")  # Superset
-                    else
-                        push!(matches, "✗")  # Different
-                    end
+                    push!(matches, "✗")
                 end
             end
         end
@@ -71,14 +105,14 @@ function summarize_multistage_trans(superdir)
     return summary
 end
 
-function summarize_multistage_storage(superdir)
+function summarize_multistage_storage(superdir; atol=1e-10)
     dir_path = joinpath(superdir, "benders_output")
     files = filter(f -> startswith(f, "storage_investments_") && endswith(f, ".csv"), 
                    readdir(dir_path))
     
     # Parse iteration and year from filenames
-    data = Dict()  # For sums
-    config_data = Dict()  # For full configurations
+    data = Dict()
+    config_data = Dict()
     
     for file in files
         parts = split(replace(file, ".csv" => ""), "_")
@@ -89,9 +123,9 @@ function summarize_multistage_storage(superdir)
         # Store sum of Storage_Energy
         data[(iter, year)] = sum(df.Storage_Energy)
         
-        # Store configuration as a sorted tuple of (Node_Index, Storage_Energy) for non-zero storage
+        # Store configuration, filtering out near-zero values
         storage_investments = [(row.Node_Index, row.Storage_Energy) 
-                               for row in eachrow(df) if row.Storage_Energy > 0]
+                               for row in eachrow(df) if row.Storage_Energy > atol]
         sort!(storage_investments)
         config_data[(iter, year)] = storage_investments
     end
@@ -115,23 +149,16 @@ function summarize_multistage_storage(superdir)
         for i in 1:length(iters)
             iter = iters[i]
             if i == 1
-                push!(matches, "-")  # First iteration has nothing to compare to
+                push!(matches, "-")
             else
                 prev_iter = iters[i-1]
                 current_config = get(config_data, (iter, year), [])
                 prev_config = get(config_data, (prev_iter, year), [])
                 
-                if current_config == prev_config
-                    push!(matches, "✓")  # Exact match
+                if compare_configs(current_config, prev_config; atol=atol)
+                    push!(matches, "✓")
                 else
-                    # Check if it's a subset or superset
-                    if issubset(Set(current_config), Set(prev_config))
-                        push!(matches, "⊂")  # Subset
-                    elseif issubset(Set(prev_config), Set(current_config))
-                        push!(matches, "⊃")  # Superset
-                    else
-                        push!(matches, "✗")  # Different
-                    end
+                    push!(matches, "✗")
                 end
             end
         end
@@ -142,18 +169,9 @@ function summarize_multistage_storage(superdir)
 end
 
 # Combined function that returns both summaries
-function summarize_multistage_investments(superdir)
-    trans_summary = summarize_multistage_trans(superdir)
-    storage_summary = summarize_multistage_storage(superdir)
+function summarize_multistage_investments(superdir; atol=1e-10)
+    trans_summary = summarize_multistage_trans(superdir; atol=atol)
+    storage_summary = summarize_multistage_storage(superdir; atol=atol)
     
     return (transmission = trans_summary, storage = storage_summary)
 end
-
-# Usage examples:
-# trans_summary = summarize_multistage_trans("path/to/superdir")
-# storage_summary = summarize_multistage_storage("path/to/superdir")
-# 
-# Or get both at once:
-# summaries = summarize_multistage_investments("path/to/superdir")
-# println(summaries.transmission)
-# println(summaries.storage)

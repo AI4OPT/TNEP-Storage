@@ -152,12 +152,21 @@ function safe_ceil(x, tolerance=1e-8)
     end
 end
 
-function compare_y_vals(y_val_1, y_val_2)
+function compare_y_vals(y_val_1, y_val_2; atol=1e-10, rtol=1e-8)
     gamma1 = y_val_1[1]
     gamma2 = y_val_2[1]
-
     s_energy_1 = y_val_1[2]
     s_energy_2 = y_val_2[2]
-
-    return sum(abs.(gamma1 .- gamma2)) + sum(abs.(s_energy_1 .- s_energy_2))
+    
+    # Use approximate comparison for floating point values
+    gamma_diff = sum(abs.(gamma1 .- gamma2))
+    energy_diff = sum(abs.(s_energy_1 .- s_energy_2))
+    
+    total_diff = gamma_diff + energy_diff
+    
+    # Return 0 if difference is within tolerance, otherwise return the difference
+    return total_diff < atol + rtol * max(
+        sum(abs.(gamma1)) + sum(abs.(s_energy_1)),
+        sum(abs.(gamma2)) + sum(abs.(s_energy_2))
+    ) ? 0.0 : total_diff
 end

@@ -25,7 +25,7 @@ function load_investments_from_dir(
     
     Returns:
     --------
-    (gamma, s_energy) : Tuple of (Union{Vector,Nothing}, Union{Vector,Nothing})
+    [gamma, s_energy] : Vector of (Union{Vector,Nothing}, Union{Vector,Nothing})
         Line and storage investment values
     """
     
@@ -78,5 +78,5 @@ function load_investments_from_dir(
         @debug "Storage investments file not found: $storage_file"
     end
     
-    return (gamma, s_energy)
+    return [gamma, s_energy]
 end
