@@ -7,5 +7,6 @@
 *.png
 *.csv
 *.json
+*.out
 
 src/model/r1

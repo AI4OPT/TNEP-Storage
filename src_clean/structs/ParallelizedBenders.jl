@@ -337,7 +337,11 @@ function add_all_cuts!(benders::ParallelizedBenders,
                 total_phi_val += (theta_val[date] + penalty * ue) * weight
             end
         else
-            total_phi_val += phi_val * weight
+            if benders.is_multistage
+                total_phi_val += disc_factors[year] * phi_val * weight
+            else
+                total_phi_val += phi_val * weight
+            end
         end
         
         total_ue += ue * weight

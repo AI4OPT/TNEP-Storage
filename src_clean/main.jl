@@ -2,6 +2,8 @@ using JuMP
 include("../exp/clean/make_PACE_script.jl")
 include("structs/ExpansionPlanner.jl")
 include("structs/ParallelizedBenders.jl")
+include("structs/ParallelizedBendersDistributed.jl")
+# include("src_clean/structs/ParallelizedBendersDistributed.jl")
 include("utils/utils.jl")
 
 function parallelized_benders_wrapper(superdir::String; 
