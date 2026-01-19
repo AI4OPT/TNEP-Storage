@@ -1,17 +1,20 @@
 using CSV, DataFrames, SHA
 
-function compare_y_vals(y_val_1, y_val_2; atol=1e-10)
+function compare_y_vals(y_val_1, y_val_2; atol=1e-6)
     gamma1 = y_val_1[1]
     gamma2 = y_val_2[1]
     s_energy_1 = y_val_1[2]
     s_energy_2 = y_val_2[2]
     
-    total_diff = sum(abs.(gamma1 .- gamma2)) + sum(abs.(s_energy_1 .- s_energy_2))
+    # For integer variables, any difference >= 0.5 means different integers
+    gamma_diff = sum(abs.(gamma1 .- gamma2))
+    energy_diff = sum(abs.(s_energy_1 .- s_energy_2))
+    total_diff = gamma_diff + energy_diff
     
     return total_diff < atol ? 0.0 : total_diff
 end
 
-function compare_configs(config1, config2; atol=1e-10)
+function compare_configs(config1, config2; atol=1e-6)
     # Check if same length
     if length(config1) != length(config2)
         return false
@@ -24,7 +27,7 @@ function compare_configs(config1, config2; atol=1e-10)
     
     # Get indices and values
     indices1 = [c[1] for c in config1]
-    indices2 = [c[2] for c in config2]
+    indices2 = [c[1] for c in config2]
     values1 = [c[2] for c in config1]
     values2 = [c[2] for c in config2]
     
@@ -35,15 +38,15 @@ function compare_configs(config1, config2; atol=1e-10)
     
     # Use compare_y_vals logic for values
     # Create y_val format: ([values], [])  - we only care about first component
-    y_val_1 = (values1, [])
-    y_val_2 = (values2, [])
+    y_val_1 = (values1, Float64[])
+    y_val_2 = (values2, Float64[])
     
     diff = compare_y_vals(y_val_1, y_val_2; atol=atol)
     
     return diff == 0.0
 end
 
-function summarize_multistage_trans(superdir; atol=1e-10)
+function summarize_multistage_trans(superdir; atol=1e-6)
     dir_path = joinpath(superdir, "benders_output")
     files = filter(f -> startswith(f, "line_investments_") && endswith(f, ".csv"), 
                    readdir(dir_path))
@@ -105,7 +108,7 @@ function summarize_multistage_trans(superdir; atol=1e-10)
     return summary
 end
 
-function summarize_multistage_storage(superdir; atol=1e-10)
+function summarize_multistage_storage(superdir; atol=1e-6)
     dir_path = joinpath(superdir, "benders_output")
     files = filter(f -> startswith(f, "storage_investments_") && endswith(f, ".csv"), 
                    readdir(dir_path))
@@ -169,7 +172,7 @@ function summarize_multistage_storage(superdir; atol=1e-10)
 end
 
 # Combined function that returns both summaries
-function summarize_multistage_investments(superdir; atol=1e-10)
+function summarize_multistage_investments(superdir; atol=1e-6)
     trans_summary = summarize_multistage_trans(superdir; atol=atol)
     storage_summary = summarize_multistage_storage(superdir; atol=atol)
     

@@ -362,7 +362,46 @@ function add_all_cuts!(benders::ParallelizedBendersDistributed,
     return current_obj, total_phi_val, total_theta_val, total_ue
 end
 
-# Update trust region based on iteration results
+# New helper function to handle master solve with trust region expansion
+function solve_master_with_trust_region_check!(benders::ParallelizedBendersDistributed)
+    """
+    Solve master problem and check if trust region needs immediate expansion.
+    Returns (y_val, master_obj, total_time) or (nothing, nothing, total_time) if infeasible.
+    """
+    master = benders.master
+    total_time = 0.0
+    
+    while true
+        println("[DEBUG] Solving master problem...")
+        add_trust_region!(master)
+        master_start = time()
+        result = solve!(master)
+        master_time = time() - master_start
+        total_time = master_time
+        
+        if result !== nothing
+            return (nothing, nothing, total_time)
+        end
+                
+        y_val = get_investments(master)
+        master_obj = get_objective_value(master)
+        
+        # Check if we need to expand trust region immediately
+        if master.stabilization == "trust_region" && master.iter > 1 && all(compare_y_vals(y_val[k], master.last_y_val[k]) == 0 for k in keys(y_val))
+            current_radius = get(master.jump_model.ext, :l1_radius, [0])[end]
+            new_radius = current_radius + 1
+            println("[DEBUG] Repeat solution detected: expanding l1_radius from $current_radius to $new_radius and resolving master")
+            master.jump_model.ext[:l1_radius] = 
+                vcat(get(master.jump_model.ext, :l1_radius, Int[]), [new_radius])
+            # Loop continues to resolve master
+        else
+            # No expansion needed, return results
+            return (y_val, master_obj, total_time)
+        end
+    end
+end
+
+# Simplified update_trust_region! - now only handles serious/null steps
 function update_trust_region!(benders::ParallelizedBendersDistributed,
                              y_val,
                              current_obj::Float64,
@@ -371,6 +410,7 @@ function update_trust_region!(benders::ParallelizedBendersDistributed,
                              total_ue::Float64)
     """
     Update trust region constraints based on iteration results.
+    Only handles serious/null step logic (expansion is now done immediately after master solve).
     """
     master = benders.master
     
@@ -383,21 +423,12 @@ function update_trust_region!(benders::ParallelizedBendersDistributed,
             println("[DEBUG] Serious step: objective improved from $(master.total_obj[end]) to $current_obj")
             push!(master.y_trust, y_val)
             master.upper_bound = current_obj
-
             println("[DEBUG] Resetting l1_radius to 1")
             master.jump_model.ext[:l1_radius] = 
                 vcat(get(master.jump_model.ext, :l1_radius, Int[]), [1])
-            
             add_level_set!(master, current_obj)
         else
             println("[DEBUG] Null step")
-            if all(compare_y_vals(y_val[k], master.last_y_val[k]) == 0 for k in keys(y_val))
-                current_radius = get(master.jump_model.ext, :l1_radius, [0])[end]
-                new_radius = current_radius + 1
-                println("[DEBUG] Repeat solution: expanding l1_radius from $current_radius to $new_radius")
-                master.jump_model.ext[:l1_radius] = 
-                    vcat(get(master.jump_model.ext, :l1_radius, Int[]), [new_radius])
-            end
         end
     end
 end
@@ -431,20 +462,18 @@ function solve!(benders::ParallelizedBendersDistributed)
             println("[ITERATION $(master.iter)]")
             println("="^80)
             
-            # Solve master problem
-            println("[DEBUG] Solving master problem...")
-            add_trust_region!(master)
-            master_start = time()
-            result = solve!(master)
-            if result !== nothing
+            # Solve master problem (potentially multiple times with trust region expansion)
+            y_val, master_obj, master_time = solve_master_with_trust_region_check!(benders)
+            
+            if y_val === nothing
                 @error "Master infeasible - returning for debugging"
                 return (converged=false, master=master)
             end
-            master_time = time() - master_start
-            push!(benders.master_times, master_time)
-            println("[DEBUG] Master solve time: $(round(master_time, digits=2))s")
             
-            y_val = get_investments(master)
+            push!(benders.master_times, master_time)
+            println("[DEBUG] Most recent master solve time: $(round(master_time, digits=2))s")
+            
+            # Export investments
             for year in master.years
                 export_investments_csv(master.data, y_val[year][1], y_val[year][2],
                                     output_dir=joinpath(benders.superdir, "benders_output"),
@@ -452,7 +481,6 @@ function solve!(benders::ParallelizedBendersDistributed)
             end
             
             theta_val = get_theta_values(master)
-            master_obj = get_objective_value(master)
             
             println("[DEBUG] Master objective: $(round(master_obj, digits=2))")
             
@@ -474,7 +502,7 @@ function solve!(benders::ParallelizedBendersDistributed)
             println("[DEBUG] Gap: $(round(gap * 100, digits=4))%")
             println("[DEBUG] Total unserved energy: $(round(total_ue, digits=6))")
             
-            # Update trust region
+            # Update trust region for next iteration
             update_trust_region!(benders, y_val, current_obj, 
                                total_theta_val, total_phi_val, total_ue)
             
