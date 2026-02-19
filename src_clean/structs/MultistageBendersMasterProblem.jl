@@ -177,7 +177,23 @@ mutable struct MultistageBendersMasterProblem
                 gamma[a, y] == 0
             )
         end
-        
+
+        # Storage lower bound on amount
+        if get(data["param"], "storage_lb", false) != false
+            storage_lb_dirs = data["param"]["storage_lb"]
+            @assert length(storage_lb_dirs) == length(years)
+            year_stor_lb = Dict()
+
+            for (dir, year) in zip(storage_lb_dirs, years)
+                _, s_energy_val_lb = load_investments_from_dir(dir, data, E=E, N=N)
+                year_stor_lb[year] = ceil(sum(s_energy_val_lb))
+            end
+
+            @constraint(jump_model, stor_lb[y in years],
+                sum(s_energy[i, y] for i in 1:N) >= year_stor_lb[y]
+            )
+        end
+
         #
         #   III. Objective
         #
@@ -348,7 +364,7 @@ function add_level_set!(master::MultistageBendersMasterProblem, current_obj::Flo
     remove_level_set!(master)
     
     obj_expr = master.jump_model.ext[:obj_expr]
-    @constraint(master.jump_model, level_set, obj_expr <= current_obj)
+    @constraint(master.jump_model, level_set, obj_expr <= current_obj -  1e-5 * abs(current_obj))
 end
 
 function remove_level_set!(master::MultistageBendersMasterProblem)

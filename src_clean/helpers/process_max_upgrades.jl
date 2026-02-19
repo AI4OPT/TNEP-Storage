@@ -137,7 +137,7 @@ function compute_superset_core_point(superdir; is_multistage::Bool=false)
             s_energy_val = stor_df[:, :Storage_Energy]
         end
         
-        return (gamma_val, s_energy_val)
+        return [gamma_val, s_energy_val]
     end
 end
 

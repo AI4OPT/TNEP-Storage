@@ -3,20 +3,25 @@ using CSV, DataFrames
 
 function save_solve_time(simdir, solve_time)
     """
-    Save solve time to CSV file.
+    Save solve time to CSV file, appending if file already exists.
     """
-    # Create the DataFrame with time information
-    df = DataFrame(
+    # Ensure output directory exists
+    filepath = joinpath(simdir, "output", "time.csv")
+
+    # Create the new row
+    df_new = DataFrame(
         Variable = ["time_to_solve"],
         Value = [solve_time]
     )
-    
-    # Ensure output directory exists
-    output_dir = joinpath(simdir, "output")
-    mkpath(output_dir)
-    
-    # Save to CSV
-    CSV.write(joinpath(output_dir, "time.csv"), df)
+
+    # Append if file exists, otherwise write fresh
+    if isfile(filepath)
+        df_existing = CSV.read(filepath, DataFrame)
+        df_combined = vcat(df_existing, df_new)
+        CSV.write(filepath, df_combined)
+    else
+        CSV.write(filepath, df_new)
+    end
 end
 
 function save_power_injections(simdir, model::JuMP.Model, data)

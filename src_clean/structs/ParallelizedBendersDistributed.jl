@@ -365,8 +365,8 @@ end
 # New helper function to handle master solve with trust region expansion
 function solve_master_with_trust_region_check!(benders::ParallelizedBendersDistributed)
     """
-    Solve master problem and check if trust region needs immediate expansion.
-    Returns (y_val, master_obj, total_time) or (nothing, nothing, total_time) if infeasible.
+    Solve master problem and handle infeasibility by expanding trust region.
+    Returns (y_val, master_obj, total_time) or (nothing, nothing, total_time) if converged.
     """
     master = benders.master
     total_time = 0.0
@@ -374,28 +374,37 @@ function solve_master_with_trust_region_check!(benders::ParallelizedBendersDistr
     while true
         println("[DEBUG] Solving master problem...")
         add_trust_region!(master)
+        
         master_start = time()
         result = solve!(master)
         master_time = time() - master_start
-        total_time = master_time
+        total_time += master_time  # Accumulate time across retries
         
-        if result !== nothing
-            return (nothing, nothing, total_time)
-        end
+        # Check if master is infeasible
+        if result !== nothing  # Assuming `result !== nothing` means infeasible
+            if master.stabilization == "trust_region"
+                current_radius = get(master.jump_model.ext, :l1_radius, [0])[end]
+                max_radius = 1000  # Set your max radius threshold
                 
-        y_val = get_investments(master)
-        master_obj = get_objective_value(master)
-        
-        # Check if we need to expand trust region immediately
-        if master.stabilization == "trust_region" && master.iter > 1 && all(compare_y_vals(y_val[k], master.last_y_val[k]) == 0 for k in keys(y_val))
-            current_radius = get(master.jump_model.ext, :l1_radius, [0])[end]
-            new_radius = current_radius + 1
-            println("[DEBUG] Repeat solution detected: expanding l1_radius from $current_radius to $new_radius and resolving master")
-            master.jump_model.ext[:l1_radius] = 
-                vcat(get(master.jump_model.ext, :l1_radius, Int[]), [new_radius])
-            # Loop continues to resolve master
+                if current_radius >= max_radius
+                    println("[DEBUG] Master infeasible at max radius ($max_radius) - likely converged")
+                    return (nothing, nothing, total_time)
+                end
+                
+                new_radius = current_radius + 1
+                println("[DEBUG] Master infeasible: expanding l1_radius from $current_radius to $new_radius and resolving")
+                master.jump_model.ext[:l1_radius] = 
+                    vcat(get(master.jump_model.ext, :l1_radius, Int[]), [new_radius])
+                # Loop continues to resolve master
+            else
+                # Not using trust region, infeasibility means done
+                println("[DEBUG] Master infeasible - algorithm terminated")
+                return (nothing, nothing, total_time)
+            end
         else
-            # No expansion needed, return results
+            # Feasible solution found
+            y_val = get_investments(master)
+            master_obj = get_objective_value(master)
             return (y_val, master_obj, total_time)
         end
     end

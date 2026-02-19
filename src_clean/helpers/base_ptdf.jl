@@ -103,3 +103,70 @@ function do_all_incidence(data)
     A = sparse(rows, cols, vals, num_buses, num_branches)
     return A
 end
+
+# cutoff_values=[0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05]
+
+function plot_percent_nonzeros(ptdf; cutoff_values=[0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05], log_scale=false)
+    abs_vals = abs.(ptdf)
+    nonzero_count = count(x -> x > 0, abs_vals)
+    percentages = [100.0 * count(x -> x < c && x > 0, abs_vals) / nonzero_count for c in cutoff_values]
+    inverted = [100.0 - p for p in percentages]
+    labels = string.(cutoff_values)
+
+    if log_scale
+        log_min = log10(minimum(cutoff_values))
+        log_max = log10(maximum(cutoff_values))
+        dense_cutoffs = 10 .^ range(log_min, log_max, length=500)
+        dense_inverted = [100.0 - 100.0 * count(x -> x > c, abs_vals) / nonzero_count for c in dense_cutoffs]
+        x_vals = log10.(dense_cutoffs)
+        tick_positions = log10.(cutoff_values)
+
+        p = plot(
+            x_vals,
+            dense_inverted,
+            fillrange=0,
+            fillalpha=0.6,
+            color=:steelblue,
+            linecolor=:steelblue,
+            linewidth=2,
+            xticks=(tick_positions, labels),
+            xrotation=45,
+            xlabel="Cutoff Value (log scale)",
+            ylabel="% of nonzero |values| < cutoff",
+            title="Percentage of Nonzero |PTDF| Values Below Cutoff",
+            legend=false,
+            ylims=(0, 105),
+            size=(800, 500),
+            bottom_margin=10mm,
+            left_margin=8mm,
+            top_margin=5mm,
+            right_margin=5mm,
+            dpi=150,
+        )
+    else
+        p = bar(
+            1:length(cutoff_values),
+            inverted,
+            xticks=(1:length(cutoff_values), labels),
+            xrotation=45,
+            xlabel="Cutoff Value",
+            ylabel="% of nonzero |values| < cutoff",
+            title="Percentage of Nonzero |PTDF| Values Below Cutoff",
+            legend=false,
+            color=:steelblue,
+            bar_edges=true,
+            ylims=(0, 105),
+            annotations=[(i, v + 1.5, text("$(round(v, digits=1))%", 7, :center))
+                         for (i, v) in enumerate(inverted)],
+            size=(800, 500),
+            bottom_margin=10mm,
+            left_margin=8mm,
+            top_margin=5mm,
+            right_margin=5mm,
+            dpi=150,
+        )
+    end
+
+    savefig(p, "ptdf_percent_nonzeros.png")
+    return p
+end
