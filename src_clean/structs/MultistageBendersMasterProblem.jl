@@ -210,7 +210,7 @@ mutable struct MultistageBendersMasterProblem
         first_stage_cost = (
             sum(s_energy[i, first_year] * data["param"]["storage_energy_size"] * 
                 data["param"]["bess_energy_cost"] for i in 1:N) + 
-            sum(data["param"]["cap_upgrade_cost"] * data["param"]["cap_upgrade_increment"] * 
+            sum(data["param"]["cap_upgrade_cost"] * get_capacity_increment(data, a) * 
                 data["branch"]["$a"]["distance"] * gamma[a, first_year] for a in 1:E)
         )
 
@@ -229,7 +229,7 @@ mutable struct MultistageBendersMasterProblem
                 
                 add_to_expression!(incremental_costs,
                     d * sum((gamma[a, y_curr] - gamma[a, y_prev]) * 
-                    data["param"]["cap_upgrade_cost"] * data["param"]["cap_upgrade_increment"] * 
+                    data["param"]["cap_upgrade_cost"] * get_capacity_increment(data, a) * 
                     data["branch"]["$a"]["distance"] for a in 1:E)
                 )
             end
