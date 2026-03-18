@@ -124,13 +124,11 @@ mutable struct MultistageBendersMasterProblem
             @constraint(jump_model, no_load_shed, ue_sum <= 0)
         end
         
-        # Check if previous investments exist
-        """
-        if haskey(data["param"], "previous_investment_dir")
+        # Check if previous investments exist (only to be used when considering only one year)
+        if haskey(data["param"], "previous_investment_dir") && length(years) == 1
             prev_dir = data["param"]["previous_investment_dir"]
-            add_prev_upgrades_internal!(superdir, jump_model, data, prev_dir, gamma, s_energy)
+            add_prev_upgrades_internal!(superdir, jump_model, data, prev_dir, years, gamma, s_energy)
         end
-        """
         
         # If rate a is zero (unlimited), then don't allow upgrades (for any year)
         @constraint(jump_model, 
@@ -271,6 +269,45 @@ mutable struct MultistageBendersMasterProblem
             over_invested_point,
             warmstart, stabilization, level_set_flag,
             R, N, E, T, G, K, years, disc_factors)
+    end
+end
+
+# Helper function for adding previous upgrades (internal use)
+# Only to be used when considering one planning stage
+function add_prev_upgrades_internal!(superdir, model::JuMP.Model, data, prev_dir, years, gamma, s_energy; export_csv::Bool=true)
+    E = length(data["branch"])
+    N = length(data["bus"])
+    
+    trans_file = joinpath(prev_dir, "line_investments.csv")
+    storage_file = joinpath(prev_dir, "storage_investments.csv")
+    trans_df = CSV.read(trans_file, DataFrame)
+    storage_df = CSV.read(storage_file, DataFrame)
+
+    gamma_min = trans_df[:, :Upgrade_Lvl]
+    s_energy_min = storage_df[:, :Storage_Energy]
+    
+    nonzero_trans_indices = findall(x -> x > 0, gamma_min)
+    nonzero_storage_indices = findall(x -> x > 0, s_energy_min)
+    
+    @constraint(model,
+        old_gamma[a in nonzero_trans_indices],
+        gamma[a, years[1]] >= gamma_min[a]
+    )
+    @constraint(model,
+        old_s_energy[i in nonzero_storage_indices],
+        s_energy[i, years[1]] >= s_energy_min[i]
+    )
+
+    # Export previous upgrades if requested
+    if export_csv
+        min_upgrades_dir = joinpath(superdir, "previous_investment_dir")
+        export_investments_csv(
+            data, 
+            gamma_min,
+            s_energy_min,
+            output_dir=min_upgrades_dir
+        )
+        @info "Exported previous upgrades to $min_upgrades_dir"
     end
 end
 

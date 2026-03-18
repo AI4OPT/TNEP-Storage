@@ -157,7 +157,7 @@ mutable struct BendersMasterProblem
         obj_expr = (
             sum(s_energy[i] * data["param"]["storage_energy_size"] * 
                 data["param"]["bess_energy_cost"] for i in 1:N) + 
-            sum(data["param"]["cap_upgrade_cost"] * data["param"]["cap_upgrade_increment"] * 
+            sum(data["param"]["cap_upgrade_cost"] * get_capacity_increment(data, a) * 
                 data["branch"]["$a"]["distance"] * gamma[a] for a in 1:E) +
             sum(theta[date] * date_weights[date[6:end]] for date in dates) + 
             ue_sum * data["param"]["operational_weight"] * data["param"]["under_served_penalty"]

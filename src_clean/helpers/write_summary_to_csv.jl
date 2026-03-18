@@ -1,3 +1,12 @@
+function get_capacity_increment(data, arc)
+    cap_upgrade_increment = data["param"]["cap_upgrade_increment"]
+    if haskey(data["param"], "cap_percent") && data["param"]["cap_percent"] == true
+        cap_upgrade_increment = data["param"]["cap_upgrade_increment"] * data["branch"]["$(arc)"]["rate_a"]
+    end
+
+    return cap_upgrade_increment
+end
+
 function write_summary_to_csv(simdir, model, data)
 
     # Get number of line investments
@@ -17,14 +26,13 @@ function write_summary_to_csv(simdir, model, data)
     # Get line investment costs
     col_data = df_line_investments[!, :Upgrade_Lvl]
     E = length(col_data)
-    line_investment_costs = sum(data["param"]["cap_upgrade_cost"] * data["param"]["cap_upgrade_increment"] * data["branch"]["$a"]["distance"] * col_data[a] for a in 1:E)
+    line_investment_costs = sum(data["param"]["cap_upgrade_cost"] * get_capacity_increment(data, a) * data["branch"]["$a"]["distance"] * col_data[a] for a in 1:E)
 
     # Get storage investment costs
     energy_data = df_storage_investments[!, :Storage_Energy]
     N = length(energy_data)
     storage_investment_costs = (
         sum(energy_data[i] * data["param"]["bess_energy_cost"] for i in 1:N) * data["param"]["storage_energy_size"] 
-        + num_storage_investments * data["param"]["storage_fixed_cost"]
     )
 
     # Model variable values
