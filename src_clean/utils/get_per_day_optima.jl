@@ -3,6 +3,8 @@ using CSV
 using DataFrames
 
 include("../structs/ExpansionPlanner.jl")
+include("../helpers/process_max_upgrades.jl")
+include("../helpers/export_model.jl")
 
 function get_per_day_optima(superdir::String; submit_jobs::Bool=true, force::Bool=false)
     # Load and validate config
@@ -22,6 +24,7 @@ function get_per_day_optima(superdir::String; submit_jobs::Bool=true, force::Boo
 
     if n_submitted_jobs == 0
         compute_avg_summary(superdir, toml_data)
+        process_max_aggregate(superdir, simdirs[1])
     end
     
 end
@@ -103,4 +106,10 @@ function create_per_day_sbatch_file(simdir::String; submit_jobs::Bool=true)
     end
 
     return output_file
+end
+
+function process_max_aggregate(superdir, simdir)
+    gamma_val, s_energy_val = compute_superset_core_point(superdir, is_multistage=false)
+    data = JSON.parsefile(joinpath(simdir, "data.json"))
+    export_investments_csv(data, gamma_val, s_energy_val, output_dir=joinpath(superdir, "output"), file_suffix="")
 end

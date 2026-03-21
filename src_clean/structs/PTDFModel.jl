@@ -170,7 +170,7 @@ function create_base_model(data::Dict{String, Any}, optimizer)
     # SOC over time constraint
     @constraint(jump_model, 
         soc_over_time[r in 1:R, i in 1:N, t in 2:T],
-        soc[r,i,t] == soc[r,i,t-1] + ch[r,i,t] * data["param"]["bess_efficiency"] - 
+        soc[r,i,t] == (1 - get(data["param"], "self_discharge", 0)) * soc[r,i,t-1] + ch[r,i,t] * data["param"]["bess_efficiency"] - 
                       dis[r,i,t] / data["param"]["bess_efficiency"]
     )
 

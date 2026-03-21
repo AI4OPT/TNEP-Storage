@@ -56,5 +56,3 @@ function compute_first_stage_costs(dir, data)
     println("$year, trans cost: $(line_cost)")
     println("$year, stor cost: $(stor_cost)")
 end
-
-
