@@ -14,7 +14,7 @@ function create_sbatch_file(job_name::String,
                            mem_per_cpu::String="12G",
                            time_limit::String="24:00:00",
                            partition::String="inferno",
-                           account::String="gts-phentenryck3-coda20",
+                           account::String="gts-phentenryck3-ai4opt",
                            email::String="kwu381@gatech.edu")
     content = """
     #!/bin/bash
@@ -180,7 +180,7 @@ function compute_first_stage_lb(superdir, first_lb_dir, most_challenging; submit
     #!/bin/bash
     #SBATCH -J$job_name
     #SBATCH -qinferno
-    #SBATCH --account=gts-phentenryck3-coda20
+    #SBATCH --account=gts-phentenryck3-ai4opt
     #SBATCH -N1 --ntasks-per-node=24
     #SBATCH --mem-per-cpu=12G
     #SBATCH -t48:00:00

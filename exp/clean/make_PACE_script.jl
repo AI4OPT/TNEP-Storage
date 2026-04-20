@@ -11,7 +11,7 @@ function write_parallelizedbenders_sbatch_file(simdir; threads=1, hours=24, subm
     sbatch_content = """#!/bin/bash
     #SBATCH -J$job_name
     #SBATCH -qinferno
-    #SBATCH --account=gts-phentenryck3-coda20
+    #SBATCH --account=gts-phentenryck3-ai4opt
     #SBATCH -N$n_nodes --ntasks-per-node=$threads
     #SBATCH --mem-per-cpu=12G
     #SBATCH -t$hours:00:00
@@ -65,7 +65,7 @@ function write_distributed_parallelizedbenders_sbatch_file(simdir; n_workers=not
     sbatch_content = """#!/bin/bash
     #SBATCH -J $job_name
     #SBATCH -q inferno
-    #SBATCH --account=gts-phentenryck3-coda20
+    #SBATCH --account=gts-phentenryck3-ai4opt
     #SBATCH -N $n_nodes
     #SBATCH --ntasks=$n_workers
     #SBATCH --ntasks-per-node=$tasks_per_node
@@ -101,38 +101,34 @@ function write_distributed_parallelizedbenders_sbatch_file(simdir; n_workers=not
     return sbatch_file
 end
 
-function write_expansionplanner_sbatch_file(simdir; hours=24, submit=true)
+function write_expansionplanner_sbatch_file(simdir; hours=24, submit=true, duals=false)
     pace_dir = "PACE/r1/PowerUp/expansionplanner"
     job_name = basename(simdir)
+    
+    duals_flag = duals ? " -d" : ""
     
     # Create the SBATCH content
     sbatch_content = """#!/bin/bash
     #SBATCH -J$job_name
     #SBATCH -qinferno
-    #SBATCH --account=gts-phentenryck3-coda20
+    #SBATCH --account=gts-phentenryck3-ai4opt
     #SBATCH -N1 --ntasks-per-node=24
     #SBATCH --mem-per-cpu=12G
     #SBATCH -t$hours:00:00
     #SBATCH -o/storage/home/hcoda1/1/kwu381/TNEP-Storage/PACE/logs/$job_name.out
     #SBATCH --mail-type=BEGIN,END,FAIL
     #SBATCH --mail-user=kwu381@gatech.edu
-
     cd /storage/home/hcoda1/1/kwu381/TNEP-Storage
-    julia --project=.  exp/clean/run_expansionplanner.jl $simdir
+    julia --project=.  exp/clean/run_expansionplanner.jl $simdir$(duals_flag)
     """
-    
     # Write to file
     sbatch_file = joinpath(pace_dir, "$job_name.sbatch")
-
     open(sbatch_file, "w") do file
         write(file, sbatch_content)
     end
-    
     println("SBATCH file written to: $sbatch_file")
-
     if submit
         run(`sbatch $sbatch_file`)
     end
-
     return sbatch_file
 end

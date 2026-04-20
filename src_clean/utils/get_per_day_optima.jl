@@ -80,7 +80,7 @@ function create_per_day_sbatch_file(simdir::String; submit_jobs::Bool=true)
     #!/bin/bash
     #SBATCH -J$job_name
     #SBATCH -qinferno
-    #SBATCH --account=gts-phentenryck3-coda20
+    #SBATCH --account=gts-phentenryck3-ai4opt
     #SBATCH -N1 --ntasks-per-node=24
     #SBATCH --mem-per-cpu=12G
     #SBATCH -t24:00:00

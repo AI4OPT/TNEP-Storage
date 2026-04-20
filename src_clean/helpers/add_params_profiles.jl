@@ -49,6 +49,12 @@ function add_profiles(data)
     num_r = data["param"]["num_representatives"]
     num_h = data["param"]["num_hours"]
 
+    specific_hours_range = get(data["param"], "specific_hours_range", nothing)
+    if specific_hours_range !== nothing
+        data["param"]["num_hours"] = specific_hours_range[2] - specific_hours_range[1] + 1
+        num_h = data["param"]["num_hours"]
+    end
+
     # Check if number of representatives is equal to the dates
     if num_r != length(data["param"]["dates"])
         throw(ArgumentError("Number of representatives does not match the config file"))
@@ -96,7 +102,15 @@ function add_profiles(data)
         fsolar_df = solar_df[occursin.(date, string.(solar_df[!, "UTC"])), :]
         fwind_df = wind_df[occursin.(date, string.(wind_df[!, "UTC"])), :]
         fhydro_df = hydro_df[occursin.(date, string.(hydro_df[!, "UTC"])), :]
-        
+
+        if specific_hours_range !== nothing
+            hr = specific_hours_range[1]:specific_hours_range[2]
+            fdemand_df = fdemand_df[hr, :]
+            fsolar_df  = fsolar_df[hr, :]
+            fwind_df   = fwind_df[hr, :]
+            fhydro_df  = fhydro_df[hr, :]
+        end
+
         for i in keys(data["bus"])
             # -- Populate the load of all busses --
             update_load(data, rep_index, i, fdemand_df)

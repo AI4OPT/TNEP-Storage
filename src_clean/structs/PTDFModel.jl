@@ -3,6 +3,13 @@ using CSV, DataFrames
 include("OptimizationModel.jl")
 include("../helpers/helpers.jl")
 
+mutable struct ConstraintStat
+    first_iter::Int          # iteration where this constraint was first violated
+    total_appearances::Int   # number of iterations where it was violated
+    max_violation::Float64   # max (abs(flow) - line_limit) observed
+    tightness_history::Vector{Tuple{Int, Float64}}  # (iter, abs(flow)-line_limit): neg=slack, pos=violated
+end
+
 # PTDF Model with iterative constraint addition
 mutable struct PTDFModel <: OptimizationModel
     jump_model::JuMP.Model
@@ -18,6 +25,9 @@ mutable struct PTDFModel <: OptimizationModel
     ptdf_tol::Float64
     solve_time::Float64
     
+    # Violation statistics for pruning analysis
+    constraint_stats::Dict{Tuple{Int,Int,Int,Bool}, ConstraintStat}
+
     # Pre-computed mappings for efficiency
     gen_bus_map::Dict{Int, Int}
     
@@ -29,11 +39,14 @@ mutable struct PTDFModel <: OptimizationModel
     G::Int  # num generators
     
     # Inner constructor
-    function PTDFModel(data::Dict{String, Any}, optimizer, simdir::String; 
+    function PTDFModel(data::Dict{String, Any}, optimizer, simdir::String;
                       max_ptdf_iterations::Int=256,
-                      max_ptdf_per_iteration::Int=32,
+                      max_ptdf_per_iteration::Int=-1,
                       ptdf_tol::Float64=1e-6)
-        
+
+        max_ptdf_per_iteration = max_ptdf_per_iteration == -1 ?
+            get(data["param"], "max_ptdf_per_iteration", 32) : max_ptdf_per_iteration
+
         # Create the base JuMP model
         jump_model = create_base_model(data, optimizer)
         
@@ -65,10 +78,12 @@ mutable struct PTDFModel <: OptimizationModel
         jump_model[:ptdf_flow] = Dict{String, ConstraintRef}()
         
         # Create and return the model
-        model = new(jump_model, data, simdir, ptdf_matrix, 
+        model = new(jump_model, data, simdir, ptdf_matrix,
             Dict{Tuple{Int,Int,Int,Bool}, Bool}(),
-            rate_a_set, max_ptdf_iterations, max_ptdf_per_iteration, 
-            ptdf_tol, 0.0, gen_bus_map, R, N, E, T, G)
+            rate_a_set, max_ptdf_iterations, max_ptdf_per_iteration,
+            ptdf_tol, 0.0,
+            Dict{Tuple{Int,Int,Int,Bool}, ConstraintStat}(),
+            gen_bus_map, R, N, E, T, G)
 
         if haskey(data["param"], "previous_investment_dir")
             prev_dir = data["param"]["previous_investment_dir"]
@@ -323,33 +338,73 @@ function warm_start!(model::PTDFModel)
     println("Warm-started with $total_constraints constraints")
 end
 
-# Find violations in current solution
-function find_violations(model::PTDFModel, flows, gamma_values)
+# Find violations in current solution; niter is 1-indexed current iteration
+function find_violations(model::PTDFModel, flows, gamma_values, niter::Int)
     violations = []
-    
+
     for a in model.rate_a_nonzero
-        # Pre-compute for this branch
         cap_increment = get_capacity_increment(model.data, a)
         line_limit_base = model.data["branch"]["$a"]["rate_a"]
         line_limit_fixed = line_limit_base + gamma_values[a] * cap_increment
-        
+
         for r in 1:model.R, t in 1:model.T
             flow_val = flows[a, r, t]
             violation_amount = abs(flow_val) - line_limit_fixed
             ub = (flow_val >= 0)
+            key = (a, r, t, ub)
 
-            # Skip if already tracked
-            if get(model.tracked_constraints, (a, r, t, ub), false)
+            # Update statistics (tracked constraints get tightness recorded every iter)
+            if haskey(model.constraint_stats, key)
+                stat = model.constraint_stats[key]
+                push!(stat.tightness_history, (niter, violation_amount))
+                if violation_amount > model.ptdf_tol
+                    stat.total_appearances += 1
+                    stat.max_violation = max(stat.max_violation, violation_amount)
+                end
+            elseif violation_amount > model.ptdf_tol
+                model.constraint_stats[key] = ConstraintStat(
+                    niter, 1, violation_amount, [(niter, violation_amount)]
+                )
+            end
+
+            # Only add to violation list if not already constrained
+            if get(model.tracked_constraints, key, false)
                 continue
             end
-    
             if violation_amount > model.ptdf_tol
                 push!(violations, (a, r, t, ub, violation_amount))
             end
         end
     end
-    
+
     return violations
+end
+
+# Remove tracked constraints that have been slack for the last stale_k iterations
+function prune_stale_constraints!(model::PTDFModel, stale_k::Int)
+    to_prune = Tuple{Int,Int,Int,Bool}[]
+
+    for (key, _) in model.tracked_constraints
+        stat = get(model.constraint_stats, key, nothing)
+        isnothing(stat) && continue
+        history = stat.tightness_history
+        length(history) < stale_k && continue
+        if stat.total_appearances == 1 && all(v <= model.ptdf_tol for (_, v) in history[end-stale_k+1:end])
+            push!(to_prune, key)
+        end
+    end
+
+    for key in to_prune
+        (a, r, t, ub) = key
+        ckey = ub ? "$(a)_$(r)_$(t)_ub" : "$(a)_$(r)_$(t)_lb"
+        if haskey(model.jump_model[:ptdf_flow], ckey)
+            delete(model.jump_model, model.jump_model[:ptdf_flow][ckey])
+            delete!(model.jump_model[:ptdf_flow], ckey)
+        end
+        delete!(model.tracked_constraints, key)
+    end
+
+    return length(to_prune)
 end
 
 # Add PTDF constraints for violations
@@ -428,26 +483,30 @@ function solve!(model::PTDFModel; configure_optimizer::Bool=true)
                       model.data, model.ptdf_matrix)
 
         # Find violations
-        violations = find_violations(model, flows, gamma_values)
+        violations = find_violations(model, flows, gamma_values, niter + 1)
         sorted_violations = sort(violations, by = x -> -x[5])
         n_violated = length(sorted_violations)
         
         # Add constraints for top violations
         n_added = add_constraints!(model, sorted_violations)
 
-        if n_added > 0
+        stale_k = get(model.data["param"], "stale_k", nothing)
+        n_pruned = (isnothing(stale_k) || n_violated == 0) ? 0 : prune_stale_constraints!(model, stale_k)
+
+        if n_added > 0 || n_pruned > 0
             save_tracked_constraints(model.simdir, model, n_violated)
         end
-        
+
         solved = (n_violated == 0)
         niter += 1
-        println("Iteration $niter: Found $n_violated violations, added $n_added constraints")
+        println("Iteration $niter: Found $n_violated violations, added $n_added constraints, pruned $n_pruned stale")
     end
 
     # Record solve time
     model.solve_time = time() - t0
     save_solve_time(model.simdir, model.solve_time)
     save_power_injections(model.simdir, model.jump_model, model.data)
+    save_constraint_stats(model.simdir, model)
     
     return model.jump_model
 end
@@ -495,6 +554,47 @@ function save_tracked_constraints(simdir, model::PTDFModel, n_violated)
     
     # Save to CSV
     CSV.write(joinpath(output_dir, "tracked_constraints.csv"), df)
+end
+
+function save_constraint_stats(simdir, model::PTDFModel)
+    output_dir = joinpath(simdir, "output")
+    mkpath(output_dir)
+
+    stats = model.constraint_stats
+    if isempty(stats)
+        return
+    end
+
+    # Summary: one row per constraint
+    summary_df = DataFrame(
+        arc             = [k[1] for k in keys(stats)],
+        rep             = [k[2] for k in keys(stats)],
+        time            = [k[3] for k in keys(stats)],
+        ub              = [k[4] for k in keys(stats)],
+        first_iter      = [v.first_iter        for v in values(stats)],
+        total_appearances = [v.total_appearances for v in values(stats)],
+        max_violation   = [v.max_violation     for v in values(stats)],
+        num_iters_tracked = [length(v.tightness_history) for v in values(stats)],
+    )
+    CSV.write(joinpath(output_dir, "constraint_stats_summary.csv"), summary_df)
+
+    # Tightness history: one row per (constraint, iteration)
+    arcs  = Int[]
+    reps  = Int[]
+    times = Int[]
+    ubs   = Bool[]
+    iters = Int[]
+    vals  = Float64[]
+    for (k, v) in stats
+        for (iter, val) in v.tightness_history
+            push!(arcs,  k[1]); push!(reps,  k[2])
+            push!(times, k[3]); push!(ubs,   k[4])
+            push!(iters, iter); push!(vals,  val)
+        end
+    end
+    history_df = DataFrame(arc=arcs, rep=reps, time=times, ub=ubs,
+                           iteration=iters, violation_amount=vals)
+    CSV.write(joinpath(output_dir, "constraint_tightness_history.csv"), history_df)
 end
 
 function set_previous_investments!(
