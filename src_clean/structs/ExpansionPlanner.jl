@@ -1,8 +1,8 @@
 using Gurobi
 using JSON
 
-include("PhaseAngleModel.jl")
-include("PTDFModel.jl")
+@isdefined(PhaseAngleModel) || include("PhaseAngleModel.jl")
+@isdefined(PTDFModel)       || include("PTDFModel.jl")
 include("../helpers/helpers.jl")
 
 function set_up_data(simdir)

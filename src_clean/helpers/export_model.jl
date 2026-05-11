@@ -287,6 +287,34 @@ function export_flow(simdir, model, data, rep_index, ptdf)
     CSV.write(joinpath(simdir, "output", datestring, "flow.csv"), df_flow)
 end
 
+function export_soc(simdir, model, data, rep_index)
+    N = length(data["bus"])
+    T = data["param"]["num_hours"]
+
+    soc_values = value.(model[:soc])            # R×N×T
+    s_energy_values = value.(model[:s_energy])  # N
+
+    storage_buses = sort([i for i in 1:N if s_energy_values[i] > 0])
+
+    if isempty(storage_buses)
+        return nothing
+    end
+
+    bus_col = storage_buses
+    soc_mat = Matrix{Float64}(undef, length(storage_buses), T)
+    for (idx, bus) in enumerate(storage_buses)
+        soc_mat[idx, :] = soc_values[rep_index, bus, :]
+    end
+
+    out_df = DataFrame(bus=bus_col)
+    for t in 1:T
+        out_df[!, Symbol("t_$t")] = soc_mat[:, t]
+    end
+
+    datestring = data["param"]["dates"][rep_index]
+    CSV.write(joinpath(simdir, "output", datestring, "soc.csv"), out_df)
+end
+
 function export_model(simdir, model, data, ptdf)
     # Check if s_power exists in the model and call export_investments_csv accordingly
     if haskey(model, :s_power)
@@ -301,5 +329,6 @@ function export_model(simdir, model, data, ptdf)
     for rep_index in 1:length(data["param"]["dates"])
         export_energy_csv(simdir, model, data, rep_index, ptdf)
         export_flow(simdir, model, data, rep_index, ptdf)
+        export_soc(simdir, model, data, rep_index)
     end
 end

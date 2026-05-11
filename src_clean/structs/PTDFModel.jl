@@ -879,9 +879,9 @@ end
 
 # Convenience constructor that matches old function signature
 function create_model_r1_ptdf_iterative_simplified_sorted(
-    simdir, data::Dict{String, Any}, optimizer; 
+    simdir, data::Dict{String, Any}, optimizer;
     max_ptdf_iterations::Int=256,
-    max_ptdf_per_iteration::Int=32,
+    max_ptdf_per_iteration::Int=-1,
     ptdf_tol::Float64=1e-6)
     
     model = PTDFModel(data, optimizer, simdir;
