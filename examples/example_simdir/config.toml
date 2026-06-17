@@ -1,0 +1,36 @@
+dates = ["2016-08-11"]
+representative_prob = [1.0]
+decarbonization_year = 2022
+num_representatives = 1
+
+decarbonization = "data/topology/tamu/decarbonization_1015.csv"
+time_series_dir = "tamu/base_grid"
+power_system_data = "data/topology/tamu/texas/power_system_data.json"
+
+relaxed_first_stage = true
+
+timezone = "CDT"
+storage_energy_size = 2.5
+cap_upgrade_increment = 1.0
+storage_operation_cost = 6850.0
+mip_gap = 0.01
+ptdf_cutoff = 0.005
+num_cap_upgrades_max = 1
+cap_upgrade_cost = 6500.0
+renewable_types = ["wind", "solar", "wind_offshore", "hydro"]
+storage_linearized = "ptdf_simplified_sorted"
+max_num_storage = -1
+soc_init_end_ratio = 0.0
+under_served_penalty = 5.0e6
+nonrenewable_types = ["dfo", "ng", "other", "coal", "nuclear", "geothermal", "foreign"]
+storage_fixed_cost = 500000
+operational_weight = 365
+max_energy_rating = 30.0
+voltage_angle_difference_max = 0.5236
+eia_interchange = "EIA/EIA930_INTERCHANGE_2016_Jan_Jun.csv"
+over_generated_penalty = 5.0e6
+num_hours = 24
+bess_efficiency = 0.95
+foreign_imports = false
+cap_percent = true
+bess_energy_cost = 9.63e6

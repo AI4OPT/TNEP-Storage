@@ -54,8 +54,7 @@ mutable struct ParallelizedBenders
         rep_prob = toml_data["representative_prob"]
         years = get(toml_data, "years", [toml_data["decarbonization_year"]])
 
-        # TODO deprecate this?
-        is_multistage = true
+        is_multistage = length(years) > 1
 
         # Create date_weights mapping
         date_weights = Dict{String, Float64}()
