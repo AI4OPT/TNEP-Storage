@@ -220,24 +220,20 @@ function compute_second_stage_lb(superdir, second_lb_dir; submit_jobs::Bool=true
     !isfile(config_file) && error("Config file not found: $config_file")
     toml_data = TOML.parsefile(config_file)
     
-    gamma_max = toml_data["num_cap_upgrades_max"]
-    s_energy_max = toml_data["max_energy_rating"]
+    gamma_max = toml_data["num_cap_upgrades_max"] * toml_data["cap_upgrade_increment"]
+    s_energy_max = toml_data["max_energy_rating"] / toml_data["storage_energy_size"]
     rep_prob = toml_data["representative_prob"]
+
+    # Set gamma_max and s_energy_max, which will be later used to write to investments
+    toml_data["gamma_max"] = gamma_max
+    toml_data["s_energy_max"] = s_energy_max
+    open(joinpath(second_lb_dir, "config.toml"), "w") do io
+        TOML.print(io, toml_data)
+    end
     
     # Create second stage simdirs (order matches rep_prob)
     simdirs = create_simdirs(second_lb_dir, toml_data)
     @assert length(simdirs) == length(rep_prob) "Mismatch between simdirs and probabilities"
-    
-    # Write second stage parameters to config files
-    for simdir in simdirs
-        config_file = joinpath(simdir, "config.toml")
-        config = TOML.parsefile(config_file)
-        config["gamma_max"] = gamma_max
-        config["s_energy_max"] = s_energy_max
-        open(config_file, "w") do io
-            TOML.print(io, config)
-        end
-    end
     
     # Create and submit batch files
     pace_dir = joinpath(second_lb_dir, "batch_files")
