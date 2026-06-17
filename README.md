@@ -1,5 +1,16 @@
 # TNEP-Storage
-Transmission Network Expansion with Storage
+
+A Julia package for large-scale **Transmission Network Expansion Planning (TNEP)** with **grid-scale energy storage**, using PTDF-based network formulations and decomposition methods for high-renewable power systems.
+
+## Description
+
+TNEP-Storage implements optimization models for jointly planning transmission upgrades and energy storage investments under future generation mix and demand scenarios. The framework supports representative-day operational modeling, synthetic Texas test systems, and scalable solution procedures based on continuous relaxations and trust-region Benders decomposition.
+
+The code accompanies the paper:
+
+**High-Resolution PTDF-Based Planning of Storage and Transmission Under High Renewables**
+
+Paper: https://arxiv.org/abs/2510.14696
 
 ## Setup
 
