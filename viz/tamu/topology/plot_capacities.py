@@ -4,10 +4,13 @@ import pandas as pd
 import sys
 import json
 
+# EXAMPLE USAGE: 
+# cd viz/tamu/topology
+# python plot_capacities.py examples/example_simdir
+
+# OUTPUT: an html file of the grid
+
 simdir = sys.argv[1]
-# Read CSV file
-df_storage = pd.read_csv(f"../../../{simdir}/output/storage_investments.csv")
-df_lines = pd.read_csv(f"../../../{simdir}/output/line_investments.csv")
 
 with open(f'../../../{simdir}/data.json', 'r') as file:
     data = json.load(file)
@@ -17,20 +20,28 @@ generator_types = set()
 for bus in data["bus"]:
     generator_types.update(data["bus"][bus]["gen"].keys())
 
-for gen_type in generator_types:
-    df_storage[gen_type + "_capacity"] = 0.0
+# Build a row per bus with lat/lon and generator capacity by type
+bus_records = []
+for bus_index, bus in data["bus"].items():
+    capacities = {gen_type + "_capacity": 0.0 for gen_type in generator_types}
+    for gen_type, gen_list in bus["gen"].items():
+        capacities[gen_type + "_capacity"] = sum(data["gen"][str(gen_id)]["pmax"] for gen_id in gen_list)
+    bus_records.append({"Lat": bus["lat"], "Lon": bus["lon"], **capacities})
 
-# Iterate over each row in df_storage
-for index, row in df_storage.iterrows():
-    bus_index = str(row["Node_Index"])  # Match bus index as a string
-    gen_data = data["bus"][bus_index]["gen"]
-
-    # Sum capacity for each generator type
-    for gen_type, gen_list in gen_data.items():
-        total_capacity = sum(data["gen"][str(gen_id)]["pmax"] for gen_id in gen_list)
-        df_storage.at[index, gen_type + "_capacity"] = total_capacity
-
+df_storage = pd.DataFrame(bus_records)
 df_storage["nonrenewable_capacity"] = df_storage[["coal_capacity", "nuclear_capacity", "ng_capacity"]].sum(axis=1)
+
+# Build a row per branch with the lat/lon of its two endpoint buses
+line_records = []
+for branch in data["branch"].values():
+    f_bus = data["bus"][str(branch["f_bus"])]
+    t_bus = data["bus"][str(branch["t_bus"])]
+    line_records.append({
+        "Lat1": f_bus["lat"], "Lon1": f_bus["lon"],
+        "Lat2": t_bus["lat"], "Lon2": t_bus["lon"],
+    })
+
+df_lines = pd.DataFrame(line_records)
 
 # Filter data for each generator type
 df_solar = df_storage[df_storage["solar_capacity"] > 0]
