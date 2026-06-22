@@ -1,4 +1,4 @@
-# TNEP-Storage
+# TNEP-Storage 
 
 A Julia package for large-scale **Transmission Network Expansion Planning (TNEP)** with **grid-scale energy storage**, using PTDF-based network formulations and decomposition methods for high-renewable power systems.
 
