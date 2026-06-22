@@ -17,14 +17,14 @@ function get_per_day_optima(superdir::String; submit_jobs::Bool=true, force::Boo
 
     for simdir in simdirs
         if !isfile(joinpath(simdir, "output", "summary_data.csv")) || force
-            create_per_day_sbatch_file(simdir, submit_jobs=submit_jobs)
+            create_per_day_sbatch_file(simdir, toml_data, submit_jobs=submit_jobs)
             n_submitted_jobs += 1
         end
     end
 
     if n_submitted_jobs == 0
         compute_avg_summary(superdir, toml_data)
-        process_max_aggregate(superdir, simdirs[1])
+        # process_max_aggregate(superdir, simdirs[1])
     end
     
 end
@@ -70,11 +70,22 @@ function compute_avg_summary(superdir, toml_data)
     # Print sum of all cost variables
     total_costs = sum(row.Value for row in eachrow(avg_df) if endswith(row.Variable, "costs"))
     println("Total costs: $total_costs")
+
+    if haskey(weighted_sums, "line_investment_costs") && haskey(weighted_sums, "storage_investment_costs")
+        first_stage_cost = weighted_sums["line_investment_costs"] + weighted_sums["storage_investment_costs"]
+        println("Total first stage cost: $first_stage_cost")
+    end
+
+    if haskey(weighted_sums, "storage_operation_costs") && haskey(weighted_sums, "generation_costs")
+        second_stage_cost = weighted_sums["storage_operation_costs"] + weighted_sums["generation_costs"]
+        println("Total second stage cost: $second_stage_cost")
+    end
 end
 
-function create_per_day_sbatch_file(simdir::String; submit_jobs::Bool=true)
+function create_per_day_sbatch_file(simdir::String, toml_data; submit_jobs::Bool=true)
     job_name = basename(simdir) * "_per_day"
     log_file = joinpath("per_day", job_name)
+    time_limit = haskey(toml_data, "current_investment_dir") ? "2:00:00" : "12:00:00"
 
     content = """
     #!/bin/bash
@@ -83,7 +94,7 @@ function create_per_day_sbatch_file(simdir::String; submit_jobs::Bool=true)
     #SBATCH --account=gts-phentenryck3-ai4opt
     #SBATCH -N1 --ntasks-per-node=24
     #SBATCH --mem-per-cpu=12G
-    #SBATCH -t24:00:00
+    #SBATCH -t$time_limit
     #SBATCH -o/storage/home/hcoda1/1/kwu381/TNEP-Storage/PACE/logs/$log_file.out
     #SBATCH --mail-type=BEGIN,END,FAIL
     #SBATCH --mail-user=kwu381@gatech.edu

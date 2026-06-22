@@ -4,6 +4,12 @@ import pandas as pd
 import sys
 import json
 
+# EXAMPLE USAGE: 
+# cd viz/tamu/topology
+# python plot_capacities.py examples/example_simdir
+
+# OUTPUT: an html file of the grid
+
 simdir = sys.argv[1]
 
 with open(f'../../../{simdir}/data.json', 'r') as file:
